@@ -61,6 +61,26 @@ export declare class Plane {
 	): void;
 	/** Mark a node deleted without touching the plane freelist (dual-write mode). */
 	clearNode(id: number): void;
+	/**
+	 * Builder-scan variant of writeNodeRaw: writes only when the slot has never been touched,
+	 * so a backfill scan of an older snapshot can never overwrite newer live-mirrored state.
+	 * Returns true when the scan's state was written.
+	 */
+	writeNodeRawIfAbsent(
+		id: number,
+		level: number,
+		vector: Buffer,
+		scale: number,
+		invMag: number,
+		neighbors: Uint32Array,
+		upper?: Array<Uint32Array> | null
+	): boolean;
+	/**
+	 * Whether the file recorded a clean shutdown when opened (create() reports true). False
+	 * means torn per-slot locks were scrubbed but slot contents may be incomplete — rebuild
+	 * rather than trusting the plane as a complete mirror.
+	 */
+	openedClean(): boolean;
 	/** Set the graph entry point (dual-write mode mirrors the host's entry updates). */
 	setEntryPoint(id: number, level: number): void;
 	getEntryPoint(): Array<number>;
