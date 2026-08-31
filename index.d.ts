@@ -15,7 +15,10 @@ export declare class Plane {
 	/** Open an existing plane file (format-version mismatch throws: rebuild the index). */
 	static open(path: string): Plane;
 
-	/** Insert a vector; returns the allocated node id (freed ids are reused). */
+	/**
+	 * Insert a vector; returns the allocated node id (freed ids are reused). Throws on a
+	 * dimension mismatch or when the plane is full (maxNodes reached).
+	 */
 	insert(vector: Float32Array): number;
 	/** Delete a node; its id returns to the freelist. Pairs with insert(). */
 	remove(id: number): void;
@@ -66,6 +69,11 @@ export declare class Plane {
 	idHighWater(): number;
 	getWatermark(): number;
 	setWatermark(txn: number): void;
-	/** msync the plane (slots + upper region, one file); advances durability. */
-	flush(): void;
+	/**
+	 * Durability barrier: flush all data, then advance the watermark (defaults to the current
+	 * one) and the clean-shutdown flag, then flush the header alone — a crash between the two
+	 * flushes leaves an old watermark over durable data, never a new watermark over missing
+	 * data. Reopening a plane that was not cleanly flushed scrubs any torn per-slot locks.
+	 */
+	flush(watermark?: number): void;
 }

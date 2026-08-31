@@ -2,9 +2,8 @@
 name = "hnsw-plane"
 version = "0.0.1"
 edition = "2021"
-description = "Persistent, concurrently-searchable HNSW over a memory-mapped fixed-slot graph file"
+description = "Native HNSW traversal plane: mmap fixed-slot graph file + off-loop search"
 license = "Apache-2.0"
-repository = "https://github.com/HarperFast/hnsw"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
