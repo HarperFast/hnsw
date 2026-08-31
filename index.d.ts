@@ -76,9 +76,9 @@ export declare class Plane {
 		upper?: Array<Uint32Array> | null
 	): boolean;
 	/**
-	 * Whether the file recorded a clean shutdown when opened (create() reports true). False
-	 * means torn per-slot locks were scrubbed but slot contents may be incomplete — rebuild
-	 * rather than trusting the plane as a complete mirror.
+	 * Advisory: whether the file recorded a durability barrier (flush) as its last state when
+	 * opened. Crash recovery does not depend on it — a per-slot lock abandoned by a dead
+	 * writer is taken over lazily at that slot by whoever waits past the takeover window.
 	 */
 	openedClean(): boolean;
 	/** Set the graph entry point (dual-write mode mirrors the host's entry updates). */
@@ -96,4 +96,6 @@ export declare class Plane {
 	 * data. Reopening a plane that was not cleanly flushed scrubs any torn per-slot locks.
 	 */
 	flush(watermark?: number): void;
+	/** flush() on the libuv thread pool — a whole-map msync can stall its calling thread. */
+	flushAsync(watermark?: number): Promise<void>;
 }
