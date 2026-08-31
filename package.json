@@ -1,0 +1,43 @@
+{
+	"name": "@harperfast/hnsw",
+	"version": "0.1.0",
+	"description": "Persistent, incrementally-maintained, concurrently-searchable native HNSW for Node.js: a memory-mapped fixed-slot graph file with off-event-loop search, seqlock concurrency, int8 asymmetric distance, and bitset/predicate filtering.",
+	"license": "Apache-2.0",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/HarperFast/hnsw.git"
+	},
+	"main": "index.js",
+	"types": "index.d.ts",
+	"files": [
+		"index.js",
+		"index.d.ts",
+		"hnsw-plane.node",
+		"src",
+		"build.rs",
+		"build.mjs",
+		"Cargo.toml",
+		"Cargo.lock",
+		"README.md",
+		"DESIGN.md"
+	],
+	"engines": {
+		"node": ">=18"
+	},
+	"scripts": {
+		"build": "node build.mjs",
+		"install": "node build.mjs --if-needed",
+		"test": "cargo test --release && node build.mjs && node smoke.mjs"
+	},
+	"keywords": [
+		"hnsw",
+		"ann",
+		"vector",
+		"nearest-neighbor",
+		"similarity-search",
+		"embedding",
+		"mmap",
+		"napi",
+		"rust"
+	]
+}

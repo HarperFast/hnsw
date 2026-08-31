@@ -1,0 +1,4 @@
+target/
+hnsw-plane.node
+node_modules/
+*.hnsw

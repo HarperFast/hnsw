@@ -1,0 +1,30 @@
+[package]
+name = "hnsw-plane"
+version = "0.0.1"
+edition = "2021"
+description = "Persistent, concurrently-searchable HNSW over a memory-mapped fixed-slot graph file"
+license = "Apache-2.0"
+repository = "https://github.com/HarperFast/hnsw"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+memmap2 = "0.9"
+napi = { version = "2", default-features = false, features = ["napi8"], optional = true }
+napi-derive = { version = "2", optional = true }
+
+[build-dependencies]
+napi-build = "2"
+
+[features]
+default = []
+napi = ["dep:napi", "dep:napi-derive"]
+
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
