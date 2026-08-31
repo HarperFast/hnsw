@@ -1,0 +1,46 @@
+name: Prebuild
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+          - os: macos-13
+            target: darwin-x64
+          - os: macos-14
+            target: darwin-arm64
+          - os: windows-latest
+            target: win32-x64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    # Windows is a best-effort target (the crate is untested there); its failure must not
+    # block the other prebuilds
+    continue-on-error: ${{ matrix.target == 'win32-x64' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Build NAPI module
+        run: node build.mjs
+      - name: Smoke test
+        run: node smoke.mjs
+      - name: Stage prebuild
+        shell: bash
+        run: |
+          mkdir -p prebuilds/${{ matrix.target }}
+          cp hnsw-plane.node prebuilds/${{ matrix.target }}/hnsw-plane.node
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prebuild-${{ matrix.target }}
+          path: prebuilds/${{ matrix.target }}/hnsw-plane.node
+          if-no-files-found: error

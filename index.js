@@ -1,14 +1,19 @@
-// Loads the native module. Prebuilds are a planned follow-up; until then the artifact is
-// produced locally by `npm run build` (requires a Rust toolchain), and absence throws with
-// a clear remedy rather than a bare MODULE_NOT_FOUND.
+// Loads the native module: a bundled prebuild for this platform when present, else a
+// locally built artifact (`npm run build`, requires a Rust toolchain). Linux prebuilds are
+// glibc builds; musl systems build locally.
 'use strict';
 const { existsSync } = require('node:fs');
 const { join } = require('node:path');
 
-const artifact = join(__dirname, 'hnsw-plane.node');
-if (!existsSync(artifact)) {
+const candidates = [
+	join(__dirname, 'prebuilds', `${process.platform}-${process.arch}`, 'hnsw-plane.node'),
+	join(__dirname, 'hnsw-plane.node'),
+];
+const artifact = candidates.find(existsSync);
+if (!artifact) {
 	throw new Error(
-		'@harperfast/hnsw native artifact not found. Build it with `npm run build` in ' +
+		`@harperfast/hnsw has no prebuilt binary for ${process.platform}-${process.arch} and no local build. ` +
+			'Build one with `npm run build` in ' +
 			__dirname +
 			' (requires a Rust toolchain: https://rustup.rs).'
 	);

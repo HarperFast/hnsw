@@ -9,8 +9,9 @@ import { fileURLToPath } from 'node:url';
 const crateRoot = dirname(fileURLToPath(import.meta.url));
 const ifNeeded = process.argv.includes('--if-needed');
 const artifact = join(crateRoot, 'hnsw-plane.node');
+const prebuilt = join(crateRoot, 'prebuilds', `${process.platform}-${process.arch}`, 'hnsw-plane.node');
 
-if (ifNeeded && existsSync(artifact)) {
+if (ifNeeded && (existsSync(artifact) || existsSync(prebuilt))) {
 	process.exit(0);
 }
 try {
