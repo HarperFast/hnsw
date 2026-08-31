@@ -18,4 +18,27 @@ if (!artifact) {
 			' (requires a Rust toolchain: https://rustup.rs).'
 	);
 }
-module.exports = require(artifact);
+const native = require(artifact);
+
+// A predicate that throws would surface through the ThreadsafeFunction as a fatal exception
+// (aborting the process); wrap it so a throw denies the batch and rejects the search instead.
+const nativeSearchWithPredicate = native.Plane.prototype.searchWithPredicate;
+native.Plane.prototype.searchWithPredicate = function (vector, k, ef, predicate, ...rest) {
+	let predicateError;
+	const guarded = (ids) => {
+		if (predicateError !== undefined) return new Uint8Array(ids.length);
+		try {
+			const verdicts = predicate(ids);
+			return verdicts instanceof Uint8Array ? verdicts : Uint8Array.from(verdicts ?? []);
+		} catch (error) {
+			predicateError = error;
+			return new Uint8Array(ids.length);
+		}
+	};
+	return nativeSearchWithPredicate.call(this, vector, k, ef, guarded, ...rest).then((hits) => {
+		if (predicateError !== undefined) throw predicateError;
+		return hits;
+	});
+};
+
+module.exports = native;
