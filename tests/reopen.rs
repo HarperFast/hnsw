@@ -12,6 +12,14 @@ fn vector_for(i: u32, dims: usize) -> Vec<f32> {
     (0..dims).map(|d| ((i as f32 * 0.31 + d as f32) * 0.7).sin()).collect()
 }
 
+fn await_lock(held: &std::sync::atomic::AtomicBool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !held.load(std::sync::atomic::Ordering::Acquire) {
+        assert!(std::time::Instant::now() < deadline, "holder thread never acquired the lock");
+        std::hint::spin_loop();
+    }
+}
+
 fn tmp(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("hnsw-{name}-{}.hnsw", std::process::id()))
 }
@@ -284,5 +292,130 @@ fn tombstoned_virgin_slot_does_not_alias_upper_entry_zero() {
     let mut virgin_upper = Vec::new();
     assert!(graph.upper_neighbors_into(virgin, 1, &mut virgin_upper));
     assert_eq!(virgin_upper, vec![1, 2]);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The host's id counter reseeds to largestNodeId + 1 across a restart, so deleting the top
+/// ids hands them back out and the new record redraws its level — often 0. The re-minted slot
+/// must stop reading its predecessor's upper adjacency, and cycling a hot id through levels
+/// must not consume a fresh entry each time.
+#[test]
+fn raw_rewrite_at_level_zero_clears_the_stale_hierarchy() {
+    let dims = 32;
+    let path = tmp("upperstale");
+    let _ = std::fs::remove_file(&path);
+    let graph = Graph::new(PlaneFile::create(&path, dims, 16, 64).expect("create"));
+    let q = hnsw_plane::distance::quantize_int8(&vector_for(9, dims));
+    let write = |level: u8, upper: &[Vec<u32>]| {
+        graph.write_node_raw(9, level, &q.0, q.1, q.2, &[1, 2], upper).unwrap();
+    };
+    let mut nbrs = Vec::new();
+
+    write(1, &[vec![7]]);
+    assert!(graph.upper_neighbors_into(9, 1, &mut nbrs) && nbrs == vec![7]);
+    write(0, &[]);
+    assert!(!graph.upper_neighbors_into(9, 1, &mut nbrs), "a level-0 rewrite must not leave the old hierarchy readable");
+
+    // cycling the same id through level 0 and back must reuse its entry, not mint one per pass
+    for n in 0..graph.file.upper_capacity as u32 + 4 {
+        write(1, &[vec![n % 8]]);
+        write(0, &[]);
+    }
+    write(1, &[vec![5]]);
+    assert!(
+        graph.upper_neighbors_into(9, 1, &mut nbrs),
+        "upper region exhausted: level cycling minted a new entry per pass"
+    );
+    assert_eq!(nbrs, vec![5]);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A peer worker holding the slot lock past the 20 ms stale window makes the lock-free upper
+/// read give up and report NO_UPPER. Treating that "cannot tell" as "nothing bound" mints a
+/// second entry per contended mirror and orphans the first, so a hot node burns the fixed
+/// upper region until level>=1 mirrors stop binding at all.
+#[test]
+fn contended_raw_rewrite_does_not_mint_a_second_upper_entry() {
+    use std::sync::atomic::{AtomicBool, Ordering as O};
+    let dims = 32;
+    let path = tmp("uppercontend");
+    let _ = std::fs::remove_file(&path);
+    let graph = std::sync::Arc::new(Graph::new(PlaneFile::create(&path, dims, 16, 64).expect("create")));
+    let q = hnsw_plane::distance::quantize_int8(&vector_for(9, dims));
+    graph.write_node_raw(9, 1, &q.0, q.1, q.2, &[1, 2], &[vec![7]]).unwrap();
+
+    let seq9 = graph.file.seq_atomic(9) as *const _ as usize;
+    for n in 0..graph.file.upper_capacity as u32 + 4 {
+        let g2 = graph.clone();
+        let held = std::sync::Arc::new(AtomicBool::new(false));
+        let held2 = held.clone();
+        let hold = std::thread::spawn(move || {
+            let seq = unsafe { &*(seq9 as *const std::sync::atomic::AtomicU32) };
+            let g2 = &g2;
+            let guard =
+                hnsw_plane::seqlock::write_lock(seq, g2.file.self_tag, || panic!("live owner sanitized"), |tag| {
+                    g2.file.tag_is_dead(tag)
+                })
+                .expect("the holder must actually take the lock, or the test proves nothing");
+            held2.store(true, O::Release);
+            std::thread::sleep(std::time::Duration::from_millis(30)); // past TAKEOVER_AFTER
+            drop(guard);
+        });
+        await_lock(&held);
+        graph.write_node_raw(9, 1, &q.0, q.1, q.2, &[1, 2], &[vec![n % 8]]).unwrap();
+        hold.join().unwrap();
+    }
+
+    let mut nbrs = Vec::new();
+    assert!(
+        graph.upper_neighbors_into(9, 1, &mut nbrs),
+        "upper region exhausted: each contended rewrite minted and orphaned an entry"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Nothing references a freshly allocated upper entry until its write lands, so a path that
+/// gives up on a wedged slot lock without freeing strands it outside both the freelist and the
+/// graph.
+#[test]
+fn a_wedged_untouched_write_frees_its_upper_entry() {
+    use std::sync::atomic::Ordering as O;
+    let dims = 32;
+    let path = tmp("wedgeuntouched");
+    let _ = std::fs::remove_file(&path);
+    let graph = std::sync::Arc::new(Graph::new(PlaneFile::create(&path, dims, 16, 64).expect("create")));
+    let write = |id: u32| {
+        let q = hnsw_plane::distance::quantize_int8(&vector_for(id, dims));
+        graph.write_node_if_untouched(id, 1, &q.0, q.1, q.2, &[1, 2], &[vec![id]])
+    };
+
+    assert_eq!(write(1), Ok(true));
+    let baseline = graph.file.upper_high_water();
+
+    let seq9 = graph.file.seq_atomic(9) as *const _ as usize;
+    let g2 = graph.clone();
+    let held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let held2 = held.clone();
+    let hold = std::thread::spawn(move || {
+        let seq = unsafe { &*(seq9 as *const std::sync::atomic::AtomicU32) };
+        let g2 = &g2;
+        let guard = hnsw_plane::seqlock::write_lock(seq, g2.file.self_tag, || panic!("live owner sanitized"), |tag| {
+            g2.file.tag_is_dead(tag)
+        })
+        .expect("the holder must actually take the lock, or the test proves nothing");
+        held2.store(true, O::Release);
+        std::thread::sleep(std::time::Duration::from_millis(6_500)); // past WRITE_WEDGE_AFTER
+        drop(guard);
+    });
+    await_lock(&held);
+    assert_eq!(write(9), Err(hnsw_plane::seqlock::Wedged), "the held lock must wedge this write");
+    hold.join().unwrap();
+
+    assert_eq!(write(2), Ok(true));
+    assert_eq!(
+        graph.file.upper_high_water(),
+        baseline + 1,
+        "the wedged write leaked its upper entry instead of returning it to the freelist"
+    );
     let _ = std::fs::remove_file(&path);
 }

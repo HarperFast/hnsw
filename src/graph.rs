@@ -249,22 +249,24 @@ impl Graph {
         seqlock::read_consistent(seq, self.file.self_tag, || unsafe { *self.file.slot_ptr(id).add(S_FLAGS) != 0 }, self.slot_sanitizer(id), || true, self.owner_dead())
     }
 
-    /// The slot's stored upper idx regardless of valid/deleted flags — the raw mirroring
-    /// path reuses a cleared node's entry when the host rewrites the same id.
-    fn upper_idx_raw(&self, id: u32) -> u32 {
+    /// The slot's stored upper idx regardless of valid/deleted flags. Taken under the slot
+    /// write lock rather than `read_consistent`, whose NO_UPPER fallback cannot be told apart
+    /// from an unbound slot — reusing it as one mints a second entry for an id that already
+    /// owns one.
+    fn upper_idx_locked(&self, id: u32) -> Result<u32, Wedged> {
         if !self.in_range(id) {
-            return NO_UPPER;
+            return Ok(NO_UPPER);
         }
         let seq = self.file.seq_atomic(id);
-        seqlock::read_consistent(seq, self.file.self_tag, || {
-            let p = self.file.slot_ptr(id);
-            unsafe {
-                if *p.add(S_FLAGS) == 0 {
-                    return NO_UPPER; // never written
-                }
+        let _guard = seqlock::write_lock(seq, self.file.self_tag, self.slot_sanitizer(id), self.owner_dead())?;
+        let p = self.file.slot_ptr(id);
+        Ok(unsafe {
+            if *p.add(S_FLAGS) == 0 {
+                NO_UPPER // never written
+            } else {
                 (p.add(S_UPPER_IDX) as *const u32).read_unaligned()
             }
-        }, self.slot_sanitizer(id), || NO_UPPER, self.owner_dead())
+        })
     }
 
     /// Mirror a host-maintained node into the plane: full state per call, host-allocated id
@@ -281,21 +283,35 @@ impl Graph {
         upper_levels: &[Vec<u32>],
     ) -> Result<(), Wedged> {
         self.file.ensure_high_water(id);
-        let existing = match self.upper_idx_raw(id) {
+        let existing = match self.upper_idx_locked(id)? {
             idx if idx != NO_UPPER && (idx as u64) >= self.file.upper_capacity => NO_UPPER, // corrupt stored index
             idx => idx,
         };
+        let mut fresh = NO_UPPER;
         let upper_idx = if upper_levels.is_empty() {
-            existing // keep an existing entry bound (level never shrinks in practice)
+            // the host reseeds its id counter to largestNodeId + 1 on restart, so an id can be
+            // re-minted at level 0 over a slot that had a hierarchy; that entry must stop being
+            // readable. Emptied in place rather than freed: the freelist hand-off is not atomic
+            // with publishing the slot below, so a mirror that read this index first could
+            // republish a slot pointing at an entry already given to another node. One idle
+            // entry per id is the bounded retention hnsw-native-plane.md §10 accepts.
+            if existing != NO_UPPER {
+                self.rewrite_upper(existing, &[])?;
+            }
+            existing
         } else if existing != NO_UPPER {
             self.rewrite_upper(existing, upper_levels)?;
             existing
         } else {
-            self.write_upper(upper_levels)?
+            fresh = self.write_upper(upper_levels)?;
+            fresh
         };
         let mut l0 = neighbors.to_vec();
         l0.truncate(self.file.layer0_cap);
-        self.write_node(id, level, vector, scale, inv_mag, &l0, upper_idx)?;
+        if let Err(wedged) = self.write_node(id, level, vector, scale, inv_mag, &l0, upper_idx) {
+            self.file.free_upper(fresh); // unreachable from any slot until publication succeeds
+            return Err(wedged);
+        }
         Ok(())
     }
 
@@ -616,12 +632,20 @@ impl Graph {
         debug_assert!(neighbors.len() <= self.file.layer0_cap);
         debug_assert_eq!(vector.len(), self.file.dims);
         self.file.ensure_high_water(id);
-        // the upper entry is allocated before taking the slot lock (allocation is cheap and
-        // an unused entry is freed below on the untouched-check failing)
+        // the upper entry is allocated before taking the slot lock (allocation is cheap); it is
+        // unreachable from any slot until the write below lands, so every path that does not
+        // publish it — a wedged lock, a slot that turns out to be touched — has to free it
         let upper_idx = if upper_levels.is_empty() { NO_UPPER } else { self.write_upper(upper_levels)? };
         let seq = self.file.seq_atomic(id);
         let written = {
-            let _guard = seqlock::write_lock(seq, self.file.self_tag, self.slot_sanitizer(id), self.owner_dead())?;
+            let _guard = match seqlock::write_lock(seq, self.file.self_tag, self.slot_sanitizer(id), self.owner_dead())
+            {
+                Ok(guard) => guard,
+                Err(wedged) => {
+                    self.file.free_upper(upper_idx);
+                    return Err(wedged);
+                }
+            };
             let p = self.file.slot_ptr_mut(id);
             let dims = self.file.dims;
             unsafe {
