@@ -12,7 +12,6 @@
 	"files": [
 		"index.js",
 		"index.d.ts",
-		"prebuilds",
 		"hnsw-plane.node",
 		"src",
 		"build.rs",
@@ -40,5 +39,11 @@
 		"mmap",
 		"napi",
 		"rust"
-	]
+	],
+	"optionalDependencies": {
+		"@harperfast/hnsw-darwin-arm64": "0.1.0",
+		"@harperfast/hnsw-linux-arm64-glibc": "0.1.0",
+		"@harperfast/hnsw-linux-x64-glibc": "0.1.0",
+		"@harperfast/hnsw-win32-x64": "0.1.0"
+	}
 }

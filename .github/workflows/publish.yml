@@ -1,0 +1,98 @@
+name: Publish
+
+on:
+  release:
+    types: [created]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # ubuntu-22.04 pins the glibc baseline at 2.35
+          - os: ubuntu-22.04
+            target: linux-x64-glibc
+          - os: ubuntu-22.04-arm
+            target: linux-arm64-glibc
+          - os: macos-14
+            target: darwin-arm64
+          - os: windows-latest
+            target: win32-x64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Crate tests
+        run: cargo test --release
+      - name: Build NAPI module
+        run: node build.mjs
+      - name: Smoke test
+        run: node smoke.mjs
+      - name: Stage artifact
+        shell: bash
+        run: mkdir -p artifacts/${{ matrix.target }} && cp hnsw-plane.node artifacts/${{ matrix.target }}/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binding-${{ matrix.target }}
+          path: artifacts/${{ matrix.target }}/hnsw-plane.node
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: 'https://registry.npmjs.org'
+      - name: Verify the release tag matches package.json
+        shell: bash
+        run: |
+          set -e
+          VERSION=$(echo "${{ github.event.release.tag_name }}" | sed 's/^v//')
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ "$VERSION" != "$PKG_VERSION" ]; then
+            echo "Release tag $VERSION does not match package.json $PKG_VERSION"
+            exit 1
+          fi
+      - name: Determine dist-tag
+        id: dist-tag
+        shell: bash
+        run: |
+          if [ "${{ github.event.release.prerelease }}" = "true" ]; then
+            echo "tag=next" >> $GITHUB_OUTPUT
+          else
+            echo "tag=latest" >> $GITHUB_OUTPUT
+          fi
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts-raw
+      - name: Arrange artifacts
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          for d in artifacts-raw/binding-*; do
+            target=${d#artifacts-raw/binding-}
+            mkdir -p "artifacts/$target"
+            cp "$d/hnsw-plane.node" "artifacts/$target/"
+          done
+          ls -laR artifacts
+      - name: Publish platform bindings
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          TAG: ${{ steps.dist-tag.outputs.tag }}
+        run: node scripts/publish-bindings.mjs
+      - name: Publish main package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --tag ${{ steps.dist-tag.outputs.tag }}

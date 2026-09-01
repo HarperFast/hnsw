@@ -12,9 +12,9 @@ jobs:
         include:
           # 22.04 pins the glibc baseline at 2.35 so current enterprise bases can load it
           - os: ubuntu-22.04
-            target: linux-x64
+            target: linux-x64-glibc
           - os: ubuntu-22.04-arm
-            target: linux-arm64
+            target: linux-arm64-glibc
           # no darwin-x64 prebuild: GitHub is sunsetting free Intel macOS runners; Intel
           # Macs build from source via the install fallback
           - os: macos-14

@@ -10,12 +10,9 @@ import { fileURLToPath } from 'node:url';
 const crateRoot = dirname(fileURLToPath(import.meta.url));
 const ifNeeded = process.argv.includes('--if-needed');
 const artifact = join(crateRoot, 'hnsw-plane.node');
-const prebuilt = join(crateRoot, 'prebuilds', `${process.platform}-${process.arch}`, 'hnsw-plane.node');
-
-// a prebuild satisfies --if-needed only if it actually LOADS on this system (a newer-glibc
-// artifact exists but throws at require; fall through to a local build in that case)
+// a platform optionalDependency or a loadable local artifact satisfies --if-needed (a
+// binding that exists but fails to link falls through to a local build)
 function loads(path) {
-	if (!existsSync(path)) return false;
 	try {
 		createRequire(import.meta.url)(path);
 		return true;
@@ -23,7 +20,11 @@ function loads(path) {
 		return false;
 	}
 }
-if (ifNeeded && (loads(artifact) || loads(prebuilt))) {
+function platformPackageLoads() {
+	const libc = process.platform === 'linux' ? '-glibc' : '';
+	return loads(`@harperfast/hnsw-${process.platform}-${process.arch}${libc}`);
+}
+if (ifNeeded && (platformPackageLoads() || (existsSync(artifact) && loads(artifact)))) {
 	process.exit(0);
 }
 try {

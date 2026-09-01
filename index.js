@@ -1,30 +1,51 @@
-// Loads the native module: a bundled prebuild for this platform when present, else a
-// locally built artifact (`npm run build`, requires a Rust toolchain). Linux prebuilds are
-// glibc builds; musl systems build locally.
+// Loads the native module, mirroring @harperfast/rocksdb-js's model: a platform-specific
+// optionalDependency package when one exists for this platform (linux bindings are split by
+// libc), else a locally built artifact (`npm run build`, requires a Rust toolchain).
 'use strict';
 const { existsSync } = require('node:fs');
 const { join } = require('node:path');
 
-const candidates = [
-	join(__dirname, 'prebuilds', `${process.platform}-${process.arch}`, 'hnsw-plane.node'),
-	join(__dirname, 'hnsw-plane.node'),
-];
-// pick the first candidate that actually LOADS (a prebuilt binary can exist but fail to
-// link, e.g. built against a newer glibc than this system's — fall through to a local build)
-let native0;
-const failures = [];
-for (const candidate of candidates) {
-	if (!existsSync(candidate)) continue;
+function libcSuffix() {
+	if (process.platform !== 'linux') return '';
+	let isMusl = false;
 	try {
-		native0 = require(candidate);
-		break;
-	} catch (error) {
-		failures.push(`${candidate}: ${error.message}`);
+		const { glibcVersionRuntime } = process.report?.getReport?.()?.header ?? {};
+		isMusl = !glibcVersionRuntime;
+	} catch {
+		// fall through to ldd probing
+	}
+	if (!isMusl) return '-glibc';
+	try {
+		const { execSync } = require('node:child_process');
+		isMusl = execSync('ldd --version', { encoding: 'utf8', stdio: 'pipe' }).includes('musl');
+	} catch {
+		// ldd may not exist; keep the report-based verdict
+	}
+	return isMusl ? '-musl' : '-glibc';
+}
+
+const failures = [];
+let native0;
+// 1. platform package (published binding)
+try {
+	native0 = require(`@harperfast/hnsw-${process.platform}-${process.arch}${libcSuffix()}`);
+} catch (error) {
+	failures.push(`platform package: ${error.message}`);
+}
+// 2. local build (dev checkouts, source-build installs)
+if (!native0) {
+	const local = join(__dirname, 'hnsw-plane.node');
+	if (existsSync(local)) {
+		try {
+			native0 = require(local);
+		} catch (error) {
+			failures.push(`${local}: ${error.message}`);
+		}
 	}
 }
 if (!native0) {
 	throw new Error(
-		`@harperfast/hnsw could not load a native binary for ${process.platform}-${process.arch}. ` +
+		`@harperfast/hnsw could not load a native binding for ${process.platform}-${process.arch}. ` +
 			'Build one with `npm run build` in ' +
 			__dirname +
 			' (requires a Rust toolchain: https://rustup.rs).' +

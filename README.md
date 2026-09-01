@@ -35,15 +35,18 @@ the host's authoritative record store. Approximate indexes don't need per-commit
 they need cheap, bounded catch-up. See [DESIGN.md](DESIGN.md) for the format, the
 concurrency model, measured baselines, and the reasoning behind every trade.
 
-## Install & build
+## Install
 
 ```bash
 npm install @harperfast/hnsw
 ```
 
-Prebuilds are not published yet: building requires a [Rust toolchain](https://rustup.rs)
-(`npm run build`, or automatically on install when cargo is available). Linux x86_64 is the
-performance target (AVX2); macOS works (scalar fallback); Windows is untested.
+Prebuilt bindings ship as platform-specific `optionalDependencies`
+(`@harperfast/hnsw-<platform>-<arch>[-glibc]`) for linux-x64, linux-arm64, darwin-arm64, and
+win32-x64. Platforms without a published binding (musl, darwin-x64, win32-arm64) build from
+source on install when a [Rust toolchain](https://rustup.rs) is present, and throw a clear
+error otherwise. Linux x86_64 is the performance target (AVX2 + kernel-lock crash recovery);
+macOS and Windows are functional (no lock takeover — bounded degradation instead).
 
 ## Usage
 
