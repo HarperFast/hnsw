@@ -39,7 +39,8 @@ export declare class Plane {
 		k: number,
 		ef: number,
 		predicate: (ids: Array<number>) => Uint8Array,
-		filterExpansion?: number
+		filterExpansion?: number,
+		visitBudget?: number
 	): Promise<Array<SearchHit>>;
 	/** Synchronous search (benchmarks/tests; blocks the calling thread). */
 	searchSync(vector: Float32Array, k: number, ef: number): Array<SearchHit>;
@@ -90,10 +91,12 @@ export declare class Plane {
 	getWatermark(): number;
 	setWatermark(txn: number): void;
 	/**
-	 * Durability barrier: flush all data, then advance the watermark (defaults to the current
-	 * one) and the clean-shutdown flag, then flush the header alone — a crash between the two
+	 * Durability barrier: flush all data, then advance the watermark (omitted = leave the
+	 * stored watermark untouched), then flush the header alone — a crash between the two
 	 * flushes leaves an old watermark over durable data, never a new watermark over missing
-	 * data. Reopening a plane that was not cleanly flushed scrubs any torn per-slot locks.
+	 * data. Crash recovery is per-slot: a lock abandoned by a dead handle is detected via a
+	 * kernel-owned registration (immune to pid reuse) and taken over, with the slot marked
+	 * deleted until rewritten.
 	 */
 	flush(watermark?: number): void;
 	/** flush() on the libuv thread pool — a whole-map msync can stall its calling thread. */

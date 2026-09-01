@@ -2,6 +2,7 @@
 // a missing Rust toolchain or a failed build is a warning and exit 0 — consumers treat the
 // module as optional and fall back to their own path when the artifact is absent.
 import { execSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { copyFileSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,7 +12,18 @@ const ifNeeded = process.argv.includes('--if-needed');
 const artifact = join(crateRoot, 'hnsw-plane.node');
 const prebuilt = join(crateRoot, 'prebuilds', `${process.platform}-${process.arch}`, 'hnsw-plane.node');
 
-if (ifNeeded && (existsSync(artifact) || existsSync(prebuilt))) {
+// a prebuild satisfies --if-needed only if it actually LOADS on this system (a newer-glibc
+// artifact exists but throws at require; fall through to a local build in that case)
+function loads(path) {
+	if (!existsSync(path)) return false;
+	try {
+		createRequire(import.meta.url)(path);
+		return true;
+	} catch {
+		return false;
+	}
+}
+if (ifNeeded && (loads(artifact) || loads(prebuilt))) {
 	process.exit(0);
 }
 try {

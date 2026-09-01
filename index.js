@@ -9,16 +9,29 @@ const candidates = [
 	join(__dirname, 'prebuilds', `${process.platform}-${process.arch}`, 'hnsw-plane.node'),
 	join(__dirname, 'hnsw-plane.node'),
 ];
-const artifact = candidates.find(existsSync);
-if (!artifact) {
+// pick the first candidate that actually LOADS (a prebuilt binary can exist but fail to
+// link, e.g. built against a newer glibc than this system's — fall through to a local build)
+let native0;
+const failures = [];
+for (const candidate of candidates) {
+	if (!existsSync(candidate)) continue;
+	try {
+		native0 = require(candidate);
+		break;
+	} catch (error) {
+		failures.push(`${candidate}: ${error.message}`);
+	}
+}
+if (!native0) {
 	throw new Error(
-		`@harperfast/hnsw has no prebuilt binary for ${process.platform}-${process.arch} and no local build. ` +
+		`@harperfast/hnsw could not load a native binary for ${process.platform}-${process.arch}. ` +
 			'Build one with `npm run build` in ' +
 			__dirname +
-			' (requires a Rust toolchain: https://rustup.rs).'
+			' (requires a Rust toolchain: https://rustup.rs).' +
+			(failures.length ? ` Load failures: ${failures.join('; ')}` : '')
 	);
 }
-const native = require(artifact);
+const native = native0;
 
 // A predicate that throws would surface through the ThreadsafeFunction as a fatal exception
 // (aborting the process); wrap it so a throw denies the batch and rejects the search instead.
