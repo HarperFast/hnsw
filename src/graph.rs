@@ -6,14 +6,43 @@
 
 use crate::distance::{cosine_i8_i8_raw, cosine_int8_raw, Query};
 use crate::format::{
-    PlaneFile, FLAG_DELETED, FLAG_VALID, MAX_UPPER_LEVELS, NO_UPPER, S_DEGREE, S_FLAGS, S_INV_MAG, S_LEVEL, S_SCALE,
-    S_UPPER_IDX, S_VECTOR, UPPER_CAP, UPPER_LEVEL_STRIDE, U_LEVELS, U_LISTS,
+    neighbor_offset, PlaneFile, FLAG_DELETED, FLAG_VALID, MAX_UPPER_LEVELS, NO_UPPER, S_DEGREE, S_FLAGS, S_INV_MAG,
+    S_LEVEL, S_SCALE, S_UPPER_IDX, S_VECTOR, UPPER_CAP, UPPER_LEVEL_STRIDE, UL_DEGREE, UL_IDS, U_LEVELS, U_LISTS,
 };
 use crate::seqlock;
 use crate::seqlock::Wedged;
 
+/// Aligned volatile load of a slot/upper-entry field another process may be mutating.
+///
+/// This forbids the optimizer from duplicating, splitting, or sinking the load across the
+/// seqlock's validating fence, which would let a reader act on bytes the generation check
+/// never covered. It does NOT make the access race-free under Rust's memory model — only
+/// atomics would, and that is the format change DESIGN.md §10 records as
+/// follow-up. The vector is deliberately not read this way: `cosine_int8_raw` must stay
+/// autovectorized, and a torn vector only perturbs a distance the generation check discards.
+/// Every field read here is naturally aligned (slots are 64-aligned; the neighbor and upper
+/// id arrays are 4-padded by format.rs), so these compile to single loads.
+#[inline(always)]
+unsafe fn vread<T: Copy>(p: *const T) -> T {
+    p.read_volatile()
+}
+
 pub struct Graph {
     pub file: PlaneFile,
+    /// Rotates `probe_for_entry`'s starting offset so this plane's consecutive repairs sample
+    /// different ids. Per handle, not per process: a shared counter is advanced by every other
+    /// plane's repairs too, so one plane's calls can land on a single residue indefinitely —
+    /// which is the coverage the rotation exists to provide.
+    probe_rotation: std::sync::atomic::AtomicU32,
+    /// (high-water, write epoch) at which this handle's last `stride` consecutive probes all
+    /// came back empty, so a fully dead graph stops paying the probe; any handle's node write
+    /// bumps the header epoch and re-arms it.
+    probe_futile_hw: std::sync::atomic::AtomicU64,
+    probe_futile_epoch: std::sync::atomic::AtomicU64,
+    probe_futile_runs: std::sync::atomic::AtomicU32,
+    /// One repair probe at a time per handle: concurrent searches on the pool would each pay
+    /// the full walk before one of them publishes.
+    probe_in_flight: std::sync::atomic::AtomicBool,
 }
 
 /// A consistent full copy of one node (construction paths only; search uses zero-copy).
@@ -27,7 +56,19 @@ pub struct NodeRead {
 
 impl Graph {
     pub fn new(file: PlaneFile) -> Self {
-        Graph { file }
+        Graph {
+            file,
+            probe_rotation: std::sync::atomic::AtomicU32::new(0),
+            probe_futile_hw: std::sync::atomic::AtomicU64::new(u64::MAX),
+            probe_futile_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
+            probe_futile_runs: std::sync::atomic::AtomicU32::new(0),
+            probe_in_flight: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    #[inline]
+    fn node_written(&self) {
+        self.file.bump_write_epoch();
     }
 
     #[inline]
@@ -67,12 +108,12 @@ impl Graph {
         seqlock::read_consistent(seq, self.file.self_tag, || {
             let p = self.file.slot_ptr(id);
             unsafe {
-                let flags = *p.add(S_FLAGS);
+                let flags = vread(p.add(S_FLAGS));
                 if flags & FLAG_VALID == 0 || flags & FLAG_DELETED != 0 {
                     return None;
                 }
-                let scale = (p.add(S_SCALE) as *const f32).read_unaligned();
-                let inv_mag = (p.add(S_INV_MAG) as *const f32).read_unaligned();
+                let scale = vread(p.add(S_SCALE) as *const f32);
+                let inv_mag = vread(p.add(S_INV_MAG) as *const f32);
                 Some(cosine_int8_raw(query, p.add(S_VECTOR) as *const i8, scale, inv_mag))
             }
         }, self.slot_sanitizer(id), || None, self.owner_dead())
@@ -119,20 +160,20 @@ impl Graph {
         }
         let seq = self.file.seq_atomic(id);
         let cap = self.file.layer0_cap;
-        let dims = self.file.dims;
+        let nbase = neighbor_offset(self.file.dims);
         seqlock::read_consistent(seq, self.file.self_tag, || {
             out.clear();
             let p = self.file.slot_ptr(id);
             unsafe {
-                let flags = *p.add(S_FLAGS);
+                let flags = vread(p.add(S_FLAGS));
                 if flags & FLAG_VALID == 0 || flags & FLAG_DELETED != 0 {
                     return None;
                 }
-                let level = *p.add(S_LEVEL);
-                let degree = u16::from_le((p.add(S_DEGREE) as *const u16).read_unaligned()) as usize;
-                let base = p.add(S_VECTOR + dims) as *const u32;
+                let level = vread(p.add(S_LEVEL));
+                let degree = u16::from_le(vread(p.add(S_DEGREE) as *const u16)) as usize;
+                let base = p.add(nbase) as *const u32;
                 for i in 0..degree.min(cap) {
-                    out.push(u32::from_le(base.add(i).read_unaligned()));
+                    out.push(u32::from_le(vread(base.add(i))));
                 }
                 Some(level)
             }
@@ -149,11 +190,11 @@ impl Graph {
         seqlock::read_consistent(seq, self.file.self_tag, || {
             let p = self.file.slot_ptr(id);
             unsafe {
-                let flags = *p.add(S_FLAGS);
+                let flags = vread(p.add(S_FLAGS));
                 if flags & FLAG_VALID == 0 || flags & FLAG_DELETED != 0 {
                     return NO_UPPER;
                 }
-                (p.add(S_UPPER_IDX) as *const u32).read_unaligned()
+                vread(p.add(S_UPPER_IDX) as *const u32)
             }
         }, self.slot_sanitizer(id), || NO_UPPER, self.owner_dead())
     }
@@ -172,15 +213,15 @@ impl Graph {
             out.clear();
             let p = self.file.upper_ptr(idx);
             unsafe {
-                let levels = *p.add(U_LEVELS);
+                let levels = vread(p.add(U_LEVELS));
                 if level > levels {
                     return false;
                 }
                 let lp = p.add(U_LISTS + (level as usize - 1) * UPPER_LEVEL_STRIDE);
-                let degree = u16::from_le((lp as *const u16).read_unaligned()) as usize;
-                let base = lp.add(2) as *const u32;
+                let degree = u16::from_le(vread(lp.add(UL_DEGREE) as *const u16)) as usize;
+                let base = lp.add(UL_IDS) as *const u32;
                 for i in 0..degree.min(UPPER_CAP) {
-                    out.push(u32::from_le(base.add(i).read_unaligned()));
+                    out.push(u32::from_le(vread(base.add(i))));
                 }
                 true
             }
@@ -206,8 +247,8 @@ impl Graph {
             for (l, list) in levels.iter().take(n).enumerate() {
                 let lp = p.add(U_LISTS + l * UPPER_LEVEL_STRIDE);
                 let deg = list.len().min(UPPER_CAP);
-                (lp as *mut u16).write_unaligned((deg as u16).to_le());
-                let base = lp.add(2) as *mut u32;
+                (lp.add(UL_DEGREE) as *mut u16).write_unaligned((deg as u16).to_le());
+                let base = lp.add(UL_IDS) as *mut u32;
                 for (i, id) in list.iter().take(deg).enumerate() {
                     base.add(i).write_unaligned(id.to_le());
                 }
@@ -229,8 +270,8 @@ impl Graph {
             for (l, list) in levels.iter().take(n).enumerate() {
                 let lp = p.add(U_LISTS + l * UPPER_LEVEL_STRIDE);
                 let deg = list.len().min(UPPER_CAP);
-                (lp as *mut u16).write_unaligned((deg as u16).to_le());
-                let base = lp.add(2) as *mut u32;
+                (lp.add(UL_DEGREE) as *mut u16).write_unaligned((deg as u16).to_le());
+                let base = lp.add(UL_IDS) as *mut u32;
                 for (i, id) in list.iter().take(deg).enumerate() {
                     base.add(i).write_unaligned(id.to_le());
                 }
@@ -246,7 +287,7 @@ impl Graph {
             return false;
         }
         let seq = self.file.seq_atomic(id);
-        seqlock::read_consistent(seq, self.file.self_tag, || unsafe { *self.file.slot_ptr(id).add(S_FLAGS) != 0 }, self.slot_sanitizer(id), || true, self.owner_dead())
+        seqlock::read_consistent(seq, self.file.self_tag, || unsafe { vread(self.file.slot_ptr(id).add(S_FLAGS)) != 0 }, self.slot_sanitizer(id), || true, self.owner_dead())
     }
 
     /// The slot's stored upper idx regardless of valid/deleted flags. Taken under the slot
@@ -294,7 +335,7 @@ impl Graph {
             // readable. Emptied in place rather than freed: the freelist hand-off is not atomic
             // with publishing the slot below, so a mirror that read this index first could
             // republish a slot pointing at an entry already given to another node. One idle
-            // entry per id is the bounded retention hnsw-native-plane.md §10 accepts.
+            // entry per id is the bounded retention DESIGN.md §10 accepts.
             if existing != NO_UPPER {
                 self.rewrite_upper(existing, &[])?;
             }
@@ -356,12 +397,12 @@ impl Graph {
                 return Ok(false);
             }
             let lp = p.add(U_LISTS + (level as usize - 1) * UPPER_LEVEL_STRIDE);
-            let degree = u16::from_le((lp as *const u16).read_unaligned()) as usize;
-            let base = lp.add(2) as *mut u32;
+            let degree = u16::from_le((lp.add(UL_DEGREE) as *const u16).read_unaligned()) as usize;
+            let base = lp.add(UL_IDS) as *mut u32;
             let mut list: Vec<u32> = (0..degree.min(UPPER_CAP)).map(|i| u32::from_le(base.add(i).read_unaligned())).collect();
             f(&mut list);
             list.truncate(UPPER_CAP);
-            (lp as *mut u16).write_unaligned((list.len() as u16).to_le());
+            (lp.add(UL_DEGREE) as *mut u16).write_unaligned((list.len() as u16).to_le());
             for (i, id) in list.iter().enumerate() {
                 base.add(i).write_unaligned(id.to_le());
             }
@@ -377,20 +418,21 @@ impl Graph {
         let seq = self.file.seq_atomic(id);
         let dims = self.file.dims;
         let cap = self.file.layer0_cap;
+        let nbase_off = neighbor_offset(dims);
         seqlock::read_consistent(seq, self.file.self_tag, || {
             let p = self.file.slot_ptr(id);
             unsafe {
-                let flags = *p.add(S_FLAGS);
+                let flags = vread(p.add(S_FLAGS));
                 if flags & FLAG_VALID == 0 || flags & FLAG_DELETED != 0 {
                     return None;
                 }
-                let level = *p.add(S_LEVEL);
-                let degree = u16::from_le((p.add(S_DEGREE) as *const u16).read_unaligned()) as usize;
-                let scale = (p.add(S_SCALE) as *const f32).read_unaligned();
-                let inv_mag = (p.add(S_INV_MAG) as *const f32).read_unaligned();
+                let level = vread(p.add(S_LEVEL));
+                let degree = u16::from_le(vread(p.add(S_DEGREE) as *const u16)) as usize;
+                let scale = vread(p.add(S_SCALE) as *const f32);
+                let inv_mag = vread(p.add(S_INV_MAG) as *const f32);
                 let vector = std::slice::from_raw_parts(p.add(S_VECTOR) as *const i8, dims).to_vec();
-                let nbase = p.add(S_VECTOR + dims) as *const u32;
-                let neighbors = (0..degree.min(cap)).map(|i| u32::from_le(nbase.add(i).read_unaligned())).collect();
+                let nbase = p.add(nbase_off) as *const u32;
+                let neighbors = (0..degree.min(cap)).map(|i| u32::from_le(vread(nbase.add(i)))).collect();
                 Some(NodeRead { level, scale, inv_mag, vector, neighbors })
             }
         }, self.slot_sanitizer(id), || None, self.owner_dead())
@@ -413,11 +455,15 @@ impl Graph {
             (p.add(S_UPPER_IDX) as *mut u32).write_unaligned(upper_idx);
             std::ptr::copy_nonoverlapping(vector.as_ptr() as *const u8, p.add(S_VECTOR), dims);
             for (i, n) in neighbors.iter().enumerate() {
-                (p.add(S_VECTOR + dims + i * 4) as *mut u32).write_unaligned(n.to_le());
+                (p.add(neighbor_offset(dims) + i * 4) as *mut u32).write_unaligned(n.to_le());
             }
             // valid last within the locked section; the seqlock release publishes it
             *p.add(S_FLAGS) = FLAG_VALID;
         }
+        drop(_guard);
+        // after the release: a probe that consumed a bump while the slot was still invalid
+        // would otherwise latch on a graph that holds a live node
+        self.node_written();
         Ok(())
     }
 
@@ -440,7 +486,7 @@ impl Graph {
                 return Ok(false);
             }
             let degree = u16::from_le((p.add(S_DEGREE) as *const u16).read_unaligned()) as usize;
-            let base = p.add(S_VECTOR + dims) as *mut u32;
+            let base = p.add(neighbor_offset(dims)) as *mut u32;
             let mut list: Vec<u32> = (0..degree.min(cap)).map(|i| u32::from_le(base.add(i).read_unaligned())).collect();
             f(&mut list);
             list.truncate(cap);
@@ -473,7 +519,7 @@ impl Graph {
             if degree != expected.len() {
                 return Ok(false);
             }
-            let base = p.add(S_VECTOR + dims) as *mut u32;
+            let base = p.add(neighbor_offset(dims)) as *mut u32;
             for (i, want) in expected.iter().enumerate() {
                 if u32::from_le(base.add(i).read_unaligned()) != *want {
                     return Ok(false);
@@ -497,7 +543,7 @@ impl Graph {
         unsafe {
             (p.add(S_DEGREE) as *mut u16).write_unaligned((neighbors.len() as u16).to_le());
             for (i, n) in neighbors.iter().enumerate() {
-                (p.add(S_VECTOR + dims + i * 4) as *mut u32).write_unaligned(n.to_le());
+                (p.add(neighbor_offset(dims) + i * 4) as *mut u32).write_unaligned(n.to_le());
             }
         }
         Ok(())
@@ -516,6 +562,13 @@ impl Graph {
         let mut candidates: Vec<u32> = Vec::new();
         if entry_id == id {
             self.neighbors_into(id, &mut candidates);
+        }
+        // Re-elect before the tombstone, not after: between marking the slot deleted and
+        // installing a replacement, every concurrent search routes through a node that reads
+        // as absent and returns nothing. The node is still live here, so a crash inside the
+        // window leaves the header naming a live entry either way.
+        if entry_id == id {
+            self.reelect_entry_point_replacing(&candidates, id);
         }
         let upper_idx;
         {
@@ -541,9 +594,6 @@ impl Graph {
             self.rewrite_upper(upper_idx, &[])?;
         }
         self.file.free_upper(upper_idx);
-        if entry_id == id {
-            self.reelect_entry_point_replacing(&candidates, id);
-        }
         self.file.free_id(id);
         Ok(())
     }
@@ -552,7 +602,7 @@ impl Graph {
     /// first live node found scanning the id range (rare path: only when the entry's whole
     /// neighborhood is gone). An empty graph clears the entry.
     /// A node's level without copying its vector or edges (cheap re-election scans).
-    fn node_level(&self, id: u32) -> Option<u8> {
+    pub(crate) fn node_level(&self, id: u32) -> Option<u8> {
         if !self.in_range(id) {
             return None;
         }
@@ -560,12 +610,73 @@ impl Graph {
         seqlock::read_consistent(seq, self.file.self_tag, || {
             let p = self.file.slot_ptr(id);
             unsafe {
-                if *p.add(S_FLAGS) != FLAG_VALID {
+                if vread(p.add(S_FLAGS)) != FLAG_VALID {
                     return None;
                 }
-                Some(*p.add(S_LEVEL))
+                Some(vread(p.add(S_LEVEL)))
             }
         }, self.slot_sanitizer(id), || None, self.owner_dead())
+    }
+
+    /// Highest-level live node among at most `limit` probes, skipping `skip`. The read-side
+    /// repair's last resort, bounded because `reelect_entry_point_replacing`'s scan runs to the
+    /// high-water mark and a search on the shared pool thread cannot afford it.
+    ///
+    /// Walks down from the newest id with a stride spanning the whole range, so it assumes
+    /// nothing about where the live nodes sit: Harper allocates ids monotonically and never
+    /// reuses them, so a churned table's low prefix is all tombstones, while the crate's own
+    /// freelist reuses ids and keeps live nodes low.
+    ///
+    /// The start rotates per handle, so `stride` consecutive repairs of this plane cover every id
+    /// while each stays capped at `limit`; a fixed start would probe one residue class forever
+    /// and leave a graph lying between its samples invisible permanently, not for one search.
+    /// That coverage rests on `stride * limit >= hw`, which is why the stride is a ceiling
+    /// division: below it a walk stops short of id 0 and no offset ever reaches the tail.
+    ///
+    /// Best-level rather than first-live: a level-0 entry degrades every later search to a
+    /// layer-0-only beam.
+    pub(crate) fn probe_for_entry(&self, limit: u32, skip: u32) -> Option<(u32, u8)> {
+        let hw = self.file.id_high_water().min(self.file.max_nodes) as u32;
+        if hw == 0 || limit == 0 {
+            return None;
+        }
+        let stride = hw.div_ceil(limit);
+        use std::sync::atomic::Ordering::Relaxed;
+        let epoch = self.file.write_epoch();
+        let unchanged = self.probe_futile_hw.load(Relaxed) == hw as u64 && self.probe_futile_epoch.load(Relaxed) == epoch;
+        if unchanged && self.probe_futile_runs.load(Relaxed) >= stride {
+            return None; // every residue probed since the last write anywhere: nothing to find
+        }
+        if self.probe_in_flight.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return None; // another search on this handle is repairing; it publishes for both
+        }
+        let offset = self.probe_rotation.fetch_add(1, Relaxed) % stride;
+        let mut best: Option<(u32, u8)> = None;
+        let mut cand = hw - 1 - offset;
+        for _ in 0..limit {
+            if cand != skip {
+                if let Some(level) = self.node_level(cand) {
+                    if best.map(|(_, l)| level > l).unwrap_or(true) {
+                        best = Some((cand, level));
+                    }
+                }
+            }
+            if cand < stride {
+                break;
+            }
+            cand -= stride;
+        }
+        if best.is_some() {
+            self.probe_futile_runs.store(0, Relaxed);
+        } else if unchanged {
+            self.probe_futile_runs.fetch_add(1, Relaxed);
+        } else {
+            self.probe_futile_hw.store(hw as u64, Relaxed);
+            self.probe_futile_epoch.store(epoch, Relaxed);
+            self.probe_futile_runs.store(1, Relaxed);
+        }
+        self.probe_in_flight.store(false, std::sync::atomic::Ordering::Release);
+        best
     }
 
     /// Pick a new entry point: the highest-level live node among `preferred`, else the
@@ -574,11 +685,7 @@ impl Graph {
     /// with no live neighborhood). Preferring level keeps the hierarchy navigable — a
     /// level-0 entry degrades every search to a layer-0-only beam. An empty graph clears
     /// the entry.
-    pub(crate) fn reelect_entry_point(&self, preferred: &[u32]) {
-        self.reelect_entry_point_replacing(preferred, crate::format::NO_ID)
-    }
-
-    fn reelect_entry_point_replacing(&self, preferred: &[u32], replacing: u32) {
+    pub(crate) fn reelect_entry_point_replacing(&self, preferred: &[u32], replacing: u32) {
         let mut best: Option<(u32, u8)> = None;
         // the most recently replaced entry point is the best cheap candidate: usually alive,
         // usually high-level — and it makes the full fallback scan a last resort
@@ -589,6 +696,9 @@ impl Graph {
             }
         }
         for &cand in preferred {
+            if cand == replacing {
+                continue; // the node on its way out is never its own replacement
+            }
             if let Some(level) = self.node_level(cand) {
                 if best.map(|(_, l)| level > l).unwrap_or(true) {
                     best = Some((cand, level));
@@ -598,6 +708,9 @@ impl Graph {
         if best.is_none() {
             let hw = self.file.id_high_water().min(self.file.max_nodes) as u32;
             for cand in 0..hw {
+                if cand == replacing {
+                    continue;
+                }
                 if let Some(level) = self.node_level(cand) {
                     if best.map(|(_, l)| level > l).unwrap_or(true) {
                         best = Some((cand, level));
@@ -610,7 +723,7 @@ impl Graph {
         }
         match best {
             Some((cand, level)) => self.file.set_entry_point_if_not_better(cand, level as u32, replacing),
-            None => self.file.set_entry_point_if_not_better(crate::format::NO_ID, 0, replacing),
+            None => self.file.clear_entry_point_if(replacing),
         }
     }
 
@@ -659,16 +772,73 @@ impl Graph {
                     (p.add(S_UPPER_IDX) as *mut u32).write_unaligned(upper_idx);
                     std::ptr::copy_nonoverlapping(vector.as_ptr() as *const u8, p.add(S_VECTOR), dims);
                     for (i, n) in neighbors.iter().enumerate() {
-                        (p.add(S_VECTOR + dims + i * 4) as *mut u32).write_unaligned(n.to_le());
+                        (p.add(neighbor_offset(dims) + i * 4) as *mut u32).write_unaligned(n.to_le());
                     }
                     *p.add(S_FLAGS) = FLAG_VALID;
                     true
                 }
             }
         };
-        if !written {
+        if written {
+            self.node_written();
+        } else {
             self.file.free_upper(upper_idx);
         }
         Ok(written)
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use crate::distance::Query;
+    use crate::insert::{insert, InsertParams};
+    use crate::search::{search, SearchScratch};
+    use std::sync::atomic::Ordering::Relaxed;
+
+    fn vector_for(i: u32, dims: usize) -> Vec<f32> {
+        (0..dims).map(|d| ((i as f32 * 0.31 + d as f32) * 0.7).sin()).collect()
+    }
+
+    /// A graph whose every node is dead must stop paying the repair probe once a full rotation
+    /// has come back empty, and must resume it after ANY handle writes a node — the revival
+    /// here comes through a second handle on the same file, as another process's would.
+    #[test]
+    fn a_fully_dead_graph_stops_probing_until_a_node_is_written() {
+        let dims = 32;
+        let path = std::env::temp_dir().join(format!("hnsw-probefutile-{}.hnsw", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let graph = Graph::new(PlaneFile::create(&path, dims, 16, 4_096).expect("create"));
+        let params = InsertParams::default();
+        let mut scratch = SearchScratch::new();
+        for i in 0..2_100 {
+            insert(&graph, &vector_for(i, dims), &params, &mut scratch).unwrap();
+        }
+        let hw = graph.file.id_high_water() as u32;
+        let stride = hw.div_ceil(1_024); // REPAIR_PROBE_LIMIT
+        assert!(stride > 1, "precondition: a rotation the guard has to wait out");
+        let (entry, _) = graph.file.entry_point();
+        for id in 0..hw {
+            let _ = graph.clear_node(id);
+        }
+        graph.file.clear_entry_point_if(entry);
+
+        let query = Query::new(vector_for(7, dims));
+        for _ in 0..stride {
+            assert!(search(&graph, &query, 5, 64, &mut scratch).0.is_empty());
+        }
+        let rotation = graph.probe_rotation.load(Relaxed);
+        assert!(search(&graph, &query, 5, 64, &mut scratch).0.is_empty());
+        assert_eq!(graph.probe_rotation.load(Relaxed), rotation, "a probed-out plane must not probe again");
+
+        // a node written through another handle, with no entry-point update (mirroring hosts do
+        // not always re-elect), must be findable again within one rotation
+        let revived = 3u32;
+        let q = crate::distance::quantize_int8(&vector_for(revived, dims));
+        let other = Graph::new(PlaneFile::open(&path).expect("a second handle"));
+        other.write_node_raw(revived, 0, &q.0, q.1, q.2, &[], &[]).expect("revive");
+        let found = (0..stride).any(|_| !search(&graph, &Query::new(vector_for(revived, dims)), 5, 64, &mut scratch).0.is_empty());
+        assert!(found, "a write must re-arm the probe");
+        let _ = std::fs::remove_file(&path);
     }
 }

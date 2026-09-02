@@ -419,3 +419,390 @@ fn a_wedged_untouched_write_frees_its_upper_entry() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+/// A wedged upper-entry cleanup must not leave the header naming a deleted entry point: the
+/// cleanup is fallible, so an early return there strands every search on a dead entry. Asserts
+/// the observable (searches still return hits), not the header word.
+#[test]
+fn a_wedged_upper_cleanup_still_reelects_the_entry_point() {
+    use std::sync::atomic::Ordering as O;
+    let dims = 32;
+    let path = tmp("wedgedelete");
+    let _ = std::fs::remove_file(&path);
+    let graph = std::sync::Arc::new(Graph::new(PlaneFile::create(&path, dims, 16, 64).expect("create")));
+    let raw = |id: u32, level: u8, neighbors: &[u32], upper: &[Vec<u32>]| {
+        let q = hnsw_plane::distance::quantize_int8(&vector_for(id, dims));
+        graph.write_node_raw(id, level, &q.0, q.1, q.2, neighbors, upper).expect("mirror");
+    };
+    // node 0 is the entry point and the only node with a hierarchy, so it owns upper entry 0
+    raw(0, 1, &[1], &[vec![1]]);
+    raw(1, 0, &[0], &[]);
+    graph.file.set_entry_point(0, 1);
+
+    let upper_seq = graph.file.upper_seq_atomic(0) as *const _ as usize;
+    let g2 = graph.clone();
+    let held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let held2 = held.clone();
+    let hold = std::thread::spawn(move || {
+        let seq = unsafe { &*(upper_seq as *const std::sync::atomic::AtomicU32) };
+        let g2 = &g2;
+        let guard = hnsw_plane::seqlock::write_lock(seq, g2.file.self_tag, || panic!("live owner sanitized"), |tag| {
+            g2.file.tag_is_dead(tag)
+        })
+        .expect("the holder must actually take the lock, or the test proves nothing");
+        held2.store(true, O::Release);
+        std::thread::sleep(std::time::Duration::from_millis(6_500)); // past WRITE_WEDGE_AFTER
+        drop(guard);
+    });
+    await_lock(&held);
+    assert_eq!(graph.delete_node(0), Err(hnsw_plane::seqlock::Wedged), "the held upper lock must wedge the cleanup");
+    hold.join().unwrap();
+
+    assert_eq!(graph.file.entry_point().0, 1, "the entry point must be re-elected before the fallible cleanup");
+    let mut scratch = SearchScratch::new();
+    let (hits, _) = search(&graph, &Query::new(vector_for(1, dims)), 5, 64, &mut scratch);
+    assert!(!hits.is_empty(), "searches must keep working after a wedged delete of the entry point");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A search must repair an entry point that no writer will: a host that cleared the entry, or
+/// a slot a reader sanitized after its writer died, leaves no delete to run the write-path
+/// re-election, so on a read-mostly table every search returns empty indefinitely.
+#[test]
+fn search_repairs_an_entry_point_no_writer_will() {
+    let dims = 32;
+    let path = tmp("entryheal");
+    let _ = std::fs::remove_file(&path);
+    let graph = Graph::new(PlaneFile::create(&path, dims, 16, 1_024).expect("create"));
+    let params = InsertParams::default();
+    let mut scratch = SearchScratch::new();
+    for i in 0..200 {
+        insert(&graph, &vector_for(i, dims), &params, &mut scratch).unwrap();
+    }
+    let prev = graph.file.previous_entry_point();
+    assert_ne!(prev, hnsw_plane::format::NO_ID, "promotions must record a previous-entry hint to repair from");
+
+    // the entry's slot reads as gone with no delete having run (dead-writer sanitization, or a
+    // mirroring host clearing the node) — nothing on the write path will ever re-elect
+    let (entry, _) = graph.file.entry_point();
+    graph.clear_node(entry).expect("tombstone the entry slot");
+
+    let (hits, _) = search(&graph, &Query::new(vector_for(7, dims)), 5, 64, &mut scratch);
+    assert!(!hits.is_empty(), "a search must self-heal past a dead entry point instead of returning empty");
+    assert_ne!(graph.file.entry_point().0, entry, "the repair must be published, not repeated per search");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// `invalidate` demotes a plane that already looks like a complete mirror back to "incomplete,
+/// rebuild me", and reports barrier failure to its caller instead of into a dropped promise —
+/// which is what lets the host order it before creating a `.stale` sidecar. (Durability itself
+/// is not observable in-process: the mapping is MAP_SHARED, so every store is already visible to
+/// a reopen and to `read()` whether or not the msync ran. The ordering that a crash would expose
+/// is asserted on the host side, in `vectorIndexPlane.test.js`.)
+#[test]
+fn invalidate_demotes_a_complete_looking_mirror_and_reports_failure() {
+    let dims = 32;
+    let path = tmp("invalidate");
+    let _ = std::fs::remove_file(&path);
+    {
+        let graph = Graph::new(PlaneFile::create(&path, dims, 16, 1_024).expect("create"));
+        let params = InsertParams::default();
+        let mut scratch = SearchScratch::new();
+        for i in 0..50 {
+            insert(&graph, &vector_for(i, dims), &params, &mut scratch).unwrap();
+        }
+        graph.file.flush_with_watermark(Some(4_096)).expect("barrier");
+        assert_eq!(graph.file.watermark(), 4_096, "precondition: a complete-looking mirror");
+        graph.file.invalidate().expect("invalidate must report its barrier, not swallow it");
+        assert_eq!(graph.file.watermark(), 0, "invalidation must mark the mirror incomplete in band");
+    }
+    let refused = PlaneFile::open(&path).err().expect("a fresh opener must refuse the invalidated plane, not adopt it");
+    assert!(refused.to_string().contains("invalidated"), "{refused}");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The hint is one slot and can die too: promote over a node, then lose BOTH that node and the
+/// entry it was promoted over. Without the bounded probe the repair has nowhere left to look and
+/// every later search returns empty although most of the graph is live.
+#[test]
+fn search_repairs_an_entry_point_whose_hint_is_dead_too() {
+    let dims = 32;
+    let path = tmp("entryhealdeadhint");
+    let _ = std::fs::remove_file(&path);
+    let graph = Graph::new(PlaneFile::create(&path, dims, 16, 1_024).expect("create"));
+    let params = InsertParams::default();
+    let mut scratch = SearchScratch::new();
+    for i in 0..200 {
+        insert(&graph, &vector_for(i, dims), &params, &mut scratch).unwrap();
+    }
+    let hint = graph.file.previous_entry_point();
+    assert_ne!(hint, hnsw_plane::format::NO_ID, "precondition: a hint to invalidate");
+    let (entry, _) = graph.file.entry_point();
+
+    // both sanitized with no delete having run, so no write-path re-election ever happens and
+    // the hint the repair would follow names a node that reads as gone
+    graph.clear_node(hint).expect("tombstone the hint slot");
+    graph.clear_node(entry).expect("tombstone the entry slot");
+
+    let (hits, _) = search(&graph, &Query::new(vector_for(7, dims)), 5, 64, &mut scratch);
+    assert!(!hits.is_empty(), "a dead hint must fall back to the bounded probe, not return empty forever");
+    let repaired = graph.file.entry_point().0;
+    assert_ne!(repaired, entry, "the repair must be published");
+    assert_ne!(repaired, hint, "the repair must not publish the dead hint");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Harper allocates node ids monotonically and never reuses them, so a table that has churned
+/// has its whole low prefix tombstoned and only the newest ids live. A repair that probed a
+/// fixed prefix would find nothing there and every search would return empty forever.
+#[test]
+fn search_repairs_an_entry_point_in_a_churned_graph_whose_low_ids_are_all_dead() {
+    let dims = 32;
+    let path = tmp("entryhealchurn");
+    let _ = std::fs::remove_file(&path);
+    let graph = Graph::new(PlaneFile::create(&path, dims, 16, 4_096).expect("create"));
+    let params = InsertParams::default();
+    let mut scratch = SearchScratch::new();
+    for i in 0..1_200 {
+        insert(&graph, &vector_for(i, dims), &params, &mut scratch).unwrap();
+    }
+    // every id a prefix probe would reach is gone, as it is for any long-lived churned table
+    for id in 0..1_100u32 {
+        let _ = graph.clear_node(id);
+    }
+    let (entry, _) = graph.file.entry_point();
+    let hint = graph.file.previous_entry_point();
+    let _ = graph.clear_node(entry);
+    if hint != hnsw_plane::format::NO_ID {
+        let _ = graph.clear_node(hint);
+    }
+
+    let (hits, _) = search(&graph, &Query::new(vector_for(1_150, dims)), 5, 64, &mut scratch);
+    assert!(!hits.is_empty(), "the probe must reach the live tail, not only a dead low prefix");
+    let repaired = graph.file.entry_point().0;
+    assert!(graph.read_node(repaired).is_some(), "the repair must publish a live node");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// With a stride above 1 a fixed start probes one residue class forever, so a live graph lying
+/// entirely between its probes would never be found. The rotation makes `stride` consecutive
+/// repairs cover every id; here the sole survivor is deliberately in the residue the unrotated
+/// walk skips.
+#[test]
+fn a_repair_probe_rotates_so_no_live_node_stays_between_its_samples() {
+    let dims = 32;
+    let path = tmp("entryhealrotate");
+    let _ = std::fs::remove_file(&path);
+    let graph = Graph::new(PlaneFile::create(&path, dims, 16, 4_096).expect("create"));
+    let params = InsertParams::default();
+    let mut scratch = SearchScratch::new();
+    for i in 0..2_100 {
+        insert(&graph, &vector_for(i, dims), &params, &mut scratch).unwrap();
+    }
+    let hw = graph.file.id_high_water() as u32;
+    let stride = hw.div_ceil(1_024); // REPAIR_PROBE_LIMIT
+    assert!(stride > 1, "precondition: a stride the rotation actually has to cover, got {stride}");
+    // an unrotated walk starts at hw-1 and steps by `stride`, so it only ever sees that residue;
+    // keep exactly one node alive in a different one
+    let survivor = (0..hw).rev().find(|id| (hw - 1 - id) % stride != 0).expect("a skipped residue");
+    for id in 0..hw {
+        if id != survivor {
+            let _ = graph.clear_node(id);
+        }
+    }
+    assert!(graph.read_node(survivor).is_some(), "precondition: the survivor is live");
+
+    let mut found = false;
+    for _ in 0..stride {
+        let (hits, _) = search(&graph, &Query::new(vector_for(survivor, dims)), 5, 64, &mut scratch);
+        if !hits.is_empty() {
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "a rotating probe must reach every residue within `stride` repairs");
+    assert_eq!(graph.file.entry_point().0, survivor, "the only live node must be the repaired entry");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The stride must be a ceiling division. Flooring it leaves `stride * limit < hw` whenever `hw`
+/// is not a multiple of `limit`, so every rotated walk stops above the lowest `hw % limit` ids —
+/// a permanent blind spot, not a one-search one, since no offset ever reaches it. A graph whose
+/// only survivors sit in that prefix would return empty from every later search; this one's does.
+#[test]
+fn a_repair_probe_reaches_the_low_ids_a_floored_stride_would_never_sample() {
+    let dims = 32;
+    let limit = 1_024u32; // REPAIR_PROBE_LIMIT
+    let path = tmp("entryheallowprefix");
+    let _ = std::fs::remove_file(&path);
+    let graph = Graph::new(PlaneFile::create(&path, dims, 16, 4_096).expect("create"));
+    let params = InsertParams::default();
+    let mut scratch = SearchScratch::new();
+    for i in 0..2_100 {
+        insert(&graph, &vector_for(i, dims), &params, &mut scratch).unwrap();
+    }
+    let hw = graph.file.id_high_water() as u32;
+    // a floored walk bottoms out at `hw % limit` whatever its rotation offset, so ids below that
+    // are exactly what the ceiling buys
+    let floored_reach = hw % limit;
+    assert!(hw > limit && floored_reach > 1, "precondition: a low prefix a floored stride skips, hw {hw}");
+    let survivor = floored_reach / 2;
+    for id in 0..hw {
+        if id != survivor {
+            let _ = graph.clear_node(id);
+        }
+    }
+    assert!(graph.read_node(survivor).is_some(), "precondition: the survivor is live");
+    assert_ne!(graph.file.previous_entry_point(), survivor, "precondition: the probe must be what finds it");
+
+    let mut found = false;
+    for _ in 0..hw.div_ceil(limit) {
+        let (hits, _) = search(&graph, &Query::new(vector_for(survivor, dims)), 5, 64, &mut scratch);
+        if !hits.is_empty() {
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "a full rotation must cover every id, the lowest included");
+    assert_eq!(graph.file.entry_point().0, survivor, "the only live node must be the repaired entry");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Rotation has to be per handle. With one process-wide counter, every other plane's repairs
+/// advance it too, so two planes repairing in turn each see offsets stepping by 2 — one residue
+/// class apiece, indefinitely, which is exactly what rotating was meant to prevent. Both planes
+/// here hide their survivor in the same residue, so a shared counter must strand one of them
+/// whichever offset it starts on.
+#[test]
+fn repair_probe_rotation_is_per_plane_not_per_process() {
+    let dims = 32;
+    let mut graphs = Vec::new();
+    let mut survivors = Vec::new();
+    let mut stride = 0u32;
+    for which in 0..2 {
+        let path = tmp(&format!("entryhealperplane{which}"));
+        let _ = std::fs::remove_file(&path);
+        let graph = Graph::new(PlaneFile::create(&path, dims, 16, 4_096).expect("create"));
+        let params = InsertParams::default();
+        let mut scratch = SearchScratch::new();
+        for i in 0..2_100 {
+            insert(&graph, &vector_for(i, dims), &params, &mut scratch).unwrap();
+        }
+        let hw = graph.file.id_high_water() as u32;
+        stride = hw.div_ceil(1_024);
+        assert!(stride > 1, "precondition: a stride the rotation has to cover");
+        // the same skipped residue on both planes, so a shared counter cannot serve both
+        let survivor = (0..hw).rev().find(|id| (hw - 1 - id) % stride != 0).expect("a skipped residue");
+        for id in 0..hw {
+            if id != survivor {
+                let _ = graph.clear_node(id);
+            }
+        }
+        graphs.push((graph, path));
+        survivors.push(survivor);
+    }
+
+    let mut scratch = SearchScratch::new();
+    let mut found = [false; 2];
+    for _ in 0..stride {
+        for (which, (graph, _)) in graphs.iter().enumerate() {
+            let (hits, _) = search(graph, &Query::new(vector_for(survivors[which], dims)), 5, 64, &mut scratch);
+            if !hits.is_empty() {
+                found[which] = true;
+            }
+        }
+    }
+    assert!(found[0] && found[1], "each plane must cover its own residues: {found:?}");
+    for (_, path) in &graphs {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// A repair publishes with a strict CAS on the entry it observed dead. A first insert that
+/// claims the header in between owns the graph, and a higher-level repair candidate must lose to
+/// it — installing the candidate would leave that insert's node with nothing pointing at it.
+#[test]
+fn a_repair_never_displaces_a_root_installed_while_it_ran() {
+    let dims = 32;
+    let path = tmp("entryhealrace");
+    let _ = std::fs::remove_file(&path);
+    let graph = Graph::new(PlaneFile::create(&path, dims, 16, 1_024).expect("create"));
+    let params = InsertParams::default();
+    let mut scratch = SearchScratch::new();
+    for i in 0..64 {
+        insert(&graph, &vector_for(i, dims), &params, &mut scratch).unwrap();
+    }
+    let (observed, _) = graph.file.entry_point();
+    let candidate = (0..64u32)
+        .find(|&id| id != observed && id != 7 && graph.read_node(id).is_some())
+        .expect("a live repair candidate");
+    let candidate_level = graph.read_node(candidate).expect("live").level;
+    assert!(graph.read_node(7).is_some(), "precondition: the racing root is a live node");
+
+    // the interleaving a repair races: the header no longer names the entry it read
+    graph.file.set_entry_point(7, 0);
+    assert!(
+        !graph.file.replace_entry_if(observed, candidate, candidate_level as u32),
+        "a repair must not publish over an entry installed after it read the dead one"
+    );
+    assert_eq!(graph.file.entry_point().0, 7, "the root installed meanwhile stays");
+
+    // and it does publish when nothing raced it
+    let (current, _) = graph.file.entry_point();
+    assert!(graph.file.replace_entry_if(current, candidate, candidate_level as u32));
+    assert_eq!(graph.file.entry_point().0, candidate);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The path-level entry point a host disables a plane through when it cannot delete the file:
+/// afterwards a fresh opener is refused, the sidecar sits next to the plane, and the file is
+/// deletable (no mapping of the helper's survives the call).
+#[test]
+fn invalidating_by_path_marks_the_plane_in_band_and_with_a_sidecar() {
+    let dims = 32;
+    let path = tmp("invalidatepath");
+    let _ = std::fs::remove_file(&path);
+    {
+        let graph = Graph::new(PlaneFile::create(&path, dims, 16, 1_024).expect("create"));
+        let params = InsertParams::default();
+        let mut scratch = SearchScratch::new();
+        for i in 0..50 {
+            insert(&graph, &vector_for(i, dims), &params, &mut scratch).unwrap();
+        }
+        graph.file.flush_with_watermark(Some(4_096)).expect("barrier");
+    }
+    let outcome = hnsw_plane::invalidate_plane(&path).expect("at least one marker");
+    assert!(outcome.in_band.is_ok() && outcome.sidecar.is_ok(), "{outcome:?}");
+    let stale = hnsw_plane::stale_path_for(&path);
+    assert!(stale.is_file(), "the sidecar must exist next to the plane");
+    assert!(PlaneFile::open(&path).is_err(), "a fresh opener must refuse the invalidated plane");
+    std::fs::remove_file(&path).expect("the helper's temporary mapping must not outlive the call");
+    let _ = std::fs::remove_file(&stale);
+}
+
+/// A re-election that read a dead entry and stalled must not land over an EQUAL-level entry
+/// installed meanwhile: that entry may be a fresh `claim_entry_if_empty` winner with no
+/// in-edges yet, and displacing it orphans the node its insert already reported as landed.
+/// A strictly higher-level install still wins.
+#[test]
+fn a_stale_reelection_never_displaces_an_equal_level_entry_installed_meanwhile() {
+    let dims = 32;
+    let path = tmp("staleelect");
+    let _ = std::fs::remove_file(&path);
+    let graph = Graph::new(PlaneFile::create(&path, dims, 16, 64).expect("create"));
+    let raw = |id: u32, level: u8, upper: &[Vec<u32>]| {
+        let q = hnsw_plane::distance::quantize_int8(&vector_for(id, dims));
+        graph.write_node_raw(id, level, &q.0, q.1, q.2, &[], upper).expect("mirror");
+    };
+    raw(1, 0, &[]); // the claimer, edgeless
+    raw(2, 0, &[]); // the stalled re-election's level-0 candidate
+    raw(3, 1, &[vec![]]);
+    let dead_entry = 9u32;
+    assert!(graph.file.claim_entry_if_empty(1, 0), "precondition: the claim wins on an empty header");
+
+    graph.file.set_entry_point_if_not_better(2, 0, dead_entry);
+    assert_eq!(graph.file.entry_point().0, 1, "an equal-level re-election must not displace the claimer");
+    graph.file.set_entry_point_if_not_better(3, 1, dead_entry);
+    assert_eq!(graph.file.entry_point().0, 3, "a higher-level install still wins");
+    let _ = std::fs::remove_file(&path);
+}

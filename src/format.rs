@@ -1,14 +1,14 @@
 //! On-disk format: 4 KB header + fixed-size layer-0 slot array + upper-layer region.
-//! See ../../../hnsw-native-plane.md §4. Format changes bump VERSION and require reindex.
+//! See ../DESIGN.md §4. Format changes bump VERSION and require reindex.
 
 use memmap2::MmapMut;
 use std::fs::OpenOptions;
 use std::io;
-use std::path::Path;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 pub const MAGIC: u32 = 0x484e_5357; // "HNSW"
-pub const VERSION: u32 = 5; // v5: opener registry + aligned freelist pointer (older files: reindex)
+pub const VERSION: u32 = 7; // v7: sticky invalidation latch; v6: 4-aligned neighbor + upper id arrays (older files: reindex)
 pub const HEADER_SIZE: usize = 4096;
 
 // Header field byte offsets.
@@ -23,6 +23,12 @@ const H_ID_HIGH_WATER: usize = 32; // u64 atomic
 const H_FREELIST_HEAD: usize = 40; // u64 atomic: (tag << 32) | id; id u32::MAX = empty
 const H_TXN_WATERMARK: usize = 48; // u64
 const H_CLEAN_SHUTDOWN: usize = 56; // u8
+// One-way: set by invalidate(), cleared by nothing. While set the watermark reads 0 on every
+// handle whatever a racing flush stamps into it, and open() refuses the file.
+const H_INVALIDATED: usize = 57; // u8
+// Bumped by every node write through any handle: the search-side repair probe's evidence
+// that a fully dead graph may have gained a live node since it last came back empty.
+const H_WRITE_EPOCH: usize = 96; // u64 atomic
 const H_MAX_NODES: usize = 64; // u64
 const H_UPPER_HIGH_WATER: usize = 72; // u64 atomic: upper-entry allocator
 const H_UPPER_FREELIST: usize = 80; // u64 atomic: (tag<<32)|idx; NO_UPPER = empty
@@ -39,11 +45,15 @@ pub const REGISTRY_SLOTS: usize = 64;
 /// 1/8 of max_nodes (2x headroom). P(level >= 9) at mL = 1/ln16 is ~e^-25 — unreachable.
 pub const MAX_UPPER_LEVELS: usize = 8;
 pub const UPPER_CAP: usize = 64; // matches the JS graph's upper cap (M<<2 under optimizeRouting)
-// entry: seq u32 | levels u8 | pad | per-level (degree u16 + ids u32*UPPER_CAP)
+// entry: seq u32 | levels u8 | pad | per-level (degree u16 + pad u16 + ids u32*UPPER_CAP)
 pub const U_SEQ: usize = 0;
 pub const U_LEVELS: usize = 4;
 pub const U_LISTS: usize = 8;
-pub const UPPER_LEVEL_STRIDE: usize = 2 + UPPER_CAP * 4 + 2; // degree + ids + pad -> 132
+/// The pad follows the degree rather than the ids so every id array starts 4-aligned; the
+/// stride (and so the entry size) is unchanged either way.
+pub const UL_DEGREE: usize = 0;
+pub const UL_IDS: usize = 4;
+pub const UPPER_LEVEL_STRIDE: usize = UL_IDS + UPPER_CAP * 4;
 pub const NO_UPPER: u32 = u32::MAX;
 
 // Slot layout offsets (within a slot).
@@ -55,8 +65,15 @@ pub const S_SCALE: usize = 8; // f32
 pub const S_INV_MAG: usize = 12; // f32
 pub const S_UPPER_IDX: usize = 16; // u32 index into the upper region; NO_UPPER = none
 pub const S_VECTOR: usize = 20; // dims bytes (int8) or dims*4 (f32)
-                                // neighbors: u32 * layer0_cap, follows vector
-                                // deleted slots reuse the first neighbor word as freelist next-pointer
+                                // neighbors: u32 * layer0_cap, follows the 4-padded vector
+
+/// Byte offset of a slot's neighbor array. The vector is padded to a 4-byte boundary so this
+/// is 4-aligned for every dims: the search hot path then reads each neighbor as one aligned
+/// volatile u32 instead of four byte loads plus shifts.
+#[inline]
+pub const fn neighbor_offset(dims: usize) -> usize {
+    S_VECTOR + (dims + 3) / 4 * 4
+}
 
 pub const FLAG_VALID: u8 = 1;
 pub const FLAG_DELETED: u8 = 2;
@@ -65,6 +82,9 @@ pub const NO_ID: u32 = u32::MAX;
 pub struct PlaneFile {
     /// Kept open for the lifetime of the mapping: the opener-registry OFD lock lives on it.
     file: std::fs::File,
+    /// The path this handle opened or created, as given; the sidecar of `invalidate_file` is
+    /// placed next to it.
+    pub path: PathBuf,
     /// This handle's registry tag (low bits encode its registry slot). 0 = unregistered
     /// (registry full or platform without OFD locks): this handle's own dead locks cannot be
     /// reclaimed by others, and it never reclaims.
@@ -77,8 +97,9 @@ pub struct PlaneFile {
     upper_offset: usize,
     pub upper_capacity: u64,
     /// Whether the file recorded a clean shutdown when opened (create() reports true).
-    /// An unclean open has had its torn seqlocks scrubbed, but individual slots may hold
-    /// unflushed/partial states — hosts should rebuild rather than trust completeness.
+    /// Advisory only: open() performs no repair — torn seqlocks are taken over lazily at
+    /// their slot (seqlock.rs) — and slots may hold unflushed states; hosts rebuild rather
+    /// than trust completeness.
     pub opened_clean: bool,
     /// Slots per 4 KB page under page-grouped addressing; 0 = packed (slots may straddle
     /// pages). Grouped is chosen at create when the per-page waste is small (e.g. 1,344 B
@@ -101,8 +122,21 @@ fn advise_random(map: &MmapMut) {
     let _ = map;
 }
 
+fn stale_sidecar_present(path: &Path) -> bool {
+    // any entry counts, a directory or dangling link included, and so does any stat failure
+    // other than absence: a marker that fails closed cannot be defeated by a transient EIO
+    match std::fs::symlink_metadata(crate::invalidate::stale_path_for(path)) {
+        Ok(_) => true,
+        Err(e) => e.kind() != io::ErrorKind::NotFound,
+    }
+}
+
+fn invalidated_error(path: &Path) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, format!("{} was invalidated: delete it and its .stale sidecar, then rebuild the index", path.display()))
+}
+
 fn slot_size_for(dims: usize, layer0_cap: usize) -> usize {
-    let raw = S_VECTOR + dims + layer0_cap * 4;
+    let raw = neighbor_offset(dims) + layer0_cap * 4;
     raw.next_multiple_of(64) // cache-line align
 }
 
@@ -134,6 +168,11 @@ impl PlaneFile {
         if max_nodes >= NO_ID as u64 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "maxNodes must be below 2^32-1"));
         }
+        if stale_sidecar_present(path) {
+            // a leftover sidecar would make the new file unopenable forever; the host must
+            // clear it deliberately
+            return Err(io::Error::other(format!("{} has a stale sidecar: remove {} before creating", path.display(), crate::invalidate::stale_path_for(path).display())));
+        }
         let slot_size = slot_size_for(dims, layer0_cap);
         let slots_per_page = slots_per_page_for(slot_size);
         let data_len = slot_region_len(max_nodes, slot_size, slots_per_page);
@@ -156,12 +195,16 @@ impl PlaneFile {
             .copy_from_slice(&((NO_ID as u64) | 0u64 << 32).to_le_bytes());
         map[H_MAX_NODES..H_MAX_NODES + 8].copy_from_slice(&max_nodes.to_le_bytes());
         map[H_UPPER_FREELIST..H_UPPER_FREELIST + 8].copy_from_slice(&(NO_UPPER as u64).to_le_bytes());
+        // zero would read as "node 0 was the previous entry point" and hand every re-election
+        // and search-side repair a candidate that was never an entry point
+        map[H_ENTRY_PREV..H_ENTRY_PREV + 8].copy_from_slice(&(NO_ID as u64).to_le_bytes());
         map[H_VERSION..H_VERSION + 4].copy_from_slice(&VERSION.to_le_bytes());
         std::sync::atomic::fence(Ordering::Release);
         map[H_MAGIC..H_MAGIC + 4].copy_from_slice(&MAGIC.to_le_bytes());
         let upper_offset = HEADER_SIZE + slot_region_len(max_nodes, slot_size, slots_per_page) as usize;
         let mut plane = PlaneFile {
             file,
+            path: path.to_path_buf(),
             self_tag: 0,
             map,
             dims,
@@ -174,10 +217,36 @@ impl PlaneFile {
             opened_clean: true,
         };
         plane.register_opener();
+        if stale_sidecar_present(path) {
+            // best-effort: an invalidation that raced the create (its in-band leg found no
+            // header yet, or was overwritten by ours) left only the sidecar. Latch the finished
+            // file so losing that sidecar cannot make this failed create adoptable. A sidecar
+            // landing after this check is caught by the next open, not by this handle.
+            let _ = plane.invalidate();
+            return Err(io::Error::other(format!("{} gained a stale sidecar during create: remove {} and rebuild", path.display(), crate::invalidate::stale_path_for(path).display())));
+        }
         Ok(plane)
     }
 
+    /// Open an existing plane. Refuses one that was invalidated — by its header latch or by a
+    /// `<path>.stale` sidecar — so a stale mirror is never adopted by any package consumer;
+    /// the host deletes both files and rebuilds.
     pub fn open(path: &Path) -> io::Result<Self> {
+        if stale_sidecar_present(path) {
+            return Err(invalidated_error(path));
+        }
+        let plane = Self::open_for_invalidation(path)?;
+        // the pre-map check is only half the refusal: a sidecar landed by an invalidation
+        // whose in-band leg failed (no latch to see) can appear between the check and the map
+        if plane.invalidated() || stale_sidecar_present(path) {
+            return Err(invalidated_error(path));
+        }
+        Ok(plane)
+    }
+
+    /// `open` without the invalidation refusals: the handle `invalidate_plane` marks through,
+    /// which must reach an already-invalidated file so a repeated invalidation is idempotent.
+    pub(crate) fn open_for_invalidation(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let file_len = file.metadata()?.len();
         if file_len < HEADER_SIZE as u64 {
@@ -220,6 +289,7 @@ impl PlaneFile {
         let opened_clean = map[H_CLEAN_SHUTDOWN] == 1;
         let mut plane = PlaneFile {
             file,
+            path: path.to_path_buf(),
             self_tag: 0,
             map,
             dims,
@@ -243,8 +313,6 @@ impl PlaneFile {
         Ok(plane)
     }
 
-    /// Force any persisted-odd seqlocks (slot + upper regions) back to even after an unclean
-    /// shutdown. Safe because open() runs before any concurrent access exists.
     #[inline]
     pub fn slot_ptr(&self, id: u32) -> *const u8 {
         let off = if self.slots_per_page > 0 {
@@ -295,8 +363,9 @@ impl PlaneFile {
                 let _ = head.compare_exchange(cur, NO_ID as u64, Ordering::AcqRel, Ordering::Acquire);
                 continue;
             }
-            // next-pointer lives in the dead slot's scale field: offset 8, aligned for any
-            // dims (the first neighbor word at S_VECTOR+dims is 4-aligned only when dims%4==0)
+            // next-pointer lives in the dead slot's scale field rather than its first neighbor
+            // word: the neighbor array is a live reader's aligned volatile load target, and a
+            // freelist pointer parked there would be decoded as a neighbor id
             let next = unsafe { (*(self.slot_ptr(id).add(S_SCALE) as *const AtomicU32)).load(Ordering::Acquire) };
             let tag = (cur >> 32).wrapping_add(1);
             let new = (next as u64) | (tag << 32);
@@ -353,25 +422,112 @@ impl PlaneFile {
 
     pub fn set_entry_point(&self, id: u32, level: u32) {
         let prev = self.header_atomic_u64(H_ENTRY).swap((id as u64) | ((level as u64) << 32), Ordering::AcqRel);
-        if (prev & 0xffff_ffff) as u32 != NO_ID && (prev & 0xffff_ffff) as u32 != id {
-            self.header_atomic_u64(H_ENTRY_PREV).store(prev, Ordering::Release);
+        self.record_previous_entry(prev, id);
+    }
+
+    /// Remember the entry point a PROMOTION displaced. Only promotions are recorded: the node
+    /// they displace was live and high-level, which is what makes it a usable hint. Recording
+    /// a re-election's replacement instead would fill the hint with the dead node that forced
+    /// the re-election.
+    #[inline]
+    fn record_previous_entry(&self, prev_packed: u64, new_id: u32) {
+        let prev_id = (prev_packed & 0xffff_ffff) as u32;
+        if prev_id == NO_ID || prev_id == new_id || (prev_id as u64) >= self.max_nodes {
+            return;
         }
+        // a hint is only worth keeping while its node is live: the host mirrors a post-delete
+        // re-election through this same call, and storing the node that died would evict a
+        // usable hint with one the repair path can never follow
+        // volatile like every other read of a field a concurrent writer mutates (graph.rs's
+        // `vread`): this one is outside the slot seqlock, so the retry cannot even catch a tear
+        if unsafe { self.slot_ptr(prev_id).add(S_FLAGS).read_volatile() } != FLAG_VALID {
+            return;
+        }
+        self.header_atomic_u64(H_ENTRY_PREV).store(prev_packed, Ordering::Release);
+    }
+
+    /// Claim the entry point of an EMPTY graph: a strict compare-exchange from the empty
+    /// encoding, so exactly one racer wins. `set_entry_point_if_not_better` cannot serve here —
+    /// it is a not-worse install, so a second first-inserter would replace the winner with its
+    /// own edgeless node and orphan everything already rooted at the winner. A loser must join
+    /// the winner's graph instead of returning an unlinked node.
+    pub fn claim_entry_if_empty(&self, id: u32, level: u32) -> bool {
+        self.header_atomic_u64(H_ENTRY)
+            .compare_exchange(NO_ID as u64, (id as u64) | ((level as u64) << 32), Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     /// Entry-point CAS for re-election: install (id, level) only while the current entry is
     /// still `expected_id` or is of a lower level — a concurrent insert that just promoted a
     /// higher-level entry must not be clobbered by a delete's level-0 survivor.
     pub fn set_entry_point_if_not_better(&self, id: u32, level: u32, expected_id: u32) {
+        self.cas_entry_if_not_better(id, level, expected_id, false);
+    }
+
+    /// The same CAS for an insert that PROMOTED itself above the entry it observed: the
+    /// displaced entry is live, so it is recorded as the previous-entry hint that re-election
+    /// and the search-side repair both consult before any O(high-water) scan.
+    pub fn promote_entry_point(&self, id: u32, level: u32, expected_id: u32) {
+        self.cas_entry_if_not_better(id, level, expected_id, true);
+    }
+
+    fn cas_entry_if_not_better(&self, id: u32, level: u32, expected_id: u32, record_prev: bool) {
         let cell = self.header_atomic_u64(H_ENTRY);
         let new = (id as u64) | ((level as u64) << 32);
         let mut cur = cell.load(Ordering::Acquire);
         loop {
             let cur_id = (cur & 0xffff_ffff) as u32;
             let cur_level = (cur >> 32) as u32;
-            if cur_id != expected_id && cur_id != NO_ID && cur_level > level {
-                return; // someone installed a better entry meanwhile
+            // `>=`, not `>`: an equal-level entry installed meanwhile may be a fresh
+            // `claim_entry_if_empty` winner with no in-edges yet; displacing it orphans that
+            // node, and an equal-level swap gains nothing
+            if cur_id != expected_id && cur_id != NO_ID && cur_level >= level {
+                return; // someone installed a not-worse entry meanwhile
             }
             match cell.compare_exchange(cur, new, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {
+                    if record_prev {
+                        self.record_previous_entry(cur, id);
+                    }
+                    return;
+                }
+                Err(now) => cur = now,
+            }
+        }
+    }
+
+    /// Install `(id, level)` ONLY while the entry still names `expected_id`. The read-side
+    /// repair publishes through this rather than `set_entry_point_if_not_better`: the entry it
+    /// is replacing is dead, so "not worse" is the wrong test — a level-0 root installed while
+    /// the repair ran would lose to a higher-level candidate and be orphaned.
+    ///
+    /// It compares the id, not the incarnation, so under the crate's own freelist reuse it can
+    /// match a different node that took the same slot. That is a routing-quality window, not a
+    /// lost node: the value it could displace is a live edged node, never the edgeless claimer
+    /// (`claim_entry_if_empty` fires only from NO_ID, which no reuse can produce). Harper's host
+    /// ids are monotonic and never reused, so this cannot arise there at all.
+    pub fn replace_entry_if(&self, expected_id: u32, id: u32, level: u32) -> bool {
+        let cell = self.header_atomic_u64(H_ENTRY);
+        let new = (id as u64) | ((level as u64) << 32);
+        let mut cur = cell.load(Ordering::Acquire);
+        while (cur & 0xffff_ffff) as u32 == expected_id {
+            match cell.compare_exchange(cur, new, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return true,
+                Err(now) => cur = now,
+            }
+        }
+        false
+    }
+
+    /// Clear the entry point, but only while it still names `expected_id`. A re-election that
+    /// found no candidate must not erase an entry a concurrent insert installed meanwhile —
+    /// `set_entry_point_if_not_better(NO_ID, 0, ..)` would, because a level-0 live entry is not
+    /// "better" than the level-0 clear.
+    pub fn clear_entry_point_if(&self, expected_id: u32) {
+        let cell = self.header_atomic_u64(H_ENTRY);
+        let mut cur = cell.load(Ordering::Acquire);
+        while (cur & 0xffff_ffff) as u32 == expected_id {
+            match cell.compare_exchange(cur, NO_ID as u64, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => return,
                 Err(now) => cur = now,
             }
@@ -382,8 +538,32 @@ impl PlaneFile {
         self.header_atomic_u64(H_TXN_WATERMARK).store(txn, Ordering::Release);
     }
 
+    /// The completion stamp — 0, "incomplete mirror", once the plane is invalidated, whatever
+    /// a flush racing the invalidation wrote into the word afterwards.
     pub fn watermark(&self) -> u64 {
+        if self.invalidated() {
+            return 0;
+        }
         self.header_atomic_u64(H_TXN_WATERMARK).load(Ordering::Acquire)
+    }
+
+    #[inline]
+    fn invalidated_cell(&self) -> &AtomicU8 {
+        unsafe { &*(self.map.as_ptr().add(H_INVALIDATED) as *const AtomicU8) }
+    }
+
+    pub fn write_epoch(&self) -> u64 {
+        self.header_atomic_u64(H_WRITE_EPOCH).load(Ordering::Acquire)
+    }
+
+    /// Release-ordered so a probe that acquires the new epoch also sees the slot it publishes.
+    pub fn bump_write_epoch(&self) {
+        self.header_atomic_u64(H_WRITE_EPOCH).fetch_add(1, Ordering::Release);
+    }
+
+    /// Whether the one-way invalidation latch is set (by this or any other handle).
+    pub fn invalidated(&self) -> bool {
+        self.invalidated_cell().load(Ordering::Acquire) != 0
     }
 
     #[inline]
@@ -491,6 +671,12 @@ impl PlaneFile {
         }
     }
 
+    /// Every nonzero registry tag, live or not (liveness is `tag_is_dead`).
+    #[cfg(test)]
+    pub(crate) fn registered_tags(&self) -> Vec<u32> {
+        (0..REGISTRY_SLOTS).map(|slot| self.registry_tag_cell(slot).load(Ordering::Acquire)).filter(|&t| t != 0).collect()
+    }
+
     /// Try to take the OFD write lock on a registry slot's byte range. `probe` releases it
     /// immediately (liveness check); otherwise it is held for this handle's lifetime.
     #[cfg(target_os = "linux")]
@@ -568,6 +754,25 @@ impl PlaneFile {
             self.set_watermark(txn);
         }
         unsafe { *(self.map.as_ptr().add(H_CLEAN_SHUTDOWN) as *mut u8) = 1 };
+        self.map.flush_range(0, HEADER_SIZE)
+    }
+
+    /// Mark the plane invalidated, durably, and nothing else: set the one-way latch, zero the
+    /// watermark, and msync the header page alone. Every handle then reads watermark 0 and
+    /// every later `open` refuses the file. The latch is what makes this stick against a
+    /// `flush_with_watermark` already in flight on this or another handle: that flush still
+    /// stamps the word, but nothing reads the word past the latch.
+    ///
+    /// Deliberately NOT `flush_with_watermark(Some(0))`: that writes the whole mapping back
+    /// first, and the caller invalidating a multi-GB plane cannot pay a full msync inline.
+    /// Skipping the data flush is sound because the data is being discarded, and because
+    /// lowering the watermark is the safe direction: the ordering hazard
+    /// `flush_with_watermark` exists to prevent is a NEW watermark over missing data, never
+    /// an old one over durable data. The stores precede the msync, so on an msync failure
+    /// the mark may still reach disk through ordinary writeback — also the safe direction.
+    pub fn invalidate(&self) -> io::Result<()> {
+        self.invalidated_cell().store(1, Ordering::Release);
+        self.set_watermark(0);
         self.map.flush_range(0, HEADER_SIZE)
     }
 }

@@ -1,7 +1,7 @@
 // End-to-end smoke test: `npm run build && node smoke.mjs` (also the CI path).
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
-const { Plane } = require('./index.js');
+const { Plane, invalidatePlane, invalidatePlaneAsync, stalePathFor } = require('./index.js');
 
 const dims = 64;
 const { tmpdir } = await import('node:os');
@@ -81,4 +81,43 @@ plane.flush();
 const reopened = Plane.open(path);
 const hits2 = reopened.searchSync(vec(42), 5, 128);
 if (hits2[0].distance > 1e-3) throw new Error('reopened self-query failed');
-console.log('reopen + sidecar OK. smoke PASSED');
+console.log('reopen OK');
+
+// invalidation through the caller's own handle: both markers land, the latch survives a
+// later flush, and every later open is refused
+const { existsSync, mkdirSync, rmSync } = await import('node:fs');
+reopened.setWatermark(4096);
+reopened.flush();
+const outcome = reopened.invalidateFile();
+if (!outcome.inBand || !outcome.sidecar) throw new Error(`invalidation incomplete: ${JSON.stringify(outcome)}`);
+if (stalePathFor(path) !== `${path}.stale` || !existsSync(stalePathFor(path))) throw new Error('no .stale sidecar');
+reopened.flush(900);
+if (reopened.getWatermark() !== 0 || !reopened.invalidated()) throw new Error('a later flush revived the plane');
+rmSync(stalePathFor(path));
+let refused;
+try {
+	Plane.open(path);
+} catch (error) {
+	refused = error;
+}
+if (!refused || !/invalidated/.test(refused.message)) throw new Error(`open must refuse an invalidated plane, got ${refused}`);
+// by path: a temporary open that must not survive the call (idempotent on a latched plane)
+const byPath = invalidatePlane(path);
+if (!byPath.inBand || !byPath.sidecar) throw new Error(`path invalidation incomplete: ${JSON.stringify(byPath)}`);
+const byPathAsync = await invalidatePlaneAsync(path);
+if (!byPathAsync.inBand || !byPathAsync.sidecar) throw new Error(`async path invalidation incomplete: ${JSON.stringify(byPathAsync)}`);
+rmSync(stalePathFor(path));
+// neither marker possible: not a plane, and a directory squatting the sidecar path
+const bogus = join(tmpdir(), `smoke-bogus-${process.pid}.hnsw`);
+const { writeFileSync } = await import('node:fs');
+writeFileSync(bogus, 'not a plane');
+mkdirSync(stalePathFor(bogus));
+let threw;
+try {
+	invalidatePlane(bogus);
+} catch (error) {
+	threw = error;
+}
+if (!threw || !/in-band:.*sidecar:/.test(threw.message)) throw new Error(`double failure must throw naming both causes, got ${threw}`);
+rmSync(stalePathFor(bogus), { recursive: true });
+console.log('invalidatePlane OK. smoke PASSED');

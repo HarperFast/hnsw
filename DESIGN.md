@@ -96,18 +96,24 @@ One file per index (per slice, once C2 lands): `<index-path>.hnsw`.
 | freelist_head                     | u64 atomic | CAS push/pop; ABA-guarded with a 32-bit tag                  |
 | txn_watermark                     | u64        | last durably indexed transaction; advanced by msync cadence  |
 | clean_shutdown flag               | u8         | torn-state detection on open                                 |
+| invalidated latch                 | u8         | one-way (v7): watermark reads 0 on every handle, open refuses |
+| write_epoch                       | u64 atomic | bumped by every node write; re-arms the read-side repair probe |
 
 **Main region — layer-0 slots**, addressed `4096 + id × slot_size`:
 
-| Field                           | Size (768-d int8, cap 64)          |
-| ------------------------------- | ---------------------------------- |
-| seq (seqlock)                   | 4 B                                |
-| flags (valid/deleted) + level   | 2 B                                |
-| scale (f32) + invMag (f32)      | 8 B                                |
-| degree                          | 2 B                                |
-| vector (int8 × 768)             | 768 B                              |
-| neighbor ids (u32 × layer0_cap) | 256 B                              |
-| **total, padded**               | **1,040 B → 1 KB-aligned 1,088 B** |
+| Field                           | Size (768-d int8, cap 64)           |
+| ------------------------------- | ----------------------------------- |
+| seq (seqlock)                   | 4 B                                 |
+| flags (valid/deleted) + level   | 2 B                                 |
+| scale (f32) + invMag (f32)      | 8 B                                 |
+| degree                          | 2 B                                 |
+| vector (int8 × 768)             | 768 B (padded to a 4-byte boundary) |
+| neighbor ids (u32 × layer0_cap) | 256 B                               |
+| **total, padded**               | **1,040 B → 1 KB-aligned 1,088 B**  |
+
+The vector's trailing pad keeps the neighbor array 4-aligned for every `dims`, so the search
+hot path reads each neighbor id as one aligned volatile `u32`. Upper-layer id lists are padded
+the same way (`degree u16 + pad u16 + ids`).
 
 At 100M nodes: ~109 GB (int8). A binary-code v2 slot (96 B codes + ids) is ~384 B → ~38 GB.
 For comparison, today's encoding averages 1,425 B/node _plus_ RocksDB overhead — so v1 is
@@ -166,6 +172,24 @@ Note the asymmetry with today: RocksDB gave the graph per-commit durability; the
 bounded-lag durability with deterministic catch-up. For an approximate index whose source of
 truth (records + pk→nodeId) remains fully transactional, bounded lag is the right trade — it
 buys the entire performance model.
+
+**Invalidation (a plane the host cannot delete).** Disabling a plane deletes its file; when the
+unlink fails (Windows sharing violation while another process maps it) the file must not be
+adopted later at its nonzero watermark, or it silently serves searches missing every mutation
+made while mirroring was off. `invalidate_plane(path)` / `invalidate_file(&handle)` leave two
+markers, always attempting both: in band — `PlaneFile::invalidate` sets a one-way header latch,
+zeroes the watermark, and msyncs the header page alone (a whole-mapping flush cannot run inline
+on a multi-GB plane, and lowering the watermark is the safe direction) — then a `<path>.stale`
+sidecar, created with create-new semantics (a planted symlink is never followed) and fsync'd
+together with its directory entry (the directory fsync is skipped on Windows, where `std` has no
+directory handle and `FlushFileBuffers` on the marker covers its creation). The package enforces
+both markers: `open` refuses a file carrying either, `create` refuses a path with a leftover
+sidecar, and `watermark()` reads 0 on every handle while the latch is set — so a flush already
+in flight on another handle, which still stamps the word, cannot revive the plane. In band
+first: the sidecar is what a process that cannot map the file checks, the latch is what covers a
+plane whose sidecar a crash lost. A temporary handle opened for the in-band mark is unmapped
+and closed before the sidecar step — its own mapping would keep the file undeletable — and the
+call fails only when neither marker is durable, leaving the file exactly as found.
 
 **Backup/copy-db/reseed:** the file is node-local derived state. Backup either includes it
 (consistent-enough after an msync barrier) or marks the index rebuild-on-restore. Replica
@@ -272,6 +296,14 @@ Decided (Kris, 2026-08-31):
 
 Open:
 
+- **Atomic slot payloads.** Fields a concurrent reader acts on (flags, level, degree, scale,
+  invMag, neighbor and upper ids) are read through aligned `read_volatile`, which forbids the
+  reload/split/sink across the seqlock's validating fence that `lto = true, codegen-units = 1`
+  otherwise licenses. That is not the same as being race-free under Rust's memory model: only
+  making those fields `AtomicU8`/`AtomicU16`/`AtomicU32` in the slot layout would be, and that
+  is a format change deferred past phase 1. The stored vector stays an ordinary load on
+  purpose — `cosine_int8_raw` must keep autovectorizing, and a torn vector only perturbs a
+  distance the generation check discards.
 - **msync cadence default** — bounded-lag durability window vs write amplification; needs a
   workload measurement, not a guess.
 - **f32 (quantization:"none") slot variant** — 3,072 B vectors → 3.4 KB slots; supported by the
