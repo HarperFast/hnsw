@@ -97,10 +97,9 @@ pub struct PlaneFile {
     upper_offset: usize,
     pub upper_capacity: u64,
     /// Whether the file recorded a clean shutdown when opened (create() reports true).
-    /// Advisory only: open() performs no repair, so an unclean open still carries the dead
-    /// writers' torn seqlocks, each taken over lazily at its slot on first contention
-    /// (seqlock.rs); individual slots may also hold unflushed/partial states. Hosts should
-    /// rebuild rather than trust completeness.
+    /// Advisory only: open() performs no repair — torn seqlocks are taken over lazily at
+    /// their slot (seqlock.rs) — and slots may hold unflushed states; hosts rebuild rather
+    /// than trust completeness.
     pub opened_clean: bool,
     /// Slots per 4 KB page under page-grouped addressing; 0 = packed (slots may straddle
     /// pages). Grouped is chosen at create when the per-page waste is small (e.g. 1,344 B
@@ -124,8 +123,12 @@ fn advise_random(map: &MmapMut) {
 }
 
 fn stale_sidecar_present(path: &Path) -> bool {
-    // any entry counts, a directory or dangling link included: the marker is its presence
-    std::fs::symlink_metadata(crate::invalidate::stale_path_for(path)).is_ok()
+    // any entry counts, a directory or dangling link included, and so does any stat failure
+    // other than absence: a marker that fails closed cannot be defeated by a transient EIO
+    match std::fs::symlink_metadata(crate::invalidate::stale_path_for(path)) {
+        Ok(_) => true,
+        Err(e) => e.kind() != io::ErrorKind::NotFound,
+    }
 }
 
 fn invalidated_error(path: &Path) -> io::Error {
@@ -215,9 +218,10 @@ impl PlaneFile {
         };
         plane.register_opener();
         if stale_sidecar_present(path) {
-            // an invalidation raced the create (its in-band leg found no header yet): latch the
-            // finished file too, so losing the sidecar cannot turn this failed create into an
-            // adoptable empty plane, and hand the caller no handle it would mirror into
+            // best-effort: an invalidation that raced the create (its in-band leg found no
+            // header yet, or was overwritten by ours) left only the sidecar. Latch the finished
+            // file so losing that sidecar cannot make this failed create adoptable. A sidecar
+            // landing after this check is caught by the next open, not by this handle.
             let _ = plane.invalidate();
             return Err(io::Error::other(format!("{} gained a stale sidecar during create: remove {} and rebuild", path.display(), crate::invalidate::stale_path_for(path).display())));
         }
@@ -549,11 +553,12 @@ impl PlaneFile {
     }
 
     pub fn write_epoch(&self) -> u64 {
-        self.header_atomic_u64(H_WRITE_EPOCH).load(Ordering::Relaxed)
+        self.header_atomic_u64(H_WRITE_EPOCH).load(Ordering::Acquire)
     }
 
+    /// Release-ordered so a probe that acquires the new epoch also sees the slot it publishes.
     pub fn bump_write_epoch(&self) {
-        self.header_atomic_u64(H_WRITE_EPOCH).fetch_add(1, Ordering::Relaxed);
+        self.header_atomic_u64(H_WRITE_EPOCH).fetch_add(1, Ordering::Release);
     }
 
     /// Whether the one-way invalidation latch is set (by this or any other handle).

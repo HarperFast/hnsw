@@ -48,11 +48,21 @@ pub fn invalidate_file(plane: &PlaneFile) -> io::Result<Invalidation> {
 }
 
 fn invalidate_at(path: &Path, attached: Option<&PlaneFile>) -> io::Result<Invalidation> {
+    invalidate_with(path, attached, write_sidecar)
+}
+
+/// The order is the contract: the in-band mark is durable before the sidecar exists, so a
+/// crash between the two cannot leave a sidecar-less file with its old watermark.
+fn invalidate_with(
+    path: &Path,
+    attached: Option<&PlaneFile>,
+    sidecar: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<Invalidation> {
     let in_band = match attached {
         Some(plane) => plane.invalidate(),
         None => PlaneFile::open_for_invalidation(path).and_then(|plane| plane.invalidate()),
     };
-    let sidecar = write_sidecar(&stale_path_for(path));
+    let sidecar = sidecar(&stale_path_for(path));
     if let (Err(in_band), Err(sidecar)) = (&in_band, &sidecar) {
         return Err(io::Error::other(format!(
             "neither invalidation marker is durable for {}: in-band: {in_band}; sidecar: {sidecar}",
@@ -147,6 +157,35 @@ mod tests {
         assert!(outcome.sidecar.is_ok(), "{:?}", outcome.sidecar);
         assert!(stale_path_for(&path).is_file());
         open_is_refused(&path);
+    }
+
+    /// The in-band mark must be on the file before the sidecar is even attempted, through a
+    /// temporary handle and through the caller's own: the sidecar writer here observes the
+    /// latch (and no sidecar yet) at the moment it is called.
+    #[test]
+    fn the_in_band_mark_lands_before_the_sidecar_is_written() {
+        let path = tmp("order");
+        complete_looking_plane(&path);
+        let observed = std::cell::Cell::new(false);
+        let outcome = invalidate_with(&path, None, |stale| {
+            assert!(!stale.exists(), "the sidecar must not exist before the in-band mark");
+            observed.set(PlaneFile::open_for_invalidation(&path).expect("temp reopen").invalidated());
+            write_sidecar(stale)
+        })
+        .expect("invalidate");
+        assert!(observed.get(), "the latch must be set before the sidecar step runs");
+        assert!(outcome.in_band.is_ok() && outcome.sidecar.is_ok(), "{outcome:?}");
+
+        let path = tmp("orderattached");
+        complete_looking_plane(&path);
+        let attached = PlaneFile::open(&path).expect("open");
+        let observed = std::cell::Cell::new(false);
+        invalidate_with(&path, Some(&attached), |stale| {
+            observed.set(attached.invalidated() && !stale.exists());
+            write_sidecar(stale)
+        })
+        .expect("invalidate");
+        assert!(observed.get(), "the attached handle must carry the latch before the sidecar step");
     }
 
     #[test]

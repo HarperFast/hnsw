@@ -35,12 +35,14 @@ pub struct Graph {
     /// which is the coverage the rotation exists to provide.
     probe_rotation: std::sync::atomic::AtomicU32,
     /// (high-water, write epoch) at which this handle's last `stride` consecutive probes all
-    /// came back empty: a plane whose graph is entirely dead would otherwise pay the full
-    /// probe on every search forever. A node write through ANY handle bumps the epoch in the
-    /// header, so a revival by another process re-arms the probe as surely as one by us.
+    /// came back empty, so a fully dead graph stops paying the probe; any handle's node write
+    /// bumps the header epoch and re-arms it.
     probe_futile_hw: std::sync::atomic::AtomicU64,
     probe_futile_epoch: std::sync::atomic::AtomicU64,
     probe_futile_runs: std::sync::atomic::AtomicU32,
+    /// One repair probe at a time per handle: concurrent searches on the pool would each pay
+    /// the full walk before one of them publishes.
+    probe_in_flight: std::sync::atomic::AtomicBool,
 }
 
 /// A consistent full copy of one node (construction paths only; search uses zero-copy).
@@ -60,6 +62,7 @@ impl Graph {
             probe_futile_hw: std::sync::atomic::AtomicU64::new(u64::MAX),
             probe_futile_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
             probe_futile_runs: std::sync::atomic::AtomicU32::new(0),
+            probe_in_flight: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -320,7 +323,6 @@ impl Graph {
         neighbors: &[u32],
         upper_levels: &[Vec<u32>],
     ) -> Result<(), Wedged> {
-        self.node_written();
         self.file.ensure_high_water(id);
         let existing = match self.upper_idx_locked(id)? {
             idx if idx != NO_UPPER && (idx as u64) >= self.file.upper_capacity => NO_UPPER, // corrupt stored index
@@ -439,7 +441,6 @@ impl Graph {
     /// Write a full slot under its seqlock. `neighbors` is pruned to layer0_cap by the
     /// caller; `upper_idx` is a write_upper() result (NO_UPPER for level-0 nodes).
     pub fn write_node(&self, id: u32, level: u8, vector: &[i8], scale: f32, inv_mag: f32, neighbors: &[u32], upper_idx: u32) -> Result<(), Wedged> {
-        self.node_written();
         debug_assert!(neighbors.len() <= self.file.layer0_cap);
         debug_assert_eq!(vector.len(), self.file.dims);
         let seq = self.file.seq_atomic(id);
@@ -459,6 +460,10 @@ impl Graph {
             // valid last within the locked section; the seqlock release publishes it
             *p.add(S_FLAGS) = FLAG_VALID;
         }
+        drop(_guard);
+        // after the release: a probe that consumed a bump while the slot was still invalid
+        // would otherwise latch on a graph that holds a live node
+        self.node_written();
         Ok(())
     }
 
@@ -642,6 +647,9 @@ impl Graph {
         if unchanged && self.probe_futile_runs.load(Relaxed) >= stride {
             return None; // every residue probed since the last write anywhere: nothing to find
         }
+        if self.probe_in_flight.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return None; // another search on this handle is repairing; it publishes for both
+        }
         let offset = self.probe_rotation.fetch_add(1, Relaxed) % stride;
         let mut best: Option<(u32, u8)> = None;
         let mut cand = hw - 1 - offset;
@@ -667,6 +675,7 @@ impl Graph {
             self.probe_futile_epoch.store(epoch, Relaxed);
             self.probe_futile_runs.store(1, Relaxed);
         }
+        self.probe_in_flight.store(false, std::sync::atomic::Ordering::Release);
         best
     }
 
@@ -733,7 +742,6 @@ impl Graph {
         neighbors: &[u32],
         upper_levels: &[Vec<u32>],
     ) -> Result<bool, Wedged> {
-        self.node_written();
         debug_assert!(neighbors.len() <= self.file.layer0_cap);
         debug_assert_eq!(vector.len(), self.file.dims);
         self.file.ensure_high_water(id);
@@ -771,7 +779,9 @@ impl Graph {
                 }
             }
         };
-        if !written {
+        if written {
+            self.node_written();
+        } else {
             self.file.free_upper(upper_idx);
         }
         Ok(written)
