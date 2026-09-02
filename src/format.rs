@@ -26,6 +26,9 @@ const H_CLEAN_SHUTDOWN: usize = 56; // u8
 // One-way: set by invalidate(), cleared by nothing. While set the watermark reads 0 on every
 // handle whatever a racing flush stamps into it, and open() refuses the file.
 const H_INVALIDATED: usize = 57; // u8
+// Bumped by every node write through any handle: the search-side repair probe's evidence
+// that a fully dead graph may have gained a live node since it last came back empty.
+const H_WRITE_EPOCH: usize = 96; // u64 atomic
 const H_MAX_NODES: usize = 64; // u64
 const H_UPPER_HIGH_WATER: usize = 72; // u64 atomic: upper-entry allocator
 const H_UPPER_FREELIST: usize = 80; // u64 atomic: (tag<<32)|idx; NO_UPPER = empty
@@ -212,8 +215,10 @@ impl PlaneFile {
         };
         plane.register_opener();
         if stale_sidecar_present(path) {
-            // an invalidation raced the create: the file is unopenable from here on, so the
-            // caller must not be handed a handle it will mirror into
+            // an invalidation raced the create (its in-band leg found no header yet): latch the
+            // finished file too, so losing the sidecar cannot turn this failed create into an
+            // adoptable empty plane, and hand the caller no handle it would mirror into
+            let _ = plane.invalidate();
             return Err(io::Error::other(format!("{} gained a stale sidecar during create: remove {} and rebuild", path.display(), crate::invalidate::stale_path_for(path).display())));
         }
         Ok(plane)
@@ -541,6 +546,14 @@ impl PlaneFile {
     #[inline]
     fn invalidated_cell(&self) -> &AtomicU8 {
         unsafe { &*(self.map.as_ptr().add(H_INVALIDATED) as *const AtomicU8) }
+    }
+
+    pub fn write_epoch(&self) -> u64 {
+        self.header_atomic_u64(H_WRITE_EPOCH).load(Ordering::Relaxed)
+    }
+
+    pub fn bump_write_epoch(&self) {
+        self.header_atomic_u64(H_WRITE_EPOCH).fetch_add(1, Ordering::Relaxed);
     }
 
     /// Whether the one-way invalidation latch is set (by this or any other handle).

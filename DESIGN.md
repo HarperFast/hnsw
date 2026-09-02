@@ -97,6 +97,7 @@ One file per index (per slice, once C2 lands): `<index-path>.hnsw`.
 | txn_watermark                     | u64        | last durably indexed transaction; advanced by msync cadence  |
 | clean_shutdown flag               | u8         | torn-state detection on open                                 |
 | invalidated latch                 | u8         | one-way (v7): watermark reads 0 on every handle, open refuses |
+| write_epoch                       | u64 atomic | bumped by every node write; re-arms the read-side repair probe |
 
 **Main region — layer-0 slots**, addressed `4096 + id × slot_size`:
 

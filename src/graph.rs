@@ -34,10 +34,12 @@ pub struct Graph {
     /// plane's repairs too, so one plane's calls can land on a single residue indefinitely —
     /// which is the coverage the rotation exists to provide.
     probe_rotation: std::sync::atomic::AtomicU32,
-    /// High-water at which this handle's last `stride` consecutive probes all came back empty:
-    /// a plane whose graph is entirely dead would otherwise pay the full probe on every search
-    /// forever. Reset by any node write through this handle and by a high-water change.
+    /// (high-water, write epoch) at which this handle's last `stride` consecutive probes all
+    /// came back empty: a plane whose graph is entirely dead would otherwise pay the full
+    /// probe on every search forever. A node write through ANY handle bumps the epoch in the
+    /// header, so a revival by another process re-arms the probe as surely as one by us.
     probe_futile_hw: std::sync::atomic::AtomicU64,
+    probe_futile_epoch: std::sync::atomic::AtomicU64,
     probe_futile_runs: std::sync::atomic::AtomicU32,
 }
 
@@ -56,13 +58,14 @@ impl Graph {
             file,
             probe_rotation: std::sync::atomic::AtomicU32::new(0),
             probe_futile_hw: std::sync::atomic::AtomicU64::new(u64::MAX),
+            probe_futile_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
             probe_futile_runs: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
     #[inline]
     fn node_written(&self) {
-        self.probe_futile_runs.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.file.bump_write_epoch();
     }
 
     #[inline]
@@ -634,8 +637,10 @@ impl Graph {
         }
         let stride = hw.div_ceil(limit);
         use std::sync::atomic::Ordering::Relaxed;
-        if self.probe_futile_hw.load(Relaxed) == hw as u64 && self.probe_futile_runs.load(Relaxed) >= stride {
-            return None; // every residue probed since the last write here: nothing to find
+        let epoch = self.file.write_epoch();
+        let unchanged = self.probe_futile_hw.load(Relaxed) == hw as u64 && self.probe_futile_epoch.load(Relaxed) == epoch;
+        if unchanged && self.probe_futile_runs.load(Relaxed) >= stride {
+            return None; // every residue probed since the last write anywhere: nothing to find
         }
         let offset = self.probe_rotation.fetch_add(1, Relaxed) % stride;
         let mut best: Option<(u32, u8)> = None;
@@ -655,9 +660,11 @@ impl Graph {
         }
         if best.is_some() {
             self.probe_futile_runs.store(0, Relaxed);
-        } else if self.probe_futile_hw.swap(hw as u64, Relaxed) == hw as u64 {
+        } else if unchanged {
             self.probe_futile_runs.fetch_add(1, Relaxed);
         } else {
+            self.probe_futile_hw.store(hw as u64, Relaxed);
+            self.probe_futile_epoch.store(epoch, Relaxed);
             self.probe_futile_runs.store(1, Relaxed);
         }
         best
@@ -784,7 +791,8 @@ mod probe_tests {
     }
 
     /// A graph whose every node is dead must stop paying the repair probe once a full rotation
-    /// has come back empty, and must resume it after this handle writes a node.
+    /// has come back empty, and must resume it after ANY handle writes a node — the revival
+    /// here comes through a second handle on the same file, as another process's would.
     #[test]
     fn a_fully_dead_graph_stops_probing_until_a_node_is_written() {
         let dims = 32;
@@ -813,11 +821,12 @@ mod probe_tests {
         assert!(search(&graph, &query, 5, 64, &mut scratch).0.is_empty());
         assert_eq!(graph.probe_rotation.load(Relaxed), rotation, "a probed-out plane must not probe again");
 
-        // a node written through this handle (mirroring hosts do not always re-elect) must be
-        // findable again within one rotation
+        // a node written through another handle, with no entry-point update (mirroring hosts do
+        // not always re-elect), must be findable again within one rotation
         let revived = 3u32;
         let q = crate::distance::quantize_int8(&vector_for(revived, dims));
-        graph.write_node_raw(revived, 0, &q.0, q.1, q.2, &[], &[]).expect("revive");
+        let other = Graph::new(PlaneFile::open(&path).expect("a second handle"));
+        other.write_node_raw(revived, 0, &q.0, q.1, q.2, &[], &[]).expect("revive");
         let found = (0..stride).any(|_| !search(&graph, &Query::new(vector_for(revived, dims)), 5, 64, &mut scratch).0.is_empty());
         assert!(found, "a write must re-arm the probe");
         let _ = std::fs::remove_file(&path);
