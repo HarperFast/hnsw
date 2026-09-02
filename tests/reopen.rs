@@ -516,8 +516,8 @@ fn invalidate_demotes_a_complete_looking_mirror_and_reports_failure() {
         graph.file.invalidate().expect("invalidate must report its barrier, not swallow it");
         assert_eq!(graph.file.watermark(), 0, "invalidation must mark the mirror incomplete in band");
     }
-    let reopened = PlaneFile::open(&path).expect("reopen");
-    assert_eq!(reopened.watermark(), 0, "a fresh opener must see the incomplete mark, not the old stamp");
+    let refused = PlaneFile::open(&path).err().expect("a fresh opener must refuse the invalidated plane, not adopt it");
+    assert!(refused.to_string().contains("invalidated"), "{refused}");
     let _ = std::fs::remove_file(&path);
 }
 
@@ -752,4 +752,30 @@ fn a_repair_never_displaces_a_root_installed_while_it_ran() {
     assert!(graph.file.replace_entry_if(current, candidate, candidate_level as u32));
     assert_eq!(graph.file.entry_point().0, candidate);
     let _ = std::fs::remove_file(&path);
+}
+
+/// The path-level entry point a host disables a plane through when it cannot delete the file:
+/// afterwards a fresh opener is refused, the sidecar sits next to the plane, and the file is
+/// deletable (no mapping of the helper's survives the call).
+#[test]
+fn invalidating_by_path_marks_the_plane_in_band_and_with_a_sidecar() {
+    let dims = 32;
+    let path = tmp("invalidatepath");
+    let _ = std::fs::remove_file(&path);
+    {
+        let graph = Graph::new(PlaneFile::create(&path, dims, 16, 1_024).expect("create"));
+        let params = InsertParams::default();
+        let mut scratch = SearchScratch::new();
+        for i in 0..50 {
+            insert(&graph, &vector_for(i, dims), &params, &mut scratch).unwrap();
+        }
+        graph.file.flush_with_watermark(Some(4_096)).expect("barrier");
+    }
+    let outcome = hnsw_plane::invalidate_plane(&path).expect("at least one marker");
+    assert!(outcome.in_band.is_ok() && outcome.sidecar.is_ok(), "{outcome:?}");
+    let stale = hnsw_plane::stale_path_for(&path);
+    assert!(stale.is_file(), "the sidecar must exist next to the plane");
+    assert!(PlaneFile::open(&path).is_err(), "a fresh opener must refuse the invalidated plane");
+    std::fs::remove_file(&path).expect("the helper's temporary mapping must not outlive the call");
+    let _ = std::fs::remove_file(&stale);
 }

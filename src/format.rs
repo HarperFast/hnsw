@@ -4,11 +4,11 @@
 use memmap2::MmapMut;
 use std::fs::OpenOptions;
 use std::io;
-use std::path::Path;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 pub const MAGIC: u32 = 0x484e_5357; // "HNSW"
-pub const VERSION: u32 = 6; // v6: 4-aligned neighbor + upper id arrays (older files: reindex)
+pub const VERSION: u32 = 7; // v7: sticky invalidation latch; v6: 4-aligned neighbor + upper id arrays (older files: reindex)
 pub const HEADER_SIZE: usize = 4096;
 
 // Header field byte offsets.
@@ -23,6 +23,9 @@ const H_ID_HIGH_WATER: usize = 32; // u64 atomic
 const H_FREELIST_HEAD: usize = 40; // u64 atomic: (tag << 32) | id; id u32::MAX = empty
 const H_TXN_WATERMARK: usize = 48; // u64
 const H_CLEAN_SHUTDOWN: usize = 56; // u8
+// One-way: set by invalidate(), cleared by nothing. While set the watermark reads 0 on every
+// handle whatever a racing flush stamps into it, and open() refuses the file.
+const H_INVALIDATED: usize = 57; // u8
 const H_MAX_NODES: usize = 64; // u64
 const H_UPPER_HIGH_WATER: usize = 72; // u64 atomic: upper-entry allocator
 const H_UPPER_FREELIST: usize = 80; // u64 atomic: (tag<<32)|idx; NO_UPPER = empty
@@ -76,6 +79,9 @@ pub const NO_ID: u32 = u32::MAX;
 pub struct PlaneFile {
     /// Kept open for the lifetime of the mapping: the opener-registry OFD lock lives on it.
     file: std::fs::File,
+    /// The path this handle opened or created, as given; the sidecar of `invalidate_file` is
+    /// placed next to it.
+    pub path: PathBuf,
     /// This handle's registry tag (low bits encode its registry slot). 0 = unregistered
     /// (registry full or platform without OFD locks): this handle's own dead locks cannot be
     /// reclaimed by others, and it never reclaims.
@@ -114,6 +120,15 @@ fn advise_random(map: &MmapMut) {
     let _ = map;
 }
 
+fn stale_sidecar_present(path: &Path) -> bool {
+    // any entry counts, a directory or dangling link included: the marker is its presence
+    std::fs::symlink_metadata(crate::invalidate::stale_path_for(path)).is_ok()
+}
+
+fn invalidated_error(path: &Path) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, format!("{} was invalidated: delete it and its .stale sidecar, then rebuild the index", path.display()))
+}
+
 fn slot_size_for(dims: usize, layer0_cap: usize) -> usize {
     let raw = neighbor_offset(dims) + layer0_cap * 4;
     raw.next_multiple_of(64) // cache-line align
@@ -147,6 +162,11 @@ impl PlaneFile {
         if max_nodes >= NO_ID as u64 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "maxNodes must be below 2^32-1"));
         }
+        if stale_sidecar_present(path) {
+            // a leftover sidecar would make the new file unopenable forever; the host must
+            // clear it deliberately
+            return Err(io::Error::other(format!("{} has a stale sidecar: remove {} before creating", path.display(), crate::invalidate::stale_path_for(path).display())));
+        }
         let slot_size = slot_size_for(dims, layer0_cap);
         let slots_per_page = slots_per_page_for(slot_size);
         let data_len = slot_region_len(max_nodes, slot_size, slots_per_page);
@@ -178,6 +198,7 @@ impl PlaneFile {
         let upper_offset = HEADER_SIZE + slot_region_len(max_nodes, slot_size, slots_per_page) as usize;
         let mut plane = PlaneFile {
             file,
+            path: path.to_path_buf(),
             self_tag: 0,
             map,
             dims,
@@ -193,7 +214,23 @@ impl PlaneFile {
         Ok(plane)
     }
 
+    /// Open an existing plane. Refuses one that was invalidated — by its header latch or by a
+    /// `<path>.stale` sidecar — so a stale mirror is never adopted by any package consumer;
+    /// the host deletes both files and rebuilds.
     pub fn open(path: &Path) -> io::Result<Self> {
+        if stale_sidecar_present(path) {
+            return Err(invalidated_error(path));
+        }
+        let plane = Self::open_for_invalidation(path)?;
+        if plane.invalidated() {
+            return Err(invalidated_error(path));
+        }
+        Ok(plane)
+    }
+
+    /// `open` without the invalidation refusals: the handle `invalidate_plane` marks through,
+    /// which must reach an already-invalidated file so a repeated invalidation is idempotent.
+    pub(crate) fn open_for_invalidation(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let file_len = file.metadata()?.len();
         if file_len < HEADER_SIZE as u64 {
@@ -236,6 +273,7 @@ impl PlaneFile {
         let opened_clean = map[H_CLEAN_SHUTDOWN] == 1;
         let mut plane = PlaneFile {
             file,
+            path: path.to_path_buf(),
             self_tag: 0,
             map,
             dims,
@@ -481,8 +519,23 @@ impl PlaneFile {
         self.header_atomic_u64(H_TXN_WATERMARK).store(txn, Ordering::Release);
     }
 
+    /// The completion stamp — 0, "incomplete mirror", once the plane is invalidated, whatever
+    /// a flush racing the invalidation wrote into the word afterwards.
     pub fn watermark(&self) -> u64 {
+        if self.invalidated() {
+            return 0;
+        }
         self.header_atomic_u64(H_TXN_WATERMARK).load(Ordering::Acquire)
+    }
+
+    #[inline]
+    fn invalidated_cell(&self) -> &AtomicU8 {
+        unsafe { &*(self.map.as_ptr().add(H_INVALIDATED) as *const AtomicU8) }
+    }
+
+    /// Whether the one-way invalidation latch is set (by this or any other handle).
+    pub fn invalidated(&self) -> bool {
+        self.invalidated_cell().load(Ordering::Acquire) != 0
     }
 
     #[inline]
@@ -590,6 +643,12 @@ impl PlaneFile {
         }
     }
 
+    /// Every nonzero registry tag, live or not (liveness is `tag_is_dead`).
+    #[cfg(test)]
+    pub(crate) fn registered_tags(&self) -> Vec<u32> {
+        (0..REGISTRY_SLOTS).map(|slot| self.registry_tag_cell(slot).load(Ordering::Acquire)).filter(|&t| t != 0).collect()
+    }
+
     /// Try to take the OFD write lock on a registry slot's byte range. `probe` releases it
     /// immediately (liveness check); otherwise it is held for this handle's lifetime.
     #[cfg(target_os = "linux")]
@@ -670,8 +729,11 @@ impl PlaneFile {
         self.map.flush_range(0, HEADER_SIZE)
     }
 
-    /// Mark the plane an incomplete mirror, durably, and nothing else: zero the watermark and
-    /// msync the header page alone. Every opener then refuses to search it and rebuilds.
+    /// Mark the plane invalidated, durably, and nothing else: set the one-way latch, zero the
+    /// watermark, and msync the header page alone. Every handle then reads watermark 0 and
+    /// every later `open` refuses the file. The latch is what makes this stick against a
+    /// `flush_with_watermark` already in flight on this or another handle: that flush still
+    /// stamps the word, but nothing reads the word past the latch.
     ///
     /// Deliberately NOT `flush_with_watermark(Some(0))`: that writes the whole mapping back
     /// first, and the caller invalidating a multi-GB plane cannot pay a full msync inline —
@@ -681,6 +743,7 @@ impl PlaneFile {
     /// the ordering hazard `flush_with_watermark` exists to prevent is a NEW watermark over
     /// missing data, never an old one over durable data.
     pub fn invalidate(&self) -> io::Result<()> {
+        self.invalidated_cell().store(1, Ordering::Release);
         self.set_watermark(0);
         self.map.flush_range(0, HEADER_SIZE)
     }

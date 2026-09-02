@@ -1,6 +1,6 @@
 {
 	"name": "@harperfast/hnsw",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"description": "Persistent, incrementally-maintained, concurrently-searchable native HNSW for Node.js: a memory-mapped fixed-slot graph file with off-event-loop search, seqlock concurrency, int8 asymmetric distance, and bitset/predicate filtering.",
 	"license": "Apache-2.0",
 	"repository": {
@@ -41,9 +41,9 @@
 		"rust"
 	],
 	"optionalDependencies": {
-		"@harperfast/hnsw-darwin-arm64": "0.1.0",
-		"@harperfast/hnsw-linux-arm64-glibc": "0.1.0",
-		"@harperfast/hnsw-linux-x64-glibc": "0.1.0",
-		"@harperfast/hnsw-win32-x64": "0.1.0"
+		"@harperfast/hnsw-darwin-arm64": "0.2.0",
+		"@harperfast/hnsw-linux-arm64-glibc": "0.2.0",
+		"@harperfast/hnsw-linux-x64-glibc": "0.2.0",
+		"@harperfast/hnsw-win32-x64": "0.2.0"
 	}
 }

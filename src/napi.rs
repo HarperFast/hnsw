@@ -29,6 +29,69 @@ impl ScratchPool {
 }
 
 #[napi(object)]
+pub struct InvalidationOutcome {
+    pub in_band: bool,
+    pub sidecar: bool,
+    pub in_band_error: Option<String>,
+    pub sidecar_error: Option<String>,
+}
+
+impl From<crate::invalidate::Invalidation> for InvalidationOutcome {
+    fn from(outcome: crate::invalidate::Invalidation) -> Self {
+        InvalidationOutcome {
+            in_band: outcome.in_band.is_ok(),
+            sidecar: outcome.sidecar.is_ok(),
+            in_band_error: outcome.in_band.err().map(|e| e.to_string()),
+            sidecar_error: outcome.sidecar.err().map(|e| e.to_string()),
+        }
+    }
+}
+
+/// Make the plane file at `path` unadoptable, durably, through a temporary handle released
+/// before this returns: the in-band latch (watermark 0 on every handle, every later open
+/// refused) and the fsync'd `.stale` sidecar. Both markers are attempted; throws only when
+/// neither became durable, leaving the file exactly as found. Synchronous: three small
+/// fsyncs on a cold path. Use invalidatePlaneAsync where the caller can await.
+#[napi]
+pub fn invalidate_plane(path: String) -> Result<InvalidationOutcome> {
+    crate::invalidate::invalidate_plane(std::path::Path::new(&path))
+        .map(InvalidationOutcome::from)
+        .map_err(|e| Error::from_reason(e.to_string()))
+}
+
+pub struct InvalidateTask {
+    path: String,
+}
+
+#[napi]
+impl Task for InvalidateTask {
+    type Output = InvalidationOutcome;
+    type JsValue = InvalidationOutcome;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        crate::invalidate::invalidate_plane(std::path::Path::new(&self.path))
+            .map(InvalidationOutcome::from)
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+/// invalidatePlane on the libuv thread pool, for callers that can await the fsyncs.
+#[napi(ts_return_type = "Promise<InvalidationOutcome>")]
+pub fn invalidate_plane_async(path: String) -> AsyncTask<InvalidateTask> {
+    AsyncTask::new(InvalidateTask { path })
+}
+
+/// The sidecar convention checked at attach: `<plane path>.stale`.
+#[napi]
+pub fn stale_path_for(path: String) -> String {
+    crate::invalidate::stale_path_for(std::path::Path::new(&path)).to_string_lossy().into_owned()
+}
+
+#[napi(object)]
 pub struct SearchHit {
     pub id: u32,
     pub distance: f64,
@@ -485,12 +548,27 @@ impl Plane {
         self.graph.file.flush_with_watermark(watermark.map(|w| w as u64)).map_err(|e| Error::from_reason(e.to_string()))
     }
 
-    /// Durably mark this plane an incomplete mirror: zero the watermark and msync the header
-    /// page alone, so a host disabling a plane it cannot delete has the mark on disk before it
-    /// writes any out-of-band tombstone. Synchronous by design — it is a 4 KB msync, not the
-    /// whole-mapping writeback `flush` performs.
+    /// Durably mark this plane invalidated in band: set the one-way latch, zero the watermark,
+    /// and msync the header page alone, so a host disabling a plane it cannot delete has the
+    /// mark on disk before it writes any out-of-band tombstone. Synchronous by design — it is
+    /// a 4 KB msync, not the whole-mapping writeback `flush` performs.
     #[napi]
     pub fn invalidate(&self) -> Result<()> {
         self.graph.file.invalidate().map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    /// invalidatePlane through this handle: the in-band mark via this mapping (no second
+    /// open, no second registry slot) and the `.stale` sidecar next to the path it opened.
+    #[napi]
+    pub fn invalidate_file(&self) -> Result<InvalidationOutcome> {
+        crate::invalidate::invalidate_file(&self.graph.file)
+            .map(InvalidationOutcome::from)
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    /// Whether the plane was invalidated (by any handle) since this one opened.
+    #[napi]
+    pub fn invalidated(&self) -> bool {
+        self.graph.file.invalidated()
     }
 }

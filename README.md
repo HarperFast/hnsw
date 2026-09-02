@@ -68,6 +68,13 @@ const predicated = await plane.searchWithPredicate(queryVector, 10, 512, (ids) =
 );
 ```
 
+A plane is derived state; when the host must stop maintaining one and cannot delete the file
+(Windows sharing violations while another process maps it), `invalidatePlane(path)` — or
+`plane.invalidateFile()` through a handle the host already holds — durably marks it
+unadoptable: a one-way in-band latch (watermark reads 0, `Plane.open` refuses) plus a fsync'd
+`<path>.stale` sidecar (`stalePathFor(path)`, which `open` also refuses). It throws only when
+neither marker lands. Hosts delete both files and rebuild.
+
 Full API in [index.d.ts](index.d.ts).
 
 ## Benchmarks
@@ -81,8 +88,8 @@ equal recall.
 
 ## Status
 
-Extracted from the Harper vector-index engine; the format (v2) and API are young and may
-change with a major version + reindex. Roadmap: prebuilds, binary-quantized slot format
+Extracted from the Harper vector-index engine; the format (v7) and API are young and may
+change with a version bump + reindex (an older format version fails to open; rebuild). Roadmap: prebuilds, binary-quantized slot format
 (~4× smaller traversal plane), Matryoshka dimension truncation, mremap growth, index
 slicing with native top-k merge.
 
