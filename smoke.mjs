@@ -107,7 +107,6 @@ if (!byPath.inBand || !byPath.sidecar) throw new Error(`path invalidation incomp
 const byPathAsync = await invalidatePlaneAsync(path);
 if (!byPathAsync.inBand || !byPathAsync.sidecar) throw new Error(`async path invalidation incomplete: ${JSON.stringify(byPathAsync)}`);
 rmSync(stalePathFor(path));
-rmSync(path);
 // neither marker possible: not a plane, and a directory squatting the sidecar path
 const bogus = join(tmpdir(), `smoke-bogus-${process.pid}.hnsw`);
 const { writeFileSync } = await import('node:fs');

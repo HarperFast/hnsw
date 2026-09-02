@@ -105,9 +105,10 @@ export declare class Plane {
 	/** flush() on the libuv thread pool — a whole-map msync can stall its calling thread. */
 	flushAsync(watermark?: number): Promise<void>;
 	/**
-	 * Durably mark this plane invalidated in band: one-way header latch + watermark zeroed,
-	 * header page msync'd (a 4 KB barrier, not a whole-mapping flush). From then on every
-	 * handle reads watermark 0, whatever a racing flush stamps, and every later open() throws.
+	 * In-band half of invalidateFile() only — no sidecar, so a process that cannot map the
+	 * file sees nothing; prefer invalidateFile(). Sets the one-way header latch, zeroes the
+	 * watermark, msyncs the header page (a 4 KB barrier, not a whole-mapping flush). From then
+	 * on every handle reads watermark 0, whatever a racing flush stamps, and open() throws.
 	 */
 	invalidate(): void;
 	/**
@@ -133,8 +134,9 @@ export interface InvalidationOutcome {
  * Make a plane file that could not be deleted unadoptable, durably, through a temporary
  * handle that is unmapped and closed before this returns. Both markers are always attempted:
  * the in-band latch and the fsync'd `.stale` sidecar; open() refuses a file carrying either.
- * Throws only when neither marker became durable; the file is then exactly as found (nothing
- * is deleted or renamed). Idempotent. Synchronous (three small fsyncs on a cold path).
+ * Throws only when neither marker became durable; nothing is deleted or renamed, and an
+ * in-band mark whose msync failed may still have landed in the shared mapping (the safe
+ * direction: it reads as incomplete). Idempotent. Synchronous (three small fsyncs on a cold path).
  */
 export declare function invalidatePlane(path: string): InvalidationOutcome;
 /** invalidatePlane() on the libuv thread pool. */

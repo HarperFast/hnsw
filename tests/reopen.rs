@@ -779,3 +779,30 @@ fn invalidating_by_path_marks_the_plane_in_band_and_with_a_sidecar() {
     std::fs::remove_file(&path).expect("the helper's temporary mapping must not outlive the call");
     let _ = std::fs::remove_file(&stale);
 }
+
+/// A re-election that read a dead entry and stalled must not land over an EQUAL-level entry
+/// installed meanwhile: that entry may be a fresh `claim_entry_if_empty` winner with no
+/// in-edges yet, and displacing it orphans the node its insert already reported as landed.
+/// A strictly higher-level install still wins.
+#[test]
+fn a_stale_reelection_never_displaces_an_equal_level_entry_installed_meanwhile() {
+    let dims = 32;
+    let path = tmp("staleelect");
+    let _ = std::fs::remove_file(&path);
+    let graph = Graph::new(PlaneFile::create(&path, dims, 16, 64).expect("create"));
+    let raw = |id: u32, level: u8, upper: &[Vec<u32>]| {
+        let q = hnsw_plane::distance::quantize_int8(&vector_for(id, dims));
+        graph.write_node_raw(id, level, &q.0, q.1, q.2, &[], upper).expect("mirror");
+    };
+    raw(1, 0, &[]); // the claimer, edgeless
+    raw(2, 0, &[]); // the stalled re-election's level-0 candidate
+    raw(3, 1, &[vec![]]);
+    let dead_entry = 9u32;
+    assert!(graph.file.claim_entry_if_empty(1, 0), "precondition: the claim wins on an empty header");
+
+    graph.file.set_entry_point_if_not_better(2, 0, dead_entry);
+    assert_eq!(graph.file.entry_point().0, 1, "an equal-level re-election must not displace the claimer");
+    graph.file.set_entry_point_if_not_better(3, 1, dead_entry);
+    assert_eq!(graph.file.entry_point().0, 3, "a higher-level install still wins");
+    let _ = std::fs::remove_file(&path);
+}

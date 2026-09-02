@@ -211,6 +211,11 @@ impl PlaneFile {
             opened_clean: true,
         };
         plane.register_opener();
+        if stale_sidecar_present(path) {
+            // an invalidation raced the create: the file is unopenable from here on, so the
+            // caller must not be handed a handle it will mirror into
+            return Err(io::Error::other(format!("{} gained a stale sidecar during create: remove {} and rebuild", path.display(), crate::invalidate::stale_path_for(path).display())));
+        }
         Ok(plane)
     }
 
@@ -222,7 +227,9 @@ impl PlaneFile {
             return Err(invalidated_error(path));
         }
         let plane = Self::open_for_invalidation(path)?;
-        if plane.invalidated() {
+        // the pre-map check is only half the refusal: a sidecar landed by an invalidation
+        // whose in-band leg failed (no latch to see) can appear between the check and the map
+        if plane.invalidated() || stale_sidecar_present(path) {
             return Err(invalidated_error(path));
         }
         Ok(plane)
@@ -462,8 +469,11 @@ impl PlaneFile {
         loop {
             let cur_id = (cur & 0xffff_ffff) as u32;
             let cur_level = (cur >> 32) as u32;
-            if cur_id != expected_id && cur_id != NO_ID && cur_level > level {
-                return; // someone installed a better entry meanwhile
+            // `>=`, not `>`: an equal-level entry installed meanwhile may be a fresh
+            // `claim_entry_if_empty` winner with no in-edges yet; displacing it orphans that
+            // node, and an equal-level swap gains nothing
+            if cur_id != expected_id && cur_id != NO_ID && cur_level >= level {
+                return; // someone installed a not-worse entry meanwhile
             }
             match cell.compare_exchange(cur, new, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => {
@@ -736,12 +746,12 @@ impl PlaneFile {
     /// stamps the word, but nothing reads the word past the latch.
     ///
     /// Deliberately NOT `flush_with_watermark(Some(0))`: that writes the whole mapping back
-    /// first, and the caller invalidating a multi-GB plane cannot pay a full msync inline —
-    /// which is why the host used to queue an async flush and create its `.stale` sidecar
-    /// before the flush had happened at all. Skipping the data flush is sound because the
-    /// data is being discarded, and because lowering the watermark is the safe direction:
-    /// the ordering hazard `flush_with_watermark` exists to prevent is a NEW watermark over
-    /// missing data, never an old one over durable data.
+    /// first, and the caller invalidating a multi-GB plane cannot pay a full msync inline.
+    /// Skipping the data flush is sound because the data is being discarded, and because
+    /// lowering the watermark is the safe direction: the ordering hazard
+    /// `flush_with_watermark` exists to prevent is a NEW watermark over missing data, never
+    /// an old one over durable data. The stores precede the msync, so on an msync failure
+    /// the mark may still reach disk through ordinary writeback — also the safe direction.
     pub fn invalidate(&self) -> io::Result<()> {
         self.invalidated_cell().store(1, Ordering::Release);
         self.set_watermark(0);

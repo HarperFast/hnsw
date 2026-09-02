@@ -221,6 +221,11 @@ pub fn insert(
     // An unresolvable entry point is an error the host retries: Ok here would report success
     // for a node no search can reach.
     let Some((entry_id, entry_level, entry_dist)) = joined else {
+        if published {
+            // the edgeless node a failed claim left behind is a live-reading slot with no
+            // in-edges: a later re-election or repair probe could root the graph at it
+            let _ = graph.delete_node(id);
+        }
         return Err(InsertError::Wedged);
     };
     let top = level.min(entry_level as u8);

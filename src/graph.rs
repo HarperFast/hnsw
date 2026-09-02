@@ -34,6 +34,11 @@ pub struct Graph {
     /// plane's repairs too, so one plane's calls can land on a single residue indefinitely —
     /// which is the coverage the rotation exists to provide.
     probe_rotation: std::sync::atomic::AtomicU32,
+    /// High-water at which this handle's last `stride` consecutive probes all came back empty:
+    /// a plane whose graph is entirely dead would otherwise pay the full probe on every search
+    /// forever. Reset by any node write through this handle and by a high-water change.
+    probe_futile_hw: std::sync::atomic::AtomicU64,
+    probe_futile_runs: std::sync::atomic::AtomicU32,
 }
 
 /// A consistent full copy of one node (construction paths only; search uses zero-copy).
@@ -47,7 +52,17 @@ pub struct NodeRead {
 
 impl Graph {
     pub fn new(file: PlaneFile) -> Self {
-        Graph { file, probe_rotation: std::sync::atomic::AtomicU32::new(0) }
+        Graph {
+            file,
+            probe_rotation: std::sync::atomic::AtomicU32::new(0),
+            probe_futile_hw: std::sync::atomic::AtomicU64::new(u64::MAX),
+            probe_futile_runs: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    #[inline]
+    fn node_written(&self) {
+        self.probe_futile_runs.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[inline]
@@ -302,6 +317,7 @@ impl Graph {
         neighbors: &[u32],
         upper_levels: &[Vec<u32>],
     ) -> Result<(), Wedged> {
+        self.node_written();
         self.file.ensure_high_water(id);
         let existing = match self.upper_idx_locked(id)? {
             idx if idx != NO_UPPER && (idx as u64) >= self.file.upper_capacity => NO_UPPER, // corrupt stored index
@@ -420,6 +436,7 @@ impl Graph {
     /// Write a full slot under its seqlock. `neighbors` is pruned to layer0_cap by the
     /// caller; `upper_idx` is a write_upper() result (NO_UPPER for level-0 nodes).
     pub fn write_node(&self, id: u32, level: u8, vector: &[i8], scale: f32, inv_mag: f32, neighbors: &[u32], upper_idx: u32) -> Result<(), Wedged> {
+        self.node_written();
         debug_assert!(neighbors.len() <= self.file.layer0_cap);
         debug_assert_eq!(vector.len(), self.file.dims);
         let seq = self.file.seq_atomic(id);
@@ -616,7 +633,11 @@ impl Graph {
             return None;
         }
         let stride = hw.div_ceil(limit);
-        let offset = self.probe_rotation.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % stride;
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.probe_futile_hw.load(Relaxed) == hw as u64 && self.probe_futile_runs.load(Relaxed) >= stride {
+            return None; // every residue probed since the last write here: nothing to find
+        }
+        let offset = self.probe_rotation.fetch_add(1, Relaxed) % stride;
         let mut best: Option<(u32, u8)> = None;
         let mut cand = hw - 1 - offset;
         for _ in 0..limit {
@@ -631,6 +652,13 @@ impl Graph {
                 break;
             }
             cand -= stride;
+        }
+        if best.is_some() {
+            self.probe_futile_runs.store(0, Relaxed);
+        } else if self.probe_futile_hw.swap(hw as u64, Relaxed) == hw as u64 {
+            self.probe_futile_runs.fetch_add(1, Relaxed);
+        } else {
+            self.probe_futile_runs.store(1, Relaxed);
         }
         best
     }
@@ -698,6 +726,7 @@ impl Graph {
         neighbors: &[u32],
         upper_levels: &[Vec<u32>],
     ) -> Result<bool, Wedged> {
+        self.node_written();
         debug_assert!(neighbors.len() <= self.file.layer0_cap);
         debug_assert_eq!(vector.len(), self.file.dims);
         self.file.ensure_high_water(id);
@@ -739,5 +768,58 @@ impl Graph {
             self.file.free_upper(upper_idx);
         }
         Ok(written)
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use crate::distance::Query;
+    use crate::insert::{insert, InsertParams};
+    use crate::search::{search, SearchScratch};
+    use std::sync::atomic::Ordering::Relaxed;
+
+    fn vector_for(i: u32, dims: usize) -> Vec<f32> {
+        (0..dims).map(|d| ((i as f32 * 0.31 + d as f32) * 0.7).sin()).collect()
+    }
+
+    /// A graph whose every node is dead must stop paying the repair probe once a full rotation
+    /// has come back empty, and must resume it after this handle writes a node.
+    #[test]
+    fn a_fully_dead_graph_stops_probing_until_a_node_is_written() {
+        let dims = 32;
+        let path = std::env::temp_dir().join(format!("hnsw-probefutile-{}.hnsw", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let graph = Graph::new(PlaneFile::create(&path, dims, 16, 4_096).expect("create"));
+        let params = InsertParams::default();
+        let mut scratch = SearchScratch::new();
+        for i in 0..2_100 {
+            insert(&graph, &vector_for(i, dims), &params, &mut scratch).unwrap();
+        }
+        let hw = graph.file.id_high_water() as u32;
+        let stride = hw.div_ceil(1_024); // REPAIR_PROBE_LIMIT
+        assert!(stride > 1, "precondition: a rotation the guard has to wait out");
+        let (entry, _) = graph.file.entry_point();
+        for id in 0..hw {
+            let _ = graph.clear_node(id);
+        }
+        graph.file.clear_entry_point_if(entry);
+
+        let query = Query::new(vector_for(7, dims));
+        for _ in 0..stride {
+            assert!(search(&graph, &query, 5, 64, &mut scratch).0.is_empty());
+        }
+        let rotation = graph.probe_rotation.load(Relaxed);
+        assert!(search(&graph, &query, 5, 64, &mut scratch).0.is_empty());
+        assert_eq!(graph.probe_rotation.load(Relaxed), rotation, "a probed-out plane must not probe again");
+
+        // a node written through this handle (mirroring hosts do not always re-elect) must be
+        // findable again within one rotation
+        let revived = 3u32;
+        let q = crate::distance::quantize_int8(&vector_for(revived, dims));
+        graph.write_node_raw(revived, 0, &q.0, q.1, q.2, &[], &[]).expect("revive");
+        let found = (0..stride).any(|_| !search(&graph, &Query::new(vector_for(revived, dims)), 5, 64, &mut scratch).0.is_empty());
+        assert!(found, "a write must re-arm the probe");
+        let _ = std::fs::remove_file(&path);
     }
 }

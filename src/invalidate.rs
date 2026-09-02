@@ -30,9 +30,10 @@ pub fn stale_path_for(path: &Path) -> PathBuf {
 }
 
 /// Invalidate the plane at `path` through a temporary handle. Returns `Err` only when NEITHER
-/// marker became durable — the file is then exactly as found (nothing here deletes or
-/// renames), so the caller keeps whatever recovery state it had. Idempotent: an already
-/// invalidated plane reports both markers again.
+/// marker became durable. Nothing here deletes or renames, so the caller keeps whatever
+/// recovery state it had; an in-band mark whose msync failed may still have landed in the
+/// shared mapping, which is the safe direction (every handle reads it as incomplete).
+/// Idempotent: an already invalidated plane reports both markers again.
 pub fn invalidate_plane(path: &Path) -> io::Result<Invalidation> {
     invalidate_at(path, None)
 }
@@ -63,20 +64,38 @@ fn invalidate_at(path: &Path, attached: Option<&PlaneFile>) -> io::Result<Invali
 
 /// Create-new rather than create: the plane directory may be writable by another principal,
 /// and a planted symlink at the sidecar path would otherwise be followed and its target
-/// truncated. An existing regular file is the marker already and is only re-synced.
+/// truncated. An existing marker is re-synced through a no-follow open checked on the open
+/// handle, so a swap between the two calls cannot redirect the sync either.
 fn write_sidecar(stale: &Path) -> io::Result<()> {
     let marker = match OpenOptions::new().write(true).create_new(true).open(stale) {
         Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            if !std::fs::symlink_metadata(stale)?.file_type().is_file() {
-                return Err(io::Error::other(format!("{} exists and is not a regular file", stale.display())));
-            }
-            OpenOptions::new().write(true).open(stale)?
-        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => open_existing_marker(stale)?,
         Err(e) => return Err(e),
     };
     marker.sync_all()?;
     sync_dir(parent_dir(stale))
+}
+
+fn open_existing_marker(stale: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_NONBLOCK: a FIFO planted here must fail (ENXIO) rather than block the open
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(stale)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::other(format!("{} exists and is not a regular file", stale.display())));
+    }
+    Ok(file)
 }
 
 fn parent_dir(stale: &Path) -> &Path {
@@ -172,10 +191,10 @@ mod tests {
         std::fs::remove_file(&path).expect("nothing of ours may hold the file");
     }
 
-    /// Neither marker: an error that names both causes, and a file exactly as found — the
+    /// Neither marker: an error that names both causes, and nothing deleted or replaced — the
     /// caller's recovery state (retry later, stay disabled in-process) is preserved.
     #[test]
-    fn a_double_failure_is_an_error_and_leaves_the_file_as_found() {
+    fn a_double_failure_is_an_error_and_deletes_nothing() {
         let path = tmp("double");
         std::fs::write(&path, b"not a plane").unwrap();
         std::fs::create_dir(stale_path_for(&path)).unwrap();
@@ -208,8 +227,9 @@ mod tests {
         open_is_refused(&path);
     }
 
-    /// A planted symlink at the sidecar path must not be followed: the victim keeps its
-    /// bytes and the sidecar is reported as not durable.
+    /// A planted symlink at the sidecar path must not be followed, on the first invalidation
+    /// (create-new) and on a repeat that finds the marker swapped for a link: the victim keeps
+    /// its bytes and the sidecar is reported as not durable.
     #[cfg(unix)]
     #[test]
     fn a_symlink_at_the_sidecar_path_is_never_followed() {
@@ -221,6 +241,8 @@ mod tests {
         let outcome = invalidate_plane(&path).expect("in band still lands");
         assert!(outcome.sidecar.is_err(), "a symlink at the sidecar path must be refused");
         assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        let err = open_existing_marker(&stale_path_for(&path)).err().expect("the no-follow reopen must refuse a link");
+        assert!(err.raw_os_error().is_some() || err.to_string().contains("regular file"), "{err}");
     }
 
     /// The package enforces the markers at open: a sidecar alone (the plane's own header was
