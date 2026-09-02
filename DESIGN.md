@@ -99,15 +99,19 @@ One file per index (per slice, once C2 lands): `<index-path>.hnsw`.
 
 **Main region — layer-0 slots**, addressed `4096 + id × slot_size`:
 
-| Field                           | Size (768-d int8, cap 64)          |
-| ------------------------------- | ---------------------------------- |
-| seq (seqlock)                   | 4 B                                |
-| flags (valid/deleted) + level   | 2 B                                |
-| scale (f32) + invMag (f32)      | 8 B                                |
-| degree                          | 2 B                                |
-| vector (int8 × 768)             | 768 B                              |
-| neighbor ids (u32 × layer0_cap) | 256 B                              |
-| **total, padded**               | **1,040 B → 1 KB-aligned 1,088 B** |
+| Field                           | Size (768-d int8, cap 64)           |
+| ------------------------------- | ----------------------------------- |
+| seq (seqlock)                   | 4 B                                 |
+| flags (valid/deleted) + level   | 2 B                                 |
+| scale (f32) + invMag (f32)      | 8 B                                 |
+| degree                          | 2 B                                 |
+| vector (int8 × 768)             | 768 B (padded to a 4-byte boundary) |
+| neighbor ids (u32 × layer0_cap) | 256 B                               |
+| **total, padded**               | **1,040 B → 1 KB-aligned 1,088 B**  |
+
+The vector's trailing pad keeps the neighbor array 4-aligned for every `dims`, so the search
+hot path reads each neighbor id as one aligned volatile `u32`. Upper-layer id lists are padded
+the same way (`degree u16 + pad u16 + ids`).
 
 At 100M nodes: ~109 GB (int8). A binary-code v2 slot (96 B codes + ids) is ~384 B → ~38 GB.
 For comparison, today's encoding averages 1,425 B/node _plus_ RocksDB overhead — so v1 is
@@ -272,6 +276,14 @@ Decided (Kris, 2026-08-31):
 
 Open:
 
+- **Atomic slot payloads.** Fields a concurrent reader acts on (flags, level, degree, scale,
+  invMag, neighbor and upper ids) are read through aligned `read_volatile`, which forbids the
+  reload/split/sink across the seqlock's validating fence that `lto = true, codegen-units = 1`
+  otherwise licenses. That is not the same as being race-free under Rust's memory model: only
+  making those fields `AtomicU8`/`AtomicU16`/`AtomicU32` in the slot layout would be, and that
+  is a format change deferred past phase 1. The stored vector stays an ordinary load on
+  purpose — `cosine_int8_raw` must keep autovectorizing, and a torn vector only perturbs a
+  distance the generation check discards.
 - **msync cadence default** — bounded-lag durability window vs write amplification; needs a
   workload measurement, not a guess.
 - **f32 (quantization:"none") slot variant** — 3,072 B vectors → 3.4 KB slots; supported by the

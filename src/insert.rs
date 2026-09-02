@@ -34,7 +34,7 @@ fn level_for(id: u32, ml: f64) -> u8 {
 /// Remove `to` from `from`'s adjacency at `level` (edge-replacement maintenance).
 fn remove_edge(graph: &Graph, from: u32, to: u32, level: u8) {
     if level == 0 {
-        graph.update_neighbors(from, |list| {
+        let _ = graph.update_neighbors(from, |list| {
             if let Some(pos) = list.iter().position(|&x| x == to) {
                 list.remove(pos);
             }
@@ -93,6 +93,25 @@ fn prune_with_coverage(graph: &Graph, base: u32, list: &mut Vec<u32>, cap: usize
     *list = scored.into_iter().map(|(cand, _)| cand).collect();
 }
 
+/// The contended fallback's merge: add `new_id` under the slot lock, displacing the tail once the
+/// list is at `cap`. Which neighbor that is is arbitrary — appends push at the tail, so a list is
+/// distance-ordered only immediately after a prune — but it must not be `new_id` itself, which is
+/// what a push followed by `truncate(cap)` drops. That loss is the systematic one: the edge being
+/// added is the in-edge keeping a freshly inserted node reachable from `nid`, and it disappears
+/// every time the list is full and the CAS path is contended. Picking a better victim needs
+/// distances, which this path deliberately keeps outside the lock.
+fn merge_neighbor_capped(graph: &Graph, nid: u32, new_id: u32, cap: usize) {
+    let _ = graph.update_neighbors(nid, |list| {
+        if list.contains(&new_id) {
+            return;
+        }
+        if list.len() >= cap {
+            list.truncate(cap.saturating_sub(1));
+        }
+        list.push(new_id);
+    });
+}
+
 /// Add `new_id` to `nid`'s adjacency at `level`, coverage-pruning to `cap` when over. The
 /// prune's distance computations (which can major-fault on a cold mapping) run OUTSIDE the
 /// slot lock: the list is snapshotted, pruned, and applied with a compare-and-set; after a
@@ -117,12 +136,7 @@ fn add_reverse_edge(graph: &Graph, nid: u32, new_id: u32, level: u8, cap: usize)
             }
         }
         // contended twice: merge cheaply under the lock (bounded critical section)
-        let _ = graph.update_neighbors(nid, |list| {
-            if !list.contains(&new_id) {
-                list.push(new_id);
-                list.truncate(cap);
-            }
-        });
+        merge_neighbor_capped(graph, nid, new_id, cap);
     } else {
         let _ = graph.update_upper_level(nid, level, |list| {
             if list.contains(&new_id) {
@@ -161,35 +175,53 @@ pub fn insert(
     let layer0_cap = graph.file.layer0_cap;
     let m = params.m;
 
-    let (entry_id, entry_level) = graph.file.entry_point();
-    if entry_id == NO_ID {
-        let upper_idx = if level > 0 { graph.write_upper(&vec![Vec::new(); level as usize]).unwrap_or(NO_UPPER) } else { NO_UPPER };
-        graph.write_node(id, level, &bytes, scale, inv_mag, &[], upper_idx).map_err(|_| InsertError::Wedged)?;
-        // CAS: a concurrent first insert may have installed an entry already — never clobber
-        graph.file.set_entry_point_if_not_better(id, level as u32, NO_ID);
-        return Ok(id);
-    }
-
     let mut stats = SearchStats { visits: 0 };
-    let (entry_id, entry_level, entry_dist) = match graph.distance_to(entry_id, &query) {
-        Some(d) => (entry_id, entry_level, d),
-        None => {
-            // The stored entry point is gone (e.g. a mirroring host cleared it without
-            // re-electing). Self-promoting an edgeless new node here would orphan the whole
-            // existing graph behind an unreachable root — re-elect from the live graph and
-            // continue; only a truly empty graph makes this node the first entry.
-            graph.reelect_entry_point(&[]);
-            let (re_id, re_level) = graph.file.entry_point();
-            match (re_id != NO_ID).then(|| graph.distance_to(re_id, &query)).flatten() {
-                Some(d) => (re_id, re_level, d),
-                None => {
-                    let upper_idx = if level > 0 { graph.write_upper(&vec![Vec::new(); level as usize]).unwrap_or(NO_UPPER) } else { NO_UPPER };
-                    graph.write_node(id, level, &bytes, scale, inv_mag, &[], upper_idx).map_err(|_| InsertError::Wedged)?;
-                    graph.file.set_entry_point_if_not_better(id, level as u32, NO_ID);
-                    return Ok(id);
-                }
-            }
+    // Upper entry a first-entry claim attempt already published for `id`. Its slot names the
+    // index, so the join path must rewrite it in place — freeing an index a live slot names
+    // would let another node adopt it mid-traversal.
+    let mut published_upper = NO_UPPER;
+    let mut published = false;
+    let publish_edgeless = |published: &mut bool, published_upper: &mut u32| -> Result<(), InsertError> {
+        if *published {
+            return Ok(());
         }
+        *published_upper =
+            if level > 0 { graph.write_upper(&vec![Vec::new(); level as usize]).unwrap_or(NO_UPPER) } else { NO_UPPER };
+        graph.write_node(id, level, &bytes, scale, inv_mag, &[], *published_upper).map_err(|_| InsertError::Wedged)?;
+        *published = true;
+        Ok(())
+    };
+
+    // Resolve an entry point to grow from. Every turn makes progress — it claims an empty
+    // graph, joins a live entry, or replaces one that is provably gone — so the cap only
+    // guards an insert/delete interleaving that keeps clearing the entry under us.
+    let mut joined = None;
+    for _ in 0..16 {
+        let (entry_id, entry_level) = graph.file.entry_point();
+        if entry_id == NO_ID {
+            publish_edgeless(&mut published, &mut published_upper)?;
+            // Claim only from EMPTY, and only the winner returns: a not-worse install would put
+            // this edgeless node over a live equal-or-lower-level entry and orphan the graph
+            // behind it, and it cannot report losing, which a loser must know to join instead.
+            if graph.file.claim_entry_if_empty(id, level as u32) {
+                return Ok(id);
+            }
+            continue; // a racer rooted the graph — join it rather than stand alone
+        }
+        if let Some(d) = graph.distance_to(entry_id, &query) {
+            joined = Some((entry_id, entry_level, d));
+            break;
+        }
+        // The stored entry point is gone (e.g. a mirroring host cleared it without
+        // re-electing). Self-promoting an edgeless new node here would orphan the whole
+        // existing graph behind an unreachable root — re-elect from the live graph and
+        // continue; only a truly empty graph makes this node the first entry.
+        graph.reelect_entry_point_replacing(&[], entry_id);
+    }
+    // An unresolvable entry point is an error the host retries: Ok here would report success
+    // for a node no search can reach.
+    let Some((entry_id, entry_level, entry_dist)) = joined else {
+        return Err(InsertError::Wedged);
     };
     let top = level.min(entry_level as u8);
     let (mut ep, mut ep_dist) =
@@ -261,7 +293,12 @@ pub fn insert(
                     .unwrap_or_default()
             })
             .collect();
-        graph.write_upper(&levels).unwrap_or(NO_UPPER)
+        if published_upper != NO_UPPER {
+            graph.rewrite_upper(published_upper, &levels).map_err(|_| InsertError::Wedged)?;
+            published_upper
+        } else {
+            graph.write_upper(&levels).unwrap_or(NO_UPPER)
+        }
     } else {
         NO_UPPER
     };
@@ -279,7 +316,7 @@ pub fn insert(
 
     if (level as u32) > entry_level {
         // CAS against the observed entry: a concurrent higher-level promotion wins
-        graph.file.set_entry_point_if_not_better(id, level as u32, entry_id);
+        graph.file.promote_entry_point(id, level as u32, entry_id);
     }
     Ok(id)
 }
@@ -289,4 +326,42 @@ fn scratch_begin(graph: &Graph, scratch: &mut SearchScratch) {
     // search_layer assumes a fresh epoch per sweep; SearchScratch::begin is crate-private
     // via this helper to keep the public surface small.
     scratch.begin_public(graph.file.id_high_water());
+}
+
+#[cfg(test)]
+mod reverse_edge_tests {
+    use super::*;
+    use crate::PlaneFile;
+
+    /// The contended fallback must still add the edge when the neighbor list is already full —
+    /// the one case where a push-then-`truncate(cap)` discards `new_id` rather than a neighbor,
+    /// losing the in-edge exactly in the contended-and-full case the fallback exists to serve.
+    #[test]
+    fn a_contended_merge_into_a_full_neighbor_list_keeps_the_edge_it_adds() {
+        let dims = 8;
+        let cap = 8usize;
+        let path = std::env::temp_dir().join(format!("hnsw-revedge-{}.hnsw", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let graph = Graph::new(PlaneFile::create(&path, dims, cap, 4_096).expect("create"));
+
+        let vector = vec![0i8; dims];
+        let full: Vec<u32> = (1..=cap as u32).collect();
+        graph.write_node_raw(0, 0, &vector, 1.0, 1.0, &full, &[]).expect("seed the full list");
+        for &nid in &full {
+            graph.write_node_raw(nid, 0, &vector, 1.0, 1.0, &[], &[]).expect("seed a neighbor");
+        }
+        let newcomer = cap as u32 + 1;
+        graph.write_node_raw(newcomer, 0, &vector, 1.0, 1.0, &[], &[]).expect("seed the newcomer");
+
+        merge_neighbor_capped(&graph, 0, newcomer, cap);
+
+        let mut neighbors: Vec<u32> = Vec::new();
+        graph.neighbors_into(0, &mut neighbors).expect("node 0 is live");
+        assert!(
+            neighbors.contains(&newcomer),
+            "the contended merge dropped the edge it was adding: {neighbors:?}"
+        );
+        assert_eq!(neighbors.len(), cap, "the merge must stay within the layer-0 cap");
+        let _ = std::fs::remove_file(&path);
+    }
 }

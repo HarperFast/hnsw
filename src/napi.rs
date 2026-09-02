@@ -92,7 +92,7 @@ impl Task for PredicateSearchTask {
             dispatch: Box::new(move |ids: Vec<u32>| {
                 let tx = tx.clone();
                 let ids_echo = ids.clone();
-                tsfn.call_with_return_value(
+                let status = tsfn.call_with_return_value(
                     ids,
                     ThreadsafeFunctionCallMode::NonBlocking,
                     move |ret: Uint8Array| {
@@ -102,6 +102,10 @@ impl Task for PredicateSearchTask {
                         Ok(())
                     },
                 );
+                // a closing or saturated queue drops the callback without invoking it, so this
+                // batch will never answer; reporting it lets the drain finish on the batches
+                // that will, instead of holding teardown for the full deadline
+                status == Status::Ok
             }),
             rx,
         };
@@ -479,5 +483,14 @@ impl Plane {
     #[napi]
     pub fn flush(&self, watermark: Option<f64>) -> Result<()> {
         self.graph.file.flush_with_watermark(watermark.map(|w| w as u64)).map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    /// Durably mark this plane an incomplete mirror: zero the watermark and msync the header
+    /// page alone, so a host disabling a plane it cannot delete has the mark on disk before it
+    /// writes any out-of-band tombstone. Synchronous by design — it is a 4 KB msync, not the
+    /// whole-mapping writeback `flush` performs.
+    #[napi]
+    pub fn invalidate(&self) -> Result<()> {
+        self.graph.file.invalidate().map_err(|e| Error::from_reason(e.to_string()))
     }
 }

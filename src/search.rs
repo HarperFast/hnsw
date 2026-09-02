@@ -219,6 +219,42 @@ pub fn greedy_descend(
     (current, current_dist)
 }
 
+/// Slots a read-side repair may probe when the previous-entry hint is dead too. Bounded so a
+/// search never pays the write path's O(high-water) re-election scan.
+const REPAIR_PROBE_LIMIT: u32 = 1024;
+
+/// Resolve a live entry point for a read, repairing a dead one in place.
+///
+/// A search that finds the header naming a deleted or sanitized node returns EMPTY, and on a
+/// read-mostly table nothing ever repairs it: write-path re-election only runs on delete, and
+/// a slot a reader sanitized after its writer died had no delete at all.
+///
+/// The candidate is the O(1) previous-entry hint, then a probe capped at `REPAIR_PROBE_LIMIT` —
+/// the hint is a single slot and can be dead itself. The cap is what keeps a read off the write
+/// path's O(high-water) scan on the pool thread every search shares, and the repair publishes,
+/// so only the first search after a wedge pays even the probe.
+fn resolve_entry(graph: &Graph, query: &Query, stats: &mut SearchStats) -> Option<(u32, u32, f32)> {
+    let (entry_id, entry_level) = graph.file.entry_point();
+    if entry_id != NO_ID {
+        if let Some(d) = graph.distance_to(entry_id, query) {
+            stats.visits += 1;
+            return Some((entry_id, entry_level, d));
+        }
+    }
+    let hint = graph.file.previous_entry_point();
+    let candidate = (hint != NO_ID && hint != entry_id)
+        .then(|| graph.node_level(hint).map(|level| (hint, level)))
+        .flatten()
+        .or_else(|| graph.probe_for_entry(REPAIR_PROBE_LIMIT, entry_id));
+    let (id, level) = candidate?;
+    let d = graph.distance_to(id, query)?;
+    stats.visits += 1;
+    // Strict on the entry we observed dead, not a not-worse install: a live level-0 root claimed
+    // since the read above must win, or it is orphaned with nothing pointing at it.
+    graph.file.replace_entry_if(entry_id, id, level as u32);
+    Some((id, level as u32, d))
+}
+
 /// Full search: greedy descent through upper layers, then beam at layer 0.
 pub fn search(
     graph: &Graph,
@@ -228,19 +264,10 @@ pub fn search(
     scratch: &mut SearchScratch,
 ) -> (Vec<(u32, f32)>, SearchStats) {
     let mut stats = SearchStats { visits: 0 };
-    let (entry_id, entry_level) = graph.file.entry_point();
-    if entry_id == NO_ID {
+    let Some((entry_id, entry_level, entry_dist)) = resolve_entry(graph, query, &mut stats) else {
         return (Vec::new(), stats);
-    }
-    scratch.begin(graph.file.id_high_water());
-
-    let entry_dist = match graph.distance_to(entry_id, query) {
-        Some(d) => {
-            stats.visits += 1;
-            d
-        }
-        None => return (Vec::new(), stats),
     };
+    scratch.begin(graph.file.id_high_water());
     let (ep, ep_dist) = greedy_descend(graph, query, entry_id, entry_dist, entry_level, 0, &mut stats);
     let mut out = search_layer(graph, query, ep, ep_dist, ef, 0, scratch, &mut stats, None, u64::MAX);
     out.truncate(k);
@@ -259,18 +286,10 @@ pub fn search_filtered(
     scratch: &mut SearchScratch,
 ) -> (Vec<(u32, f32)>, SearchStats) {
     let mut stats = SearchStats { visits: 0 };
-    let (entry_id, entry_level) = graph.file.entry_point();
-    if entry_id == NO_ID {
+    let Some((entry_id, entry_level, entry_dist)) = resolve_entry(graph, query, &mut stats) else {
         return (Vec::new(), stats);
-    }
-    scratch.begin_public(graph.file.id_high_water());
-    let entry_dist = match graph.distance_to(entry_id, query) {
-        Some(d) => {
-            stats.visits += 1;
-            d
-        }
-        None => return (Vec::new(), stats),
     };
+    scratch.begin_public(graph.file.id_high_water());
     let (ep, ep_dist) = greedy_descend(graph, query, entry_id, entry_dist, entry_level, 0, &mut stats);
     let budget = if filter.is_some() { (ef * filter_expansion) as u64 } else { u64::MAX };
     let mut out = search_layer(graph, query, ep, ep_dist, ef, 0, scratch, &mut stats, filter, budget);
@@ -284,8 +303,11 @@ pub fn search_filtered(
 /// steer result admission only; routing uses pure distance order, bounded by the visit
 /// budget, so a slow or saturated JS loop degrades speculative overshoot, not correctness.
 pub struct PredicatePipe {
-    /// Sends one batch of ids for evaluation. Must not block.
-    pub dispatch: Box<dyn FnMut(Vec<u32>) + Send>,
+    /// Sends one batch of ids for evaluation. Must not block. Returns whether the batch was
+    /// actually handed off: a refused enqueue never produces a verdict, so counting it as
+    /// outstanding would make the tail drain wait out its whole deadline for an answer that
+    /// cannot arrive.
+    pub dispatch: Box<dyn FnMut(Vec<u32>) -> bool + Send>,
     /// Receives (ids, verdicts) pairs; verdicts[i] != 0 admits ids[i].
     pub rx: std::sync::mpsc::Receiver<(Vec<u32>, Vec<u8>)>,
 }
@@ -307,18 +329,10 @@ pub fn search_predicated(
     scratch: &mut SearchScratch,
 ) -> (Vec<(u32, f32)>, SearchStats) {
     let mut stats = SearchStats { visits: 0 };
-    let (entry_id, entry_level) = graph.file.entry_point();
-    if entry_id == NO_ID {
+    let Some((entry_id, entry_level, entry_dist)) = resolve_entry(graph, query, &mut stats) else {
         return (Vec::new(), stats);
-    }
-    scratch.begin_public(graph.file.id_high_water());
-    let entry_dist = match graph.distance_to(entry_id, query) {
-        Some(d) => {
-            stats.visits += 1;
-            d
-        }
-        None => return (Vec::new(), stats),
     };
+    scratch.begin_public(graph.file.id_high_water());
     let (ep, ep_dist) = greedy_descend(graph, query, entry_id, entry_dist, entry_level, 0, &mut stats);
 
     use std::collections::HashMap;
@@ -336,9 +350,13 @@ pub fn search_predicated(
 
     let mut nbuf = std::mem::take(&mut scratch.neighbors);
 
+    // guarded on `outstanding` rather than draining until the channel is empty: with a blocking
+    // receive the unguarded form pays another full timeout after the last verdict lands, on every
+    // filtered query
     macro_rules! drain {
         ($recv:expr) => {
-            while let Ok((ids, flags)) = $recv {
+            while outstanding > 0 {
+                let Ok((ids, flags)) = $recv else { break };
                 outstanding -= 1;
                 for (i, id) in ids.iter().enumerate() {
                     verdicts.insert(*id, flags.get(i).copied().unwrap_or(0) != 0);
@@ -390,8 +408,7 @@ pub fn search_predicated(
                     candidates.push(Candidate { distance: d, id: nid });
                     speculative.push((nid, d));
                     batch.push(nid);
-                    if batch.len() >= PREDICATE_BATCH {
-                        (pipe.dispatch)(std::mem::take(&mut batch));
+                    if batch.len() >= PREDICATE_BATCH && (pipe.dispatch)(std::mem::take(&mut batch)) {
                         outstanding += 1;
                     }
                 }
@@ -401,8 +418,7 @@ pub fn search_predicated(
     scratch.neighbors = nbuf;
 
     // flush the tail batch and block-drain what's still in flight
-    if !batch.is_empty() {
-        (pipe.dispatch)(std::mem::take(&mut batch));
+    if !batch.is_empty() && (pipe.dispatch)(std::mem::take(&mut batch)) {
         outstanding += 1;
     }
     let deadline = std::time::Instant::now() + DRAIN_TIMEOUT;
@@ -458,9 +474,7 @@ mod predicate_tests {
         });
 
         let mut pipe = PredicatePipe {
-            dispatch: Box::new(move |ids| {
-                let _ = req_tx.send(ids);
-            }),
+            dispatch: Box::new(move |ids| req_tx.send(ids).is_ok()),
             rx: res_rx,
         };
         let q: Vec<f32> = (0..dims).map(|d| ((41.0f32 * 0.31 + d as f32) * 0.7).sin()).collect();
@@ -472,6 +486,104 @@ mod predicate_tests {
         }
         drop(pipe);
         worker.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The tail drain must stop receiving the moment the last verdict lands. Draining until the
+    /// channel reports empty sits out another full `recv_timeout` after `outstanding` reaches
+    /// zero — 50 ms added to every filtered query, against a sub-millisecond search. Measured
+    /// from the evaluator's last send so the search's own cost is not in the number, and over
+    /// the best of several queries so scheduler noise on one of them cannot pass for the extra
+    /// receive, which every query would pay.
+    #[test]
+    fn a_predicated_search_returns_as_soon_as_the_last_verdict_lands() {
+        let dims = 32;
+        let path = std::env::temp_dir().join(format!("hnsw-preddrain-{}.hnsw", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let graph = Graph::new(PlaneFile::create(&path, dims, 16, 4_096).expect("create"));
+        let params = InsertParams::default();
+        let mut scratch = SearchScratch::new();
+        for i in 0..1_000u32 {
+            let v: Vec<f32> = (0..dims).map(|d| ((i as f32 * 0.31 + d as f32) * 0.7).sin()).collect();
+            insert(&graph, &v, &params, &mut scratch).unwrap();
+        }
+
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<Vec<u32>>();
+        let (res_tx, res_rx) = std::sync::mpsc::channel::<(Vec<u32>, Vec<u8>)>();
+        // stamped before the send, so the search can never observe a verdict newer than the stamp
+        let last_send = std::sync::Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
+        let stamps = last_send.clone();
+        let worker = std::thread::spawn(move || {
+            while let Ok(ids) = req_rx.recv() {
+                let verdicts = vec![1u8; ids.len()];
+                *stamps.lock().unwrap() = Some(std::time::Instant::now());
+                if res_tx.send((ids, verdicts)).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let mut pipe = PredicatePipe {
+            dispatch: Box::new(move |ids| req_tx.send(ids).is_ok()),
+            rx: res_rx,
+        };
+        let q: Vec<f32> = (0..dims).map(|d| ((41.0f32 * 0.31 + d as f32) * 0.7).sin()).collect();
+        let mut best = std::time::Duration::MAX;
+        for _ in 0..5 {
+            let (hits, _) = search_predicated(
+                &graph,
+                &Query::new(q.clone()),
+                10,
+                64,
+                &mut pipe,
+                64 * 24,
+                &mut scratch,
+            );
+            let tail = last_send.lock().unwrap().expect("the evaluator answered a batch").elapsed();
+            assert!(!hits.is_empty(), "precondition: an admitting predicate returns results");
+            best = best.min(tail);
+        }
+        assert!(
+            best < std::time::Duration::from_millis(25),
+            "the drain sat {best:?} past the last verdict on every query instead of returning on it"
+        );
+        drop(pipe);
+        worker.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A refused enqueue never answers. Counting it outstanding makes the tail drain wait out
+    /// its whole `DRAIN_TIMEOUT` for a verdict that cannot arrive — which is exactly the state
+    /// a closing environment puts every in-flight filtered query in, so teardown pays five
+    /// seconds per query instead of returning on the batches that did land.
+    #[test]
+    fn a_refused_predicate_enqueue_does_not_hold_the_drain() {
+        let dims = 32;
+        let path = std::env::temp_dir().join(format!("hnsw-refused-{}.hnsw", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let graph = Graph::new(PlaneFile::create(&path, dims, 16, 4_096).expect("create"));
+        let params = InsertParams::default();
+        let mut scratch = SearchScratch::new();
+        for i in 0..1_000u32 {
+            let v: Vec<f32> = (0..dims).map(|d| ((i as f32 * 0.31 + d as f32) * 0.7).sin()).collect();
+            insert(&graph, &v, &params, &mut scratch).unwrap();
+        }
+
+        // the sender stays alive for the whole search, so a drain that believes a batch is
+        // outstanding blocks on the deadline rather than on a disconnected channel
+        let (tx, rx) = std::sync::mpsc::channel::<(Vec<u32>, Vec<u8>)>();
+        let mut pipe = PredicatePipe { dispatch: Box::new(|_ids| false), rx };
+        let q: Vec<f32> = (0..dims).map(|d| ((41.0f32 * 0.31 + d as f32) * 0.7).sin()).collect();
+        let started = std::time::Instant::now();
+        let (hits, _) =
+            search_predicated(&graph, &Query::new(q), 10, 64, &mut pipe, 64 * 24, &mut scratch);
+        let elapsed = started.elapsed();
+        drop(tx);
+        assert!(hits.is_empty(), "no verdict can arrive for a refused batch, so nothing may be admitted");
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "the search waited {elapsed:?} on batches that were never enqueued (deadline is {DRAIN_TIMEOUT:?})"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }
