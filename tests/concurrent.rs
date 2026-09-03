@@ -278,8 +278,7 @@ fn descent_width_sweep() {
     let dims = 64;
     let n = 8_000u32;
     let seeds: u64 = std::env::var("HNSW_SWEEP_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(50);
-    // a width of 0 makes search_layer's `results.len() >= ef` break trip immediately, so the
-    // sweep would report a clean run having expanded nothing
+    // 0 would silently mean width 1, since the entry is admitted before any cap check
     let read_ef: usize = std::env::var("HNSW_SWEEP_READ_EF")
         .ok()
         .and_then(|v| v.parse().ok())
