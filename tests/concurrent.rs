@@ -1,5 +1,7 @@
 //! Concurrent-write torture: writers insert while readers search; then verify the graph is
 //! coherent (every stored vector findable, edge lists within cap, freelist reuse works).
+//! `vector_for`'s clustered corpus is also what makes the deterministic descent regression at
+//! the bottom of this file bite, so the two live together rather than duplicating it.
 
 use hnsw_plane::distance::Query;
 use hnsw_plane::insert::{insert, InsertParams};
@@ -168,6 +170,70 @@ fn racing_first_inserts_all_stay_reachable() {
                 "round {round}: writer {w}'s node {id} is unreachable from the entry point (found {results:?})"
             );
         }
+        drop(graph);
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// A reproducible insertion order over the corpus: Fisher-Yates driven by a xorshift stream, so
+/// one seed names one exact graph with no thread interleaving in it.
+fn insertion_order(n: u32, seed: u64) -> Vec<u32> {
+    let mut order: Vec<u32> = (0..n).collect();
+    let mut s = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    for i in (1..order.len()).rev() {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        order.swap(i, (s % (i as u64 + 1)) as usize);
+    }
+    order
+}
+
+/// The deterministic half of `concurrent_insert_search`'s reachability assertion, and the
+/// regression pin for the upper-layer descent.
+///
+/// Concurrency is not what breaks the search here — it only shuffles the insertion order, which
+/// this test fixes outright. A width-1 greedy descent halts at the first upper-layer node no
+/// neighbor improves on; on this corpus that local minimum can sit in the wrong basin, and
+/// layer-0 adjacency is intra-basin, so the layer-0 beam has no uphill edge with which to leave.
+/// The query's own vector is then unreachable at any ef, which is what the sampled assertion
+/// above catches only ~1.5% of the time. Both seeds trap `greedy_descend`: seed 57 loses 55 of
+/// its 8000 self-queries and seed 240 loses 22.
+#[test]
+fn a_descent_that_traps_at_a_local_minimum_still_reaches_the_true_neighborhood() {
+    let dims = 64;
+    let n = 8_000u32;
+    for &seed in &[57u64, 240] {
+        let path = std::env::temp_dir().join(format!("hnsw-descent-{}-{seed}.hnsw", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let graph = Graph::new(PlaneFile::create(&path, dims, 32, n as u64 + 1024).expect("create"));
+        let params = InsertParams::default();
+        let mut scratch = SearchScratch::new();
+
+        let inserted: Vec<(u32, u32)> = insertion_order(n, seed)
+            .into_iter()
+            .map(|index| {
+                let v = vector_for(index, dims);
+                (index, insert(&graph, &v, &params, &mut scratch).expect("insert"))
+            })
+            .collect();
+
+        let mut misses = Vec::new();
+        for &(index, id) in &inserted {
+            let query = Query::new(vector_for(index, dims));
+            let (results, _) = search(&graph, &query, 10, 256, &mut scratch);
+            if !results.iter().any(|&(rid, _)| rid == id) {
+                misses.push((index, id));
+            }
+        }
+        assert!(
+            misses.is_empty(),
+            "seed {seed}: {} of {n} nodes are their own true nearest neighbor but unreachable \
+from the entry point — the descent stranded the search. First few (corpus index, node id): {:?}",
+            misses.len(),
+            &misses[..misses.len().min(8)]
+        );
+
         drop(graph);
         let _ = std::fs::remove_file(&path);
     }

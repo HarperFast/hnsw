@@ -7,7 +7,7 @@
 use crate::distance::{quantize_int8, Query};
 use crate::format::{NO_ID, NO_UPPER};
 use crate::graph::Graph;
-use crate::search::{greedy_descend, search_layer, SearchScratch, SearchStats};
+use crate::search::{beam_descend, search_layer, SearchScratch, SearchStats, DESCENT_EF};
 
 pub struct InsertParams {
     pub m: usize,               // base connection count (JS M, default 16)
@@ -229,8 +229,17 @@ pub fn insert(
         return Err(InsertError::Wedged);
     };
     let top = level.min(entry_level as u8);
-    let (mut ep, mut ep_dist) =
-        greedy_descend(graph, &query, entry_id, entry_dist, entry_level, top as u32, &mut stats);
+    let (mut ep, mut ep_dist) = beam_descend(
+        graph,
+        &query,
+        entry_id,
+        entry_dist,
+        entry_level,
+        top as u32,
+        DESCENT_EF,
+        scratch,
+        &mut stats,
+    );
 
     // Per-level connection lists for the new node, selection-ordered.
     let mut connections: Vec<Vec<(u32, f32)>> = vec![Vec::new(); level as usize + 1];

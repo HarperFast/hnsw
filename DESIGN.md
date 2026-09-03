@@ -210,6 +210,29 @@ search(sliceHandles, queryVector: Float32Array, k, ef, filter?): Promise<{ids, d
 - Auto-ef / auto-efC read the node count from the header high-water minus freelist length —
   same semantics as today, minus the #2182 inflation (freed ids return to the pool).
 
+**Upper-layer descent is a beam, not hill climbing** (`beam_descend`, `DESCENT_EF = 16`). The
+textbook width-1 descent halts at the first upper-layer node no neighbor improves on. On a
+clustered corpus that local minimum can sit in the wrong basin, and layer-0 adjacency is
+intra-basin, so the layer-0 beam has no uphill edge with which to leave — the query's true
+nearest neighbor is then unreachable at *any* ef, and raising ef only expands the wrong basin.
+Measured on the `tests/concurrent.rs` corpus (8 000 nodes, 64-d, self-query every node at
+ef 256, insertion order fixed by seed): width 1 loses 125 nodes over 200 builds, width 4 loses
+20 over 200, width 8 loses 8 over 700, width 16 loses 0 over 700. Cost at 50 000 × 768-d:
+visits/query +17 % to +27 %, p50 +0.06 ms flat (0.15 → 0.21 ms at ef 16, 0.21 → 0.28 at ef 64,
+0.46 → 0.47 at ef 512 — the descent is a fixed cost, so it hurts most where ef is small), build
+throughput -20 %. recall@10 improves below ef 128 (0.844 → 0.903 at ef 16, 0.983 → 1.000 at
+ef 64) and is unchanged above.
+
+`beam_descend` is shared by the read and write paths deliberately: insert must route through
+the same graph its queries will, or nodes get their neighbors chosen from a basin searches
+never reach. The width is a compile-time constant rather than a parameter because it is a
+correctness floor, not a recall/latency dial — `ef` is the dial.
+
+Two facts worth keeping when working on this. The trap is a property of graph *shape*, not of
+concurrency: it reproduces single-threaded from a fixed insertion permutation, and concurrency
+only shuffles that permutation. And it needs the full corpus — no seed reproduces it at 32
+dims, or at 2 000 / 4 000 nodes, so a shrunken repro is not evidence of a fix.
+
 **Filtering** (predicate-aware / ACORN, `filteredSearch = true` today):
 
 1. **Bitset fast path.** RBAC allow-lists and companion-condition candidate sets are computed
