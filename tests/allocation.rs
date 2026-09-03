@@ -8,25 +8,23 @@ use hnsw_plane::insert::{insert, InsertParams};
 use hnsw_plane::search::{search, SearchScratch};
 use hnsw_plane::{Graph, PlaneFile};
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::cell::Cell;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
-/// The thread whose allocations count, as a raw `pthread_t`. A global allocator sees every
-/// thread in the binary — the test harness's own included — so counting unconditionally would
-/// fold their allocations into the measurement. `pthread_self` is used rather than
-/// `thread::current().id()` because the latter can allocate, and allocating inside the allocator
-/// recurses. Zero means counting is off.
-static COUNTING_THREAD: AtomicU64 = AtomicU64::new(0);
 
-#[inline]
-fn this_thread() -> u64 {
-    unsafe { libc::pthread_self() as u64 }
+thread_local! {
+    /// A global allocator sees every thread in the binary, the test harness's own included, so a
+    /// process-wide flag would fold their allocations into the measurement. Scoping it per thread
+    /// keeps the count to the one doing the searching. `const` init on a `Cell` so that reading it
+    /// neither lazily initializes nor registers a destructor — either would allocate, and
+    /// allocating inside the allocator recurses.
+    static COUNTING: Cell<bool> = const { Cell::new(false) };
 }
 
 #[inline]
 fn counting_here() -> bool {
-    let t = COUNTING_THREAD.load(Ordering::Relaxed);
-    t != 0 && t == this_thread()
+    COUNTING.try_with(|c| c.get()).unwrap_or(false)
 }
 
 struct CountingAllocator;
@@ -57,27 +55,25 @@ fn allocations_per_search(graph: &Graph, dims: usize, scratch: &mut SearchScratc
     let vector = |i: usize| -> Vec<f32> {
         (0..dims).map(|d| ((i as f32 * 0.11 + d as f32) * 0.9).sin()).collect()
     };
-    // warm every reusable buffer to its steady-state capacity first
     for i in 0..8 {
         let _ = search(graph, &Query::new(vector(i)), 10, 64, scratch);
     }
     let queries_prepared: Vec<Query> = (0..queries).map(|i| Query::new(vector(i + 100))).collect();
 
     ALLOCATIONS.store(0, Ordering::Relaxed);
-    COUNTING_THREAD.store(this_thread(), Ordering::Relaxed);
+    COUNTING.with(|c| c.set(true));
     for query in &queries_prepared {
         let (hits, _) = search(graph, query, 10, 64, scratch);
         std::hint::black_box(hits);
     }
-    COUNTING_THREAD.store(0, Ordering::Relaxed);
+    COUNTING.with(|c| c.set(false));
     ALLOCATIONS.load(Ordering::Relaxed) as f64 / queries as f64
 }
 
 fn build(path: &std::path::Path, n: u32, dims: usize) -> Graph {
     let _ = std::fs::remove_file(path);
     let graph = Graph::new(PlaneFile::create(path, dims, 16, n as u64 + 1024).expect("create"));
-    // graph quality is irrelevant here — only its height is — so build at a fraction of the
-    // default ef_construction rather than adding a full-quality 60k build to every CI run
+    // only the graph's height matters here, not its quality
     let params = InsertParams { ef_construction: 24, ..InsertParams::default() };
     let mut scratch = SearchScratch::new();
     for i in 0..n {
