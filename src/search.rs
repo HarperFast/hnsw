@@ -49,11 +49,19 @@ pub struct SearchScratch {
     visited: Vec<u32>,
     epoch: u32,
     neighbors: Vec<u32>,
+    candidates: BinaryHeap<Candidate>,
+    results: BinaryHeap<Result_>,
 }
 
 impl SearchScratch {
     pub fn new() -> Self {
-        SearchScratch { visited: Vec::new(), epoch: 0, neighbors: Vec::new() }
+        SearchScratch {
+            visited: Vec::new(),
+            epoch: 0,
+            neighbors: Vec::new(),
+            candidates: BinaryHeap::new(),
+            results: BinaryHeap::new(),
+        }
     }
 
     pub fn begin_public(&mut self, capacity: u64) {
@@ -128,16 +136,19 @@ pub fn search_layer(
     filter: Option<&[u8]>,
     visit_budget: u64,
 ) -> Vec<(u32, f32)> {
-    let mut candidates = BinaryHeap::new();
-    let mut results: BinaryHeap<Result_> = BinaryHeap::new();
+    // take() the scratch buffers to sidestep the double-borrow of scratch. The descent calls this
+    // once per upper level, so allocating the heaps here would be per-level, not per-query.
+    let mut candidates = std::mem::take(&mut scratch.candidates);
+    let mut results = std::mem::take(&mut scratch.results);
+    let mut nbuf = std::mem::take(&mut scratch.neighbors);
+    candidates.clear();
+    results.clear();
+
     scratch.visit(entry);
     candidates.push(Candidate { distance: entry_dist, id: entry });
     if bit_allowed(filter, entry) {
         results.push(Result_ { distance: entry_dist, id: entry });
     }
-
-    // take() the scratch neighbor buffer to sidestep the double-borrow of scratch
-    let mut nbuf = std::mem::take(&mut scratch.neighbors);
 
     while let Some(c) = candidates.pop() {
         let worst = results.peek().map(|r| r.distance).unwrap_or(f32::INFINITY);
@@ -177,10 +188,13 @@ pub fn search_layer(
             }
         }
     }
-    scratch.neighbors = nbuf;
-
-    let mut out: Vec<(u32, f32)> = results.into_iter().map(|r| (r.id, r.distance)).collect();
+    let mut out: Vec<(u32, f32)> = results.drain().map(|r| (r.id, r.distance)).collect();
     out.sort_by(|a, b| a.1.total_cmp(&b.1));
+
+    candidates.clear();
+    scratch.neighbors = nbuf;
+    scratch.candidates = candidates;
+    scratch.results = results;
     out
 }
 
@@ -495,6 +509,53 @@ mod descent_tests {
 level 1 holds roughly {} nodes, and a beam that pushed tied candidates would walk all of them",
             stats.visits,
             n / 16
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `filter_expansion` bounds layer 0, so the budget has to start counting where the descent
+    /// left off. Measured against a counter the descent has already advanced, a descent costing
+    /// more than the whole budget leaves layer 0 unable to expand even one candidate, and the
+    /// search returns its entry point instead of a result set — silently, since a filtered search
+    /// is allowed to return short.
+    #[test]
+    fn the_filter_budget_bounds_layer_zero_not_the_descent() {
+        let dims = 16;
+        let n = 6_000u32;
+        let path = std::env::temp_dir().join(format!("hnsw-budget-{}.hnsw", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let graph = Graph::new(PlaneFile::create(&path, dims, 16, n as u64 + 1024).expect("create"));
+        let params = InsertParams::default();
+        let mut scratch = SearchScratch::new();
+        for i in 0..n {
+            let v: Vec<f32> = (0..dims).map(|d| ((i as f32 * 0.31 + d as f32) * 0.7).sin()).collect();
+            insert(&graph, &v, &params, &mut scratch).expect("insert");
+        }
+
+        let query = Query::new((0..dims).map(|d| ((97.0f32 * 0.31 + d as f32) * 0.7).sin()).collect());
+        let (entry_id, entry_level) = graph.file.entry_point();
+        let entry_dist = graph.distance_to(entry_id, &query).expect("the entry point is live");
+        let mut descent = SearchStats { visits: 0 };
+        beam_descend(&graph, &query, entry_id, entry_dist, entry_level, 0, DESCENT_EF, &mut scratch, &mut descent);
+
+        // a budget deliberately far below what the descent spends
+        let (ef, filter_expansion) = (16usize, 1usize);
+        assert!(
+            descent.visits > (ef * filter_expansion) as u64,
+            "precondition: the descent ({} visits) must cost more than the whole budget ({})",
+            descent.visits,
+            ef * filter_expansion
+        );
+        let allow = vec![0xffu8; (n as usize).div_ceil(8)];
+        let (hits, stats) =
+            search_filtered(&graph, &query, 10, ef, Some(&allow), filter_expansion, &mut scratch);
+
+        assert_eq!(hits.len(), 10, "layer 0 got no budget of its own: {hits:?}");
+        assert!(
+            stats.visits > descent.visits,
+            "layer 0 expanded nothing beyond the descent ({} total vs {} for the descent alone)",
+            stats.visits,
+            descent.visits
         );
         let _ = std::fs::remove_file(&path);
     }

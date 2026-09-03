@@ -5,7 +5,7 @@
 
 use hnsw_plane::distance::Query;
 use hnsw_plane::insert::{insert, InsertParams};
-use hnsw_plane::search::{search, SearchScratch};
+use hnsw_plane::search::{beam_descend, search, search_layer, SearchScratch, SearchStats, DESCENT_EF};
 use hnsw_plane::{Graph, PlaneFile};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
@@ -235,12 +235,40 @@ from the entry point — the descent stranded the search. First few (corpus inde
     }
 }
 
+/// `search` at an explicit descent width — what the sweep varies, since `search` itself reads the
+/// `DESCENT_EF` constant. A single-threaded build always has a live entry point, so this skips
+/// `search`'s dead-entry repair and is otherwise the same sequence.
+fn search_at_descent_width(
+    graph: &Graph,
+    query: &Query,
+    k: usize,
+    ef: usize,
+    descent_ef: usize,
+    scratch: &mut SearchScratch,
+) -> Vec<(u32, f32)> {
+    let (entry_id, entry_level) = graph.file.entry_point();
+    let Some(entry_dist) = graph.distance_to(entry_id, query) else {
+        return Vec::new();
+    };
+    let mut stats = SearchStats { visits: 0 };
+    let (ep, ep_dist) =
+        beam_descend(graph, query, entry_id, entry_dist, entry_level, 0, descent_ef, scratch, &mut stats);
+    scratch.begin_public(graph.file.id_high_water());
+    let mut out = search_layer(graph, query, ep, ep_dist, ef, 0, scratch, &mut stats, None, u64::MAX);
+    out.truncate(k);
+    out
+}
+
 /// The measurement behind DESIGN.md's descent-width table, kept runnable so the numbers can be
 /// re-derived when M, ml or the prune policy changes. Ignored: it reports rather than asserts,
 /// and a full sweep is minutes of CPU.
 ///
+/// `HNSW_SWEEP_READ_EF` sets the query-side descent width; the build side is whatever
+/// `DESCENT_EF` is compiled as. Varying them independently is what separates a routing defect
+/// from a construction one — DESIGN.md §7 records that matrix.
+///
 /// ```text
-/// HNSW_SWEEP_SEEDS=700 cargo test --release --test concurrent \
+/// HNSW_SWEEP_SEEDS=700 HNSW_SWEEP_READ_EF=8 cargo test --release --test concurrent \
 ///     descent_width_sweep -- --ignored --nocapture
 /// ```
 #[test]
@@ -249,6 +277,8 @@ fn descent_width_sweep() {
     let dims = 64;
     let n = 8_000u32;
     let seeds: u64 = std::env::var("HNSW_SWEEP_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(50);
+    let read_ef: usize =
+        std::env::var("HNSW_SWEEP_READ_EF").ok().and_then(|v| v.parse().ok()).unwrap_or(DESCENT_EF);
     let mut total = 0usize;
     let mut bad = 0usize;
     for seed in 0..seeds {
@@ -267,7 +297,8 @@ fn descent_width_sweep() {
         let misses = inserted
             .iter()
             .filter(|&&(index, id)| {
-                let (results, _) = search(&graph, &Query::new(vector_for(index, dims)), 10, 256, &mut scratch);
+                let q = Query::new(vector_for(index, dims));
+                let results = search_at_descent_width(&graph, &q, 10, 256, read_ef, &mut scratch);
                 !results.iter().any(|&(rid, _)| rid == id)
             })
             .count();
@@ -279,5 +310,8 @@ fn descent_width_sweep() {
         drop(graph);
         let _ = std::fs::remove_file(&path);
     }
-    println!("descent width sweep: {total} misses over {seeds} builds of {n}, {bad} builds affected");
+    println!(
+        "descent width sweep (build {DESCENT_EF} / read {read_ef}): {total} misses over {seeds} \
+builds of {n}, {bad} builds affected"
+    );
 }

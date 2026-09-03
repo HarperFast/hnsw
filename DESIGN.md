@@ -244,6 +244,16 @@ less navigable than one where they agree. This is also the upgrade story: an exi
 read by a new binary is the read-only row, improved but not repaired until its nodes are
 re-inserted.
 
+`HNSW_SWEEP_READ_EF` sets the sweep's query-side width; the build side is whatever `DESCENT_EF`
+is compiled as, so the four cells are two runs per value of the constant:
+
+```text
+HNSW_SWEEP_SEEDS=200 HNSW_SWEEP_READ_EF=1  cargo test --release --test concurrent \
+    descent_width_sweep -- --ignored --nocapture
+HNSW_SWEEP_SEEDS=200 HNSW_SWEEP_READ_EF=16 cargo test --release --test concurrent \
+    descent_width_sweep -- --ignored --nocapture
+```
+
 Do not add a per-level visit cap to the descent without re-measuring. The obvious ceiling,
 `DESCENT_EF * UPPER_CAP` = 1024, is already exceeded by ordinary queries: the worst of 3 000
 random queries visits 788 nodes at level 1 on a 50 000-node graph and 1 044 on a 500 000-node
