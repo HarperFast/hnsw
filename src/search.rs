@@ -350,7 +350,7 @@ pub fn search_predicated(
     scratch.begin_public(graph.file.id_high_water());
     // absolute cap for the layer-0 loop below: the caller's budget counted from where the
     // descent left off, so a wider descent does not silently shrink it
-    let visit_budget = stats.visits.saturating_add(visit_budget);
+    let layer0_budget = stats.visits.saturating_add(visit_budget);
 
     use std::collections::HashMap;
     let mut verdicts: HashMap<u32, bool> = HashMap::new();
@@ -404,7 +404,7 @@ pub fn search_predicated(
         if results.len() >= ef && c.distance > worst {
             break;
         }
-        if stats.visits >= visit_budget {
+        if stats.visits >= layer0_budget {
             break;
         }
         if graph.neighbors_into(c.id, &mut nbuf).is_none() {
