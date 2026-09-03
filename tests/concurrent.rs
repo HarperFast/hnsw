@@ -254,7 +254,7 @@ fn search_at_descent_width(
     let (ep, ep_dist) =
         beam_descend(graph, query, entry_id, entry_dist, entry_level, 0, descent_ef, scratch, &mut stats);
     scratch.begin_public(graph.file.id_high_water());
-    let mut out = Vec::with_capacity(ef);
+    let mut out = Vec::with_capacity(ef.min(graph.file.id_high_water() as usize));
     search_layer(graph, query, ep, ep_dist, ef, 0, scratch, &mut stats, None, u64::MAX, &mut out);
     out.truncate(k);
     out

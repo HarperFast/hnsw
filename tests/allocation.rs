@@ -60,7 +60,9 @@ fn allocations_per_search(graph: &Graph, dims: usize, scratch: &mut SearchScratc
 fn build(path: &std::path::Path, n: u32, dims: usize) -> Graph {
     let _ = std::fs::remove_file(path);
     let graph = Graph::new(PlaneFile::create(path, dims, 16, n as u64 + 1024).expect("create"));
-    let params = InsertParams::default();
+    // graph quality is irrelevant here — only its height is — so build at a fraction of the
+    // default ef_construction rather than adding a full-quality 60k build to every CI run
+    let params = InsertParams { ef_construction: 24, ..InsertParams::default() };
     let mut scratch = SearchScratch::new();
     for i in 0..n {
         let v: Vec<f32> = (0..dims).map(|d| ((i as f32 * 0.31 + d as f32) * 0.7).sin()).collect();
@@ -84,14 +86,15 @@ fn a_search_does_not_allocate_per_upper_level() {
     let tall_levels = tall.file.entry_point().1;
     assert!(
         tall_levels >= shallow_levels + 2,
-        "precondition: the two graphs must differ in height ({shallow_levels} vs {tall_levels})"
+        "precondition: the two graphs must differ in height ({shallow_levels} vs {tall_levels}). \
+This is derived from `ml` and `level_for`; if either was tuned, re-pick the two node counts \
+rather than reading this as an allocation regression"
     );
 
     let mut scratch = SearchScratch::new();
     let shallow_allocs = allocations_per_search(&shallow, dims, &mut scratch, 200);
     let tall_allocs = allocations_per_search(&tall, dims, &mut scratch, 200);
 
-    // the returned Vec, and nothing that scales with the descent
     assert!(
         tall_allocs <= shallow_allocs + 0.5,
         "search allocates per upper level: {shallow_allocs:.2}/query at {shallow_levels} levels \
