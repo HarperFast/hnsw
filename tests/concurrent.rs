@@ -238,3 +238,50 @@ from the entry point — the descent stranded the search. First few (corpus inde
         let _ = std::fs::remove_file(&path);
     }
 }
+
+/// The measurement behind DESIGN.md's descent-width table, kept runnable so the numbers can be
+/// re-derived when M, ml or the prune policy changes. Ignored by default — it reports, it does
+/// not assert, and a full sweep is minutes of CPU:
+///
+/// ```text
+/// HNSW_SWEEP_SEEDS=700 cargo test --release --test concurrent \
+///     descent_width_sweep -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+fn descent_width_sweep() {
+    let dims = 64;
+    let n = 8_000u32;
+    let seeds: u64 = std::env::var("HNSW_SWEEP_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(50);
+    let mut total = 0usize;
+    let mut bad = 0usize;
+    for seed in 0..seeds {
+        let path = std::env::temp_dir().join(format!("hnsw-sweep-{}-{seed}.hnsw", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let graph = Graph::new(PlaneFile::create(&path, dims, 32, n as u64 + 1024).expect("create"));
+        let params = InsertParams::default();
+        let mut scratch = SearchScratch::new();
+        let inserted: Vec<(u32, u32)> = insertion_order(n, seed)
+            .into_iter()
+            .map(|index| {
+                let v = vector_for(index, dims);
+                (index, insert(&graph, &v, &params, &mut scratch).expect("insert"))
+            })
+            .collect();
+        let misses = inserted
+            .iter()
+            .filter(|&&(index, id)| {
+                let (results, _) = search(&graph, &Query::new(vector_for(index, dims)), 10, 256, &mut scratch);
+                !results.iter().any(|&(rid, _)| rid == id)
+            })
+            .count();
+        if misses > 0 {
+            println!("seed {seed}: {misses} misses");
+            bad += 1;
+        }
+        total += misses;
+        drop(graph);
+        let _ = std::fs::remove_file(&path);
+    }
+    println!("descent width sweep: {total} misses over {seeds} builds of {n}, {bad} builds affected");
+}

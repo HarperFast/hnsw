@@ -260,7 +260,7 @@ fn resolve_entry(graph: &Graph, query: &Query, stats: &mut SearchStats) -> Optio
     Some((id, level as u32, d))
 }
 
-/// Full search: greedy descent through upper layers, then beam at layer 0.
+/// Full search: beam descent through upper layers, then the layer-0 beam at `ef`.
 pub fn search(
     graph: &Graph,
     query: &Query,
@@ -456,6 +456,56 @@ pub fn search_predicated(
     out.sort_by(|a, b| a.1.total_cmp(&b.1));
     out.truncate(k);
     (out, stats)
+}
+
+#[cfg(test)]
+mod descent_tests {
+    use super::*;
+    use crate::format::UPPER_CAP;
+    use crate::insert::{insert, InsertParams};
+    use crate::PlaneFile;
+
+    /// The descent takes no caller-supplied visit budget, so what bounds it under tied distances
+    /// is `search_layer`'s strict `d < worst`: once the result set is full a tied candidate is
+    /// never pushed, and the candidate heap drains after at most `ef` expansions. Relaxing that
+    /// to `<=` would make a zero query — every cosine distance exactly 1.0, and any caller can
+    /// send one — walk the whole upper component instead.
+    #[test]
+    fn a_tied_distance_descent_stops_at_its_visit_cap() {
+        let dims = 16;
+        let n = 6_000u32;
+        let path = std::env::temp_dir().join(format!("hnsw-tied-{}.hnsw", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let graph = Graph::new(PlaneFile::create(&path, dims, 16, n as u64 + 1024).expect("create"));
+        let params = InsertParams::default();
+        let mut scratch = SearchScratch::new();
+        for i in 0..n {
+            let v: Vec<f32> = (0..dims).map(|d| ((i as f32 * 0.31 + d as f32) * 0.7).sin()).collect();
+            insert(&graph, &v, &params, &mut scratch).expect("insert");
+        }
+
+        let (entry_id, entry_level) = graph.file.entry_point();
+        assert!(entry_level >= 1, "precondition: the graph has an upper level to descend");
+        let query = Query::new(vec![0.0f32; dims]);
+        let entry_dist = graph.distance_to(entry_id, &query).expect("the entry point is live");
+        assert_eq!(entry_dist, 1.0, "precondition: a zero query ties every stored vector at 1.0");
+
+        // one level only, so the bound under test is the per-level one rather than a sum
+        let ef = 2usize;
+        let mut stats = SearchStats { visits: 0 };
+        beam_descend(&graph, &query, entry_id, entry_dist, 1, 0, ef, &mut scratch, &mut stats);
+
+        // ef expansions at the maximum upper degree
+        let ceiling = (ef * UPPER_CAP) as u64;
+        assert!(
+            stats.visits <= ceiling,
+            "the tied-distance descent visited {} nodes at level 1 against a ceiling of {ceiling} — \
+level 1 holds roughly {} nodes, and a beam that pushed tied candidates would walk all of them",
+            stats.visits,
+            n / 16
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 #[cfg(test)]
