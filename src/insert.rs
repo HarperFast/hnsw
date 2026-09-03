@@ -244,11 +244,23 @@ pub fn insert(
     // Per-level connection lists for the new node, selection-ordered.
     let mut connections: Vec<Vec<(u32, f32)>> = vec![Vec::new(); level as usize + 1];
     let mut nbuf: Vec<u32> = Vec::new();
+    let mut neighbors: Vec<(u32, f32)> = Vec::with_capacity(params.ef_construction);
 
     for l in (0..=top).rev() {
         scratch_begin(graph, scratch);
-        let mut neighbors =
-            search_layer(graph, &query, ep, ep_dist, params.ef_construction, l, scratch, &mut stats, None, u64::MAX);
+        search_layer(
+            graph,
+            &query,
+            ep,
+            ep_dist,
+            params.ef_construction,
+            l,
+            scratch,
+            &mut stats,
+            None,
+            u64::MAX,
+            &mut neighbors,
+        );
         neighbors.truncate(m << 1);
         if let Some(&(best, best_d)) = neighbors.first() {
             ep = best;

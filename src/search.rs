@@ -51,6 +51,7 @@ pub struct SearchScratch {
     neighbors: Vec<u32>,
     candidates: BinaryHeap<Candidate>,
     results: BinaryHeap<Result_>,
+    descent_out: Vec<(u32, f32)>,
 }
 
 impl SearchScratch {
@@ -61,6 +62,7 @@ impl SearchScratch {
             neighbors: Vec::new(),
             candidates: BinaryHeap::new(),
             results: BinaryHeap::new(),
+            descent_out: Vec::new(),
         }
     }
 
@@ -117,9 +119,13 @@ fn bit_allowed(filter: Option<&[u8]>, id: u32) -> bool {
     }
 }
 
-/// Beam search within one layer, starting from `entry`. Level 0 reads slot adjacency;
-/// upper levels read the resident upper map. Returns (id, distance) ascending by distance.
+/// Beam search within one layer, starting from `entry`. Level 0 reads slot adjacency; upper
+/// levels read the resident upper map. Fills `out` with (id, distance) ascending by distance.
 /// Assumes scratch.begin() was called for this query; entry is marked visited here.
+///
+/// `out` is the caller's so the descent can reuse one buffer across levels: the module's cost
+/// model is one distance per visit and no allocation per query, which a fresh return `Vec` per
+/// upper level would break.
 ///
 /// `filter`: optional allow-bitset over node ids (bit i of byte i>>3). Filtered-out nodes
 /// are traversed (their edges route) but excluded from results — ACORN-style — with
@@ -135,7 +141,8 @@ pub fn search_layer(
     stats: &mut SearchStats,
     filter: Option<&[u8]>,
     visit_budget: u64,
-) -> Vec<(u32, f32)> {
+    out: &mut Vec<(u32, f32)>,
+) {
     // take() the scratch buffers to sidestep the double-borrow of scratch. The descent calls this
     // once per upper level, so allocating the heaps here would be per-level, not per-query.
     let mut candidates = std::mem::take(&mut scratch.candidates);
@@ -188,14 +195,14 @@ pub fn search_layer(
             }
         }
     }
-    let mut out: Vec<(u32, f32)> = results.drain().map(|r| (r.id, r.distance)).collect();
+    out.clear();
+    out.extend(results.drain().map(|r| (r.id, r.distance)));
     out.sort_by(|a, b| a.1.total_cmp(&b.1));
 
     candidates.clear();
     scratch.neighbors = nbuf;
     scratch.candidates = candidates;
     scratch.results = results;
-    out
 }
 
 /// Beam width at every upper level of the descent. A width of 1 is hill climbing, which halts in
@@ -219,11 +226,13 @@ pub fn beam_descend(
     scratch: &mut SearchScratch,
     stats: &mut SearchStats,
 ) -> (u32, f32) {
+    let mut found = std::mem::take(&mut scratch.descent_out);
     let mut level = from_level.min(MAX_UPPER_LEVELS as u32);
     while level > to_level {
         scratch.begin(graph.file.id_high_water());
-        let found =
-            search_layer(graph, query, current, current_dist, ef, level as u8, scratch, stats, None, u64::MAX);
+        search_layer(
+            graph, query, current, current_dist, ef, level as u8, scratch, stats, None, u64::MAX, &mut found,
+        );
         // search_layer admits the entry itself, so `first` is never worse than what went in
         if let Some(&(id, d)) = found.first() {
             current = id;
@@ -231,6 +240,7 @@ pub fn beam_descend(
         }
         level -= 1;
     }
+    scratch.descent_out = found;
     (current, current_dist)
 }
 
@@ -285,7 +295,8 @@ pub fn search(
     let (ep, ep_dist) =
         beam_descend(graph, query, entry_id, entry_dist, entry_level, 0, DESCENT_EF, scratch, &mut stats);
     scratch.begin(graph.file.id_high_water());
-    let mut out = search_layer(graph, query, ep, ep_dist, ef, 0, scratch, &mut stats, None, u64::MAX);
+    let mut out = Vec::with_capacity(ef);
+    search_layer(graph, query, ep, ep_dist, ef, 0, scratch, &mut stats, None, u64::MAX, &mut out);
     out.truncate(k);
     (out, stats)
 }
@@ -314,7 +325,8 @@ pub fn search_filtered(
     } else {
         u64::MAX
     };
-    let mut out = search_layer(graph, query, ep, ep_dist, ef, 0, scratch, &mut stats, filter, budget);
+    let mut out = Vec::with_capacity(ef);
+    search_layer(graph, query, ep, ep_dist, ef, 0, scratch, &mut stats, filter, budget, &mut out);
     out.truncate(k);
     (out, stats)
 }
