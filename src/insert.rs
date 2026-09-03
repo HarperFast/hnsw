@@ -244,8 +244,7 @@ pub fn insert(
     // Per-level connection lists for the new node, selection-ordered.
     let mut connections: Vec<Vec<(u32, f32)>> = vec![Vec::new(); level as usize + 1];
     let mut nbuf: Vec<u32> = Vec::new();
-    let mut neighbors: Vec<(u32, f32)> =
-        Vec::with_capacity(params.ef_construction.min(graph.file.id_high_water() as usize));
+    let mut neighbors: Vec<(u32, f32)> = Vec::new();
 
     for l in (0..=top).rev() {
         scratch_begin(graph, scratch);

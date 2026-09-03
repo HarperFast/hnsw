@@ -8,16 +8,32 @@ use hnsw_plane::insert::{insert, InsertParams};
 use hnsw_plane::search::{search, SearchScratch};
 use hnsw_plane::{Graph, PlaneFile};
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
-static COUNTING: AtomicUsize = AtomicUsize::new(0);
+/// The thread whose allocations count, as a raw `pthread_t`. A global allocator sees every
+/// thread in the binary — the test harness's own included — so counting unconditionally would
+/// fold their allocations into the measurement. `pthread_self` is used rather than
+/// `thread::current().id()` because the latter can allocate, and allocating inside the allocator
+/// recurses. Zero means counting is off.
+static COUNTING_THREAD: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn this_thread() -> u64 {
+    unsafe { libc::pthread_self() as u64 }
+}
+
+#[inline]
+fn counting_here() -> bool {
+    let t = COUNTING_THREAD.load(Ordering::Relaxed);
+    t != 0 && t == this_thread()
+}
 
 struct CountingAllocator;
 
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if COUNTING.load(Ordering::Relaxed) != 0 {
+        if counting_here() {
             ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         }
         System.alloc(layout)
@@ -26,7 +42,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
         System.dealloc(ptr, layout)
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if COUNTING.load(Ordering::Relaxed) != 0 {
+        if counting_here() {
             ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         }
         System.realloc(ptr, layout, new_size)
@@ -48,12 +64,12 @@ fn allocations_per_search(graph: &Graph, dims: usize, scratch: &mut SearchScratc
     let queries_prepared: Vec<Query> = (0..queries).map(|i| Query::new(vector(i + 100))).collect();
 
     ALLOCATIONS.store(0, Ordering::Relaxed);
-    COUNTING.store(1, Ordering::Relaxed);
+    COUNTING_THREAD.store(this_thread(), Ordering::Relaxed);
     for query in &queries_prepared {
         let (hits, _) = search(graph, query, 10, 64, scratch);
         std::hint::black_box(hits);
     }
-    COUNTING.store(0, Ordering::Relaxed);
+    COUNTING_THREAD.store(0, Ordering::Relaxed);
     ALLOCATIONS.load(Ordering::Relaxed) as f64 / queries as f64
 }
 

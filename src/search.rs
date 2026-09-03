@@ -44,16 +44,6 @@ impl PartialOrd for Result_ {
     }
 }
 
-/// Capacity for a layer's result buffer. `ef` reaches this from an unvalidated `u32` at the NAPI
-/// boundary, and a result set cannot exceed the ids the plane has ever allocated, so reserving
-/// `ef` outright turns a caller's typo into a multi-gigabyte request and an allocator abort. One
-/// reservation, not a growing push loop: the descent's no-allocation-per-level property is what
-/// `tests/allocation.rs` pins.
-#[inline]
-fn result_capacity(graph: &Graph, ef: usize) -> usize {
-    ef.min(graph.file.id_high_water() as usize)
-}
-
 /// Reusable per-thread search scratch.
 pub struct SearchScratch {
     visited: Vec<u32>,
@@ -133,7 +123,9 @@ fn bit_allowed(filter: Option<&[u8]>, id: u32) -> bool {
 /// levels read the resident upper map. Fills `out` with (id, distance) ascending by distance.
 /// Assumes scratch.begin() was called for this query; entry is marked visited here.
 ///
-/// `out` is the caller's so the descent can reuse one buffer across all levels.
+/// `out` is the caller's so the descent can reuse one buffer across all levels. It is filled by
+/// one `extend` off an exact-size drain, so it takes at most one allocation sized to the results
+/// actually found — never to `ef`, which arrives unvalidated from the NAPI boundary.
 ///
 /// `filter`: optional allow-bitset over node ids (bit i of byte i>>3). Filtered-out nodes
 /// are traversed (their edges route) but excluded from results — ACORN-style — with
@@ -302,7 +294,7 @@ pub fn search(
     let (ep, ep_dist) =
         beam_descend(graph, query, entry_id, entry_dist, entry_level, 0, DESCENT_EF, scratch, &mut stats);
     scratch.begin(graph.file.id_high_water());
-    let mut out = Vec::with_capacity(result_capacity(graph, ef));
+    let mut out = Vec::new();
     search_layer(graph, query, ep, ep_dist, ef, 0, scratch, &mut stats, None, u64::MAX, &mut out);
     out.truncate(k);
     (out, stats)
@@ -331,7 +323,7 @@ pub fn search_filtered(
     } else {
         u64::MAX
     };
-    let mut out = Vec::with_capacity(result_capacity(graph, ef));
+    let mut out = Vec::new();
     search_layer(graph, query, ep, ep_dist, ef, 0, scratch, &mut stats, filter, budget, &mut out);
     out.truncate(k);
     (out, stats)
@@ -584,11 +576,11 @@ level 1 holds roughly {} nodes, and a beam that pushed tied candidates would wal
         let _ = std::fs::remove_file(&path);
     }
 
-    /// `ef` arrives from an unvalidated `u32` at the NAPI boundary. Reserving it outright turns a
-    /// caller's typo into a request for tens of gigabytes, which `handle_alloc_error` answers by
-    /// aborting the process — uncatchable from JS, and it takes every in-flight query with it.
+    /// `ef` arrives from an unvalidated `u32` at the NAPI boundary. Sizing any allocation by it
+    /// turns a caller's typo into a request for tens of gigabytes, which `handle_alloc_error`
+    /// answers by aborting — uncatchable from JS, and it takes every in-flight query with it.
     #[test]
-    fn an_absurd_ef_does_not_reserve_by_it() {
+    fn an_absurd_ef_answers_instead_of_reserving_by_it() {
         let dims = 8;
         let n = 64u32;
         let path = std::env::temp_dir().join(format!("hnsw-absurdef-{}.hnsw", std::process::id()));
@@ -604,10 +596,6 @@ level 1 holds roughly {} nodes, and a beam that pushed tied candidates would wal
         let query = Query::new((0..dims).map(|d| ((7.0f32 * 0.31 + d as f32) * 0.7).sin()).collect());
         let (hits, _) = search(&graph, &query, 5, u32::MAX as usize, &mut scratch);
         assert_eq!(hits.len(), 5, "an absurd ef must still answer from a {n}-node plane");
-        assert!(
-            result_capacity(&graph, u32::MAX as usize) <= n as usize + 16,
-            "the reservation is bounded by the plane, not by ef"
-        );
         let _ = std::fs::remove_file(&path);
     }
 
