@@ -228,10 +228,31 @@ the same graph its queries will, or nodes get their neighbors chosen from a basi
 never reach. The width is a compile-time constant rather than a parameter because it is a
 correctness floor, not a recall/latency dial — `ef` is the dial.
 
-Two facts worth keeping when working on this. The trap is a property of graph *shape*, not of
-concurrency: it reproduces single-threaded from a fixed insertion permutation, and concurrency
-only shuffles that permutation. And it needs the full corpus — no seed reproduces it at 32
-dims, or at 2 000 / 4 000 nodes, so a shrunken repro is not evidence of a fix.
+Three facts worth keeping when working on this.
+
+The trap is a property of graph *shape*, not of concurrency: it reproduces single-threaded from
+a fixed insertion permutation, and concurrency only shuffles that permutation. It also needs the
+full corpus — no seed reproduces it at 32 dims, or at 2 000 / 4 000 nodes, so a shrunken repro
+is not evidence of a fix. `descent_width_sweep` in `tests/concurrent.rs` (ignored by default) is
+the harness behind the table above.
+
+Read and write descent widths must match. Measured over 200 builds per cell: width 1 both sides
+loses 125 nodes, read-only widening loses 37, **write-only widening loses 245 — worse than
+either**, and both sides widened loses 0. `insert` seeds each level's `search_layer` from the
+descent's landing point, so a graph wired under one routing policy and queried under another is
+less navigable than one where they agree. This is also the upgrade story: an existing plane file
+read by a new binary is the read-only row, improved but not repaired until its nodes are
+re-inserted.
+
+Do not add a per-level visit cap to the descent without re-measuring. The obvious ceiling,
+`DESCENT_EF * UPPER_CAP` = 1024, is already exceeded by ordinary queries: the worst of 3 000
+random queries visits 788 nodes at level 1 on a 50 000-node graph and 1 044 on a 500 000-node
+one. A cap that binds silently degrades recall, which is the defect this exists to fix. What
+bounds the pathological case instead is `search_layer`'s strict `d < worst`: with every distance
+tied — a zero query ties them all at exactly 1.0 — a full result set never admits another
+candidate, so the descent drains after `ef` expansions per level (measured 608 visits at 50 000
+nodes, 990 at 500 000). `a_tied_distance_descent_stops_at_its_visit_cap` fails if that `<` is
+ever relaxed.
 
 **Filtering** (predicate-aware / ACORN, `filteredSearch = true` today):
 

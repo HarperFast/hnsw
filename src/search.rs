@@ -184,20 +184,16 @@ pub fn search_layer(
     out
 }
 
-/// Beam width carried through every upper level of the descent.
-///
-/// A width-1 descent is plain hill climbing: it halts at the first node no neighbor improves
-/// on. On a clustered corpus that local minimum can sit in the wrong basin, and layer-0
-/// adjacency is intra-basin, so the layer-0 beam has no uphill edge to leave it — the query's
-/// true neighborhood is then unreachable at any ef.
+/// Beam width at every upper level of the descent. A width of 1 is hill climbing, which halts in
+/// the first basin no neighbor improves on; layer-0 adjacency is intra-basin, so a query that
+/// lands in the wrong one has no uphill edge out at any ef. See DESIGN.md §7 for the width sweep.
 pub const DESCENT_EF: usize = 16;
 
-/// Beam descent through upper layers from `from_level` down to `to_level` (exclusive).
-/// Each level runs a width-`ef` beam seeded by the level above's best; that level's best in
-/// turn seeds the next. Returns the improved entry for the caller's layer-`to_level` search.
+/// Beam descent through upper layers from `from_level` down to `to_level` (exclusive), each level
+/// a width-`ef` beam seeded by the level above's best. Returns the entry for the caller's
+/// layer-`to_level` search, which the caller must `begin()` a fresh epoch for.
 ///
-/// The scratch epoch is rolled per level: a node reachable at several levels must be
-/// expandable at each of them, so visited marks must not carry across the boundary.
+/// A node reachable at several levels must be expandable at each, so the epoch rolls per level.
 pub fn beam_descend(
     graph: &Graph,
     query: &Query,
@@ -214,7 +210,7 @@ pub fn beam_descend(
         scratch.begin(graph.file.id_high_water());
         let found =
             search_layer(graph, query, current, current_dist, ef, level as u8, scratch, stats, None, u64::MAX);
-        // search_layer admits the entry itself, so `first` is never worse than the entry
+        // search_layer admits the entry itself, so `first` is never worse than what went in
         if let Some(&(id, d)) = found.first() {
             current = id;
             current_dist = d;
@@ -298,8 +294,7 @@ pub fn search_filtered(
     let (ep, ep_dist) =
         beam_descend(graph, query, entry_id, entry_dist, entry_level, 0, DESCENT_EF, scratch, &mut stats);
     scratch.begin_public(graph.file.id_high_water());
-    // offset by the descent's own visits so the budget bounds layer 0, as documented, rather
-    // than layer 0 minus whatever the descent already spent
+    // absolute, so the budget bounds layer 0 rather than layer 0 less the descent
     let budget = if filter.is_some() {
         stats.visits.saturating_add((ef * filter_expansion) as u64)
     } else {
@@ -348,8 +343,7 @@ pub fn search_predicated(
     let (ep, ep_dist) =
         beam_descend(graph, query, entry_id, entry_dist, entry_level, 0, DESCENT_EF, scratch, &mut stats);
     scratch.begin_public(graph.file.id_high_water());
-    // absolute cap for the layer-0 loop below: the caller's budget counted from where the
-    // descent left off, so a wider descent does not silently shrink it
+    // absolute, so the budget bounds layer 0 rather than layer 0 less the descent
     let layer0_budget = stats.visits.saturating_add(visit_budget);
 
     use std::collections::HashMap;
@@ -465,11 +459,10 @@ mod descent_tests {
     use crate::insert::{insert, InsertParams};
     use crate::PlaneFile;
 
-    /// The descent takes no caller-supplied visit budget, so what bounds it under tied distances
-    /// is `search_layer`'s strict `d < worst`: once the result set is full a tied candidate is
-    /// never pushed, and the candidate heap drains after at most `ef` expansions. Relaxing that
-    /// to `<=` would make a zero query — every cosine distance exactly 1.0, and any caller can
-    /// send one — walk the whole upper component instead.
+    /// The descent takes no caller-supplied visit budget. What bounds it under tied distances is
+    /// `search_layer`'s strict `d < worst`: a full result set admits no tied candidate, so the
+    /// beam drains after `ef` expansions. Relaxing that to `<=` lets a zero query — which ties
+    /// every cosine distance at 1.0, and any caller can send one — walk the whole upper level.
     #[test]
     fn a_tied_distance_descent_stops_at_its_visit_cap() {
         let dims = 16;
@@ -490,8 +483,7 @@ mod descent_tests {
         let entry_dist = graph.distance_to(entry_id, &query).expect("the entry point is live");
         assert_eq!(entry_dist, 1.0, "precondition: a zero query ties every stored vector at 1.0");
 
-        // one level only, so the bound under test is the per-level one rather than a sum
-        let ef = 2usize;
+        let ef = 2usize; // one level, so the bound under test is per-level rather than a sum
         let mut stats = SearchStats { visits: 0 };
         beam_descend(&graph, &query, entry_id, entry_dist, 1, 0, ef, &mut scratch, &mut stats);
 

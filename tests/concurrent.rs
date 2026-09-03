@@ -1,7 +1,7 @@
 //! Concurrent-write torture: writers insert while readers search; then verify the graph is
-//! coherent (every stored vector findable, edge lists within cap, freelist reuse works).
-//! `vector_for`'s clustered corpus is also what makes the deterministic descent regression at
-//! the bottom of this file bite, so the two live together rather than duplicating it.
+//! coherent (every stored vector findable, edge lists within cap, freelist reuse works). The
+//! deterministic descent tests at the bottom share `vector_for`: its clustered corpus is what
+//! makes them bite.
 
 use hnsw_plane::distance::Query;
 use hnsw_plane::insert::{insert, InsertParams};
@@ -175,8 +175,8 @@ fn racing_first_inserts_all_stay_reachable() {
     }
 }
 
-/// A reproducible insertion order over the corpus: Fisher-Yates driven by a xorshift stream, so
-/// one seed names one exact graph with no thread interleaving in it.
+/// Fisher-Yates over a xorshift stream: one seed names one exact graph, with no thread
+/// interleaving in it.
 fn insertion_order(n: u32, seed: u64) -> Vec<u32> {
     let mut order: Vec<u32> = (0..n).collect();
     let mut s = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
@@ -189,16 +189,12 @@ fn insertion_order(n: u32, seed: u64) -> Vec<u32> {
     order
 }
 
-/// The deterministic half of `concurrent_insert_search`'s reachability assertion, and the
-/// regression pin for the upper-layer descent.
-///
-/// Concurrency is not what breaks the search here — it only shuffles the insertion order, which
-/// this test fixes outright. A width-1 greedy descent halts at the first upper-layer node no
-/// neighbor improves on; on this corpus that local minimum can sit in the wrong basin, and
-/// layer-0 adjacency is intra-basin, so the layer-0 beam has no uphill edge with which to leave.
-/// The query's own vector is then unreachable at any ef, which is what the sampled assertion
-/// above catches only ~1.5% of the time. Both seeds trap `greedy_descend`: seed 57 loses 55 of
-/// its 8000 self-queries and seed 240 loses 22.
+/// `concurrent_insert_search`'s reachability assertion with the concurrency removed. Concurrency
+/// only shuffles the insertion order, which this fixes outright, so what remains is the descent:
+/// a width-1 hill climb halts in the first basin no neighbor improves on, and layer-0 adjacency
+/// is intra-basin, leaving the query's own vector unreachable at any ef. Sampling every 97th node
+/// as the test above does catches that ~1.5% of the time; these two seeds catch it every time,
+/// losing 55 and 22 of their 8000 self-queries on a width-1 descent.
 #[test]
 fn a_descent_that_traps_at_a_local_minimum_still_reaches_the_true_neighborhood() {
     let dims = 64;
@@ -240,8 +236,8 @@ from the entry point — the descent stranded the search. First few (corpus inde
 }
 
 /// The measurement behind DESIGN.md's descent-width table, kept runnable so the numbers can be
-/// re-derived when M, ml or the prune policy changes. Ignored by default — it reports, it does
-/// not assert, and a full sweep is minutes of CPU:
+/// re-derived when M, ml or the prune policy changes. Ignored: it reports rather than asserts,
+/// and a full sweep is minutes of CPU.
 ///
 /// ```text
 /// HNSW_SWEEP_SEEDS=700 cargo test --release --test concurrent \
