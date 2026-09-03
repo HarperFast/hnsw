@@ -366,14 +366,18 @@ pub fn search_predicated(
     let mut batch: Vec<u32> = Vec::new();
     let mut outstanding = 0usize;
 
-    let mut candidates = BinaryHeap::new();
-    let mut results: BinaryHeap<Result_> = BinaryHeap::new();
+    // same scratch-owned heaps as search_layer; this path hand-rolls the layer-0 beam because
+    // admission is deferred on a verdict rather than decided at expansion time
+    let mut candidates = std::mem::take(&mut scratch.candidates);
+    let mut results = std::mem::take(&mut scratch.results);
+    let mut nbuf = std::mem::take(&mut scratch.neighbors);
+    candidates.clear();
+    results.clear();
+
     scratch.visit(ep);
     candidates.push(Candidate { distance: ep_dist, id: ep });
     speculative.push((ep, ep_dist));
     batch.push(ep);
-
-    let mut nbuf = std::mem::take(&mut scratch.neighbors);
 
     // guarded on `outstanding` rather than draining until the channel is empty: with a blocking
     // receive the unguarded form pays another full timeout after the last verdict lands, on every
@@ -460,9 +464,13 @@ pub fn search_predicated(
         false
     });
 
-    let mut out: Vec<(u32, f32)> = results.into_iter().map(|r| (r.id, r.distance)).collect();
+    let mut out: Vec<(u32, f32)> = results.drain().map(|r| (r.id, r.distance)).collect();
     out.sort_by(|a, b| a.1.total_cmp(&b.1));
     out.truncate(k);
+
+    candidates.clear();
+    scratch.candidates = candidates;
+    scratch.results = results;
     (out, stats)
 }
 
