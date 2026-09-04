@@ -3,7 +3,7 @@
 //! array; neighbor ids stream through a reusable scratch buffer.
 
 use crate::distance::Query;
-use crate::format::NO_ID;
+use crate::format::{MAX_UPPER_LEVELS, NO_ID};
 use crate::graph::Graph;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::BinaryHeap;
@@ -49,11 +49,21 @@ pub struct SearchScratch {
     visited: Vec<u32>,
     epoch: u32,
     neighbors: Vec<u32>,
+    candidates: BinaryHeap<Candidate>,
+    results: BinaryHeap<Result_>,
+    descent_out: Vec<(u32, f32)>,
 }
 
 impl SearchScratch {
     pub fn new() -> Self {
-        SearchScratch { visited: Vec::new(), epoch: 0, neighbors: Vec::new() }
+        SearchScratch {
+            visited: Vec::new(),
+            epoch: 0,
+            neighbors: Vec::new(),
+            candidates: BinaryHeap::new(),
+            results: BinaryHeap::new(),
+            descent_out: Vec::new(),
+        }
     }
 
     pub fn begin_public(&mut self, capacity: u64) {
@@ -109,9 +119,13 @@ fn bit_allowed(filter: Option<&[u8]>, id: u32) -> bool {
     }
 }
 
-/// Beam search within one layer, starting from `entry`. Level 0 reads slot adjacency;
-/// upper levels read the resident upper map. Returns (id, distance) ascending by distance.
+/// Beam search within one layer, starting from `entry`. Level 0 reads slot adjacency; upper
+/// levels read the resident upper map. Fills `out` with (id, distance) ascending by distance.
 /// Assumes scratch.begin() was called for this query; entry is marked visited here.
+///
+/// `out` is the caller's so the descent can reuse one buffer across all levels. It is filled by
+/// one `extend` off an exact-size drain, so it takes at most one allocation sized to the results
+/// actually found — never to `ef`, which arrives unvalidated from the NAPI boundary.
 ///
 /// `filter`: optional allow-bitset over node ids (bit i of byte i>>3). Filtered-out nodes
 /// are traversed (their edges route) but excluded from results — ACORN-style — with
@@ -127,17 +141,20 @@ pub fn search_layer(
     stats: &mut SearchStats,
     filter: Option<&[u8]>,
     visit_budget: u64,
-) -> Vec<(u32, f32)> {
-    let mut candidates = BinaryHeap::new();
-    let mut results: BinaryHeap<Result_> = BinaryHeap::new();
+    out: &mut Vec<(u32, f32)>,
+) {
+    // take() the scratch buffers to sidestep the double-borrow of scratch
+    let mut candidates = std::mem::take(&mut scratch.candidates);
+    let mut results = std::mem::take(&mut scratch.results);
+    let mut nbuf = std::mem::take(&mut scratch.neighbors);
+    candidates.clear();
+    results.clear();
+
     scratch.visit(entry);
     candidates.push(Candidate { distance: entry_dist, id: entry });
     if bit_allowed(filter, entry) {
         results.push(Result_ { distance: entry_dist, id: entry });
     }
-
-    // take() the scratch neighbor buffer to sidestep the double-borrow of scratch
-    let mut nbuf = std::mem::take(&mut scratch.neighbors);
 
     while let Some(c) = candidates.pop() {
         let worst = results.peek().map(|r| r.distance).unwrap_or(f32::INFINITY);
@@ -177,45 +194,52 @@ pub fn search_layer(
             }
         }
     }
-    scratch.neighbors = nbuf;
-
-    let mut out: Vec<(u32, f32)> = results.into_iter().map(|r| (r.id, r.distance)).collect();
+    out.clear();
+    out.extend(results.drain().map(|r| (r.id, r.distance)));
     out.sort_by(|a, b| a.1.total_cmp(&b.1));
-    out
+
+    candidates.clear();
+    scratch.neighbors = nbuf;
+    scratch.candidates = candidates;
+    scratch.results = results;
 }
 
-/// Greedy single-candidate descent through upper layers from `from_level` down to
-/// `to_level` (exclusive lower bound handled by caller loops). Returns improved entry.
-pub fn greedy_descend(
+/// Beam width at every upper level of the descent. A width of 1 is hill climbing, which halts in
+/// the first basin no neighbor improves on; layer-0 adjacency is intra-basin, so a query that
+/// lands in the wrong one has no uphill edge out at any ef. See DESIGN.md §7 for the width sweep.
+pub const DESCENT_EF: usize = 16;
+
+/// Beam descent through upper layers from `from_level` down to `to_level` (exclusive), each level
+/// a width-`ef` beam seeded by the level above's best. Returns the entry for the caller's
+/// layer-`to_level` search, which the caller must `begin()` a fresh epoch for.
+///
+/// A node reachable at several levels must be expandable at each, so the epoch rolls per level.
+pub fn beam_descend(
     graph: &Graph,
     query: &Query,
     mut current: u32,
     mut current_dist: f32,
     from_level: u32,
     to_level: u32,
+    ef: usize,
+    scratch: &mut SearchScratch,
     stats: &mut SearchStats,
 ) -> (u32, f32) {
-    let mut nbuf: Vec<u32> = Vec::new();
-    let mut level = from_level;
+    let mut found = std::mem::take(&mut scratch.descent_out);
+    let mut level = from_level.min(MAX_UPPER_LEVELS as u32);
     while level > to_level {
-        let mut improved = true;
-        while improved {
-            improved = false;
-            graph.upper_neighbors_into(current, level.min(255) as u8, &mut nbuf);
-            for i in 0..nbuf.len() {
-                let nid = nbuf[i];
-                if let Some(d) = graph.distance_to(nid, query) {
-                    stats.visits += 1;
-                    if d < current_dist {
-                        current = nid;
-                        current_dist = d;
-                        improved = true;
-                    }
-                }
-            }
+        scratch.begin(graph.file.id_high_water());
+        search_layer(
+            graph, query, current, current_dist, ef, level as u8, scratch, stats, None, u64::MAX, &mut found,
+        );
+        // search_layer admits the entry itself, so `first` is never worse than what went in
+        if let Some(&(id, d)) = found.first() {
+            current = id;
+            current_dist = d;
         }
         level -= 1;
     }
+    scratch.descent_out = found;
     (current, current_dist)
 }
 
@@ -255,7 +279,7 @@ fn resolve_entry(graph: &Graph, query: &Query, stats: &mut SearchStats) -> Optio
     Some((id, level as u32, d))
 }
 
-/// Full search: greedy descent through upper layers, then beam at layer 0.
+/// Full search: beam descent through upper layers, then the layer-0 beam at `ef`.
 pub fn search(
     graph: &Graph,
     query: &Query,
@@ -267,9 +291,11 @@ pub fn search(
     let Some((entry_id, entry_level, entry_dist)) = resolve_entry(graph, query, &mut stats) else {
         return (Vec::new(), stats);
     };
+    let (ep, ep_dist) =
+        beam_descend(graph, query, entry_id, entry_dist, entry_level, 0, DESCENT_EF, scratch, &mut stats);
     scratch.begin(graph.file.id_high_water());
-    let (ep, ep_dist) = greedy_descend(graph, query, entry_id, entry_dist, entry_level, 0, &mut stats);
-    let mut out = search_layer(graph, query, ep, ep_dist, ef, 0, scratch, &mut stats, None, u64::MAX);
+    let mut out = Vec::new();
+    search_layer(graph, query, ep, ep_dist, ef, 0, scratch, &mut stats, None, u64::MAX, &mut out);
     out.truncate(k);
     (out, stats)
 }
@@ -289,10 +315,16 @@ pub fn search_filtered(
     let Some((entry_id, entry_level, entry_dist)) = resolve_entry(graph, query, &mut stats) else {
         return (Vec::new(), stats);
     };
+    let (ep, ep_dist) =
+        beam_descend(graph, query, entry_id, entry_dist, entry_level, 0, DESCENT_EF, scratch, &mut stats);
     scratch.begin_public(graph.file.id_high_water());
-    let (ep, ep_dist) = greedy_descend(graph, query, entry_id, entry_dist, entry_level, 0, &mut stats);
-    let budget = if filter.is_some() { (ef * filter_expansion) as u64 } else { u64::MAX };
-    let mut out = search_layer(graph, query, ep, ep_dist, ef, 0, scratch, &mut stats, filter, budget);
+    let budget = if filter.is_some() {
+        stats.visits.saturating_add((ef * filter_expansion) as u64)
+    } else {
+        u64::MAX
+    };
+    let mut out = Vec::new();
+    search_layer(graph, query, ep, ep_dist, ef, 0, scratch, &mut stats, filter, budget, &mut out);
     out.truncate(k);
     (out, stats)
 }
@@ -332,8 +364,10 @@ pub fn search_predicated(
     let Some((entry_id, entry_level, entry_dist)) = resolve_entry(graph, query, &mut stats) else {
         return (Vec::new(), stats);
     };
+    let (ep, ep_dist) =
+        beam_descend(graph, query, entry_id, entry_dist, entry_level, 0, DESCENT_EF, scratch, &mut stats);
     scratch.begin_public(graph.file.id_high_water());
-    let (ep, ep_dist) = greedy_descend(graph, query, entry_id, entry_dist, entry_level, 0, &mut stats);
+    let layer0_budget = stats.visits.saturating_add(visit_budget);
 
     use std::collections::HashMap;
     let mut verdicts: HashMap<u32, bool> = HashMap::new();
@@ -341,14 +375,18 @@ pub fn search_predicated(
     let mut batch: Vec<u32> = Vec::new();
     let mut outstanding = 0usize;
 
-    let mut candidates = BinaryHeap::new();
-    let mut results: BinaryHeap<Result_> = BinaryHeap::new();
+    // this path hand-rolls the layer-0 beam because admission waits on a verdict rather than
+    // being decided at expansion time
+    let mut candidates = std::mem::take(&mut scratch.candidates);
+    let mut results = std::mem::take(&mut scratch.results);
+    let mut nbuf = std::mem::take(&mut scratch.neighbors);
+    candidates.clear();
+    results.clear();
+
     scratch.visit(ep);
     candidates.push(Candidate { distance: ep_dist, id: ep });
     speculative.push((ep, ep_dist));
     batch.push(ep);
-
-    let mut nbuf = std::mem::take(&mut scratch.neighbors);
 
     // guarded on `outstanding` rather than draining until the channel is empty: with a blocking
     // receive the unguarded form pays another full timeout after the last verdict lands, on every
@@ -387,7 +425,7 @@ pub fn search_predicated(
         if results.len() >= ef && c.distance > worst {
             break;
         }
-        if stats.visits >= visit_budget {
+        if stats.visits >= layer0_budget {
             break;
         }
         if graph.neighbors_into(c.id, &mut nbuf).is_none() {
@@ -435,10 +473,186 @@ pub fn search_predicated(
         false
     });
 
-    let mut out: Vec<(u32, f32)> = results.into_iter().map(|r| (r.id, r.distance)).collect();
+    let mut out: Vec<(u32, f32)> = results.drain().map(|r| (r.id, r.distance)).collect();
     out.sort_by(|a, b| a.1.total_cmp(&b.1));
     out.truncate(k);
+
+    candidates.clear();
+    scratch.candidates = candidates;
+    scratch.results = results;
     (out, stats)
+}
+
+#[cfg(test)]
+mod descent_tests {
+    use super::*;
+    use crate::format::UPPER_CAP;
+    use crate::insert::{insert, InsertParams};
+    use crate::PlaneFile;
+
+    /// The descent takes no caller-supplied visit budget. What bounds it under tied distances is
+    /// `search_layer`'s strict `d < worst`: a full result set admits no tied candidate, so the
+    /// beam drains after `ef` expansions. Relaxing that to `<=` lets a zero query — which ties
+    /// every cosine distance at 1.0, and any caller can send one — walk the whole upper level.
+    #[test]
+    fn a_tied_distance_descent_stops_at_its_visit_cap() {
+        let dims = 16;
+        let n = 6_000u32;
+        let path = std::env::temp_dir().join(format!("hnsw-tied-{}.hnsw", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let graph = Graph::new(PlaneFile::create(&path, dims, 16, n as u64 + 1024).expect("create"));
+        let params = InsertParams::default();
+        let mut scratch = SearchScratch::new();
+        for i in 0..n {
+            let v: Vec<f32> = (0..dims).map(|d| ((i as f32 * 0.31 + d as f32) * 0.7).sin()).collect();
+            insert(&graph, &v, &params, &mut scratch).expect("insert");
+        }
+
+        let (entry_id, entry_level) = graph.file.entry_point();
+        assert!(entry_level >= 1, "precondition: the graph has an upper level to descend");
+        let query = Query::new(vec![0.0f32; dims]);
+        let entry_dist = graph.distance_to(entry_id, &query).expect("the entry point is live");
+        assert_eq!(entry_dist, 1.0, "precondition: a zero query ties every stored vector at 1.0");
+
+        let ef = 2usize; // one level, so the bound under test is per-level rather than a sum
+        let mut stats = SearchStats { visits: 0 };
+        beam_descend(&graph, &query, entry_id, entry_dist, 1, 0, ef, &mut scratch, &mut stats);
+
+        let ceiling = (ef * UPPER_CAP) as u64;
+        assert!(
+            stats.visits <= ceiling,
+            "the tied-distance descent visited {} nodes at level 1 against a ceiling of {ceiling} — \
+level 1 holds roughly {} nodes, and a beam that pushed tied candidates would walk all of them",
+            stats.visits,
+            n / 16
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `filter_expansion` bounds layer 0, so the budget has to start counting where the descent
+    /// left off. Measured against a counter the descent has already advanced, a descent costing
+    /// more than the whole budget leaves layer 0 unable to expand even one candidate, and the
+    /// search returns its entry point instead of a result set — silently, since a filtered search
+    /// is allowed to return short.
+    #[test]
+    fn the_filter_budget_bounds_layer_zero_not_the_descent() {
+        let dims = 16;
+        let n = 6_000u32;
+        let path = std::env::temp_dir().join(format!("hnsw-budget-{}.hnsw", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let graph = Graph::new(PlaneFile::create(&path, dims, 16, n as u64 + 1024).expect("create"));
+        let params = InsertParams::default();
+        let mut scratch = SearchScratch::new();
+        for i in 0..n {
+            let v: Vec<f32> = (0..dims).map(|d| ((i as f32 * 0.31 + d as f32) * 0.7).sin()).collect();
+            insert(&graph, &v, &params, &mut scratch).expect("insert");
+        }
+
+        let query = Query::new((0..dims).map(|d| ((97.0f32 * 0.31 + d as f32) * 0.7).sin()).collect());
+        let (entry_id, entry_level) = graph.file.entry_point();
+        let entry_dist = graph.distance_to(entry_id, &query).expect("the entry point is live");
+        let mut descent = SearchStats { visits: 0 };
+        beam_descend(&graph, &query, entry_id, entry_dist, entry_level, 0, DESCENT_EF, &mut scratch, &mut descent);
+
+        // a budget deliberately far below what the descent spends
+        let (ef, filter_expansion) = (16usize, 1usize);
+        assert!(
+            descent.visits > (ef * filter_expansion) as u64,
+            "precondition: the descent ({} visits) must cost more than the whole budget ({})",
+            descent.visits,
+            ef * filter_expansion
+        );
+        let allow = vec![0xffu8; (n as usize).div_ceil(8)];
+        let (hits, stats) =
+            search_filtered(&graph, &query, 10, ef, Some(&allow), filter_expansion, &mut scratch);
+
+        assert_eq!(hits.len(), 10, "layer 0 got no budget of its own: {hits:?}");
+        assert!(
+            stats.visits > descent.visits,
+            "layer 0 expanded nothing beyond the descent ({} total vs {} for the descent alone)",
+            stats.visits,
+            descent.visits
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `ef` arrives from an unvalidated `u32` at the NAPI boundary. Sizing any allocation by it
+    /// turns a caller's typo into a request for tens of gigabytes, which `handle_alloc_error`
+    /// answers by aborting — uncatchable from JS, and it takes every in-flight query with it.
+    #[test]
+    fn an_absurd_ef_answers_instead_of_reserving_by_it() {
+        let dims = 8;
+        let n = 64u32;
+        let path = std::env::temp_dir().join(format!("hnsw-absurdef-{}.hnsw", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let graph = Graph::new(PlaneFile::create(&path, dims, 8, n as u64 + 16).expect("create"));
+        let params = InsertParams::default();
+        let mut scratch = SearchScratch::new();
+        for i in 0..n {
+            let v: Vec<f32> = (0..dims).map(|d| ((i as f32 * 0.31 + d as f32) * 0.7).sin()).collect();
+            insert(&graph, &v, &params, &mut scratch).expect("insert");
+        }
+
+        let query = Query::new((0..dims).map(|d| ((7.0f32 * 0.31 + d as f32) * 0.7).sin()).collect());
+        let (hits, _) = search(&graph, &query, 5, u32::MAX as usize, &mut scratch);
+        assert_eq!(hits.len(), 5, "an absurd ef must still answer from a {n}-node plane");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The same contract on the predicate path, which carries its own layer-0 loop: a host budget
+    /// smaller than the descent must still buy layer-0 visits. `predicate_tests` all pass
+    /// `64 * 24`, orders above what a descent costs, so they hold either way.
+    #[test]
+    fn the_predicate_visit_budget_bounds_layer_zero_not_the_descent() {
+        let dims = 16;
+        let n = 6_000u32;
+        let path = std::env::temp_dir().join(format!("hnsw-predbudget-{}.hnsw", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let graph = Graph::new(PlaneFile::create(&path, dims, 16, n as u64 + 1024).expect("create"));
+        let params = InsertParams::default();
+        let mut scratch = SearchScratch::new();
+        for i in 0..n {
+            let v: Vec<f32> = (0..dims).map(|d| ((i as f32 * 0.31 + d as f32) * 0.7).sin()).collect();
+            insert(&graph, &v, &params, &mut scratch).expect("insert");
+        }
+
+        let query = Query::new((0..dims).map(|d| ((97.0f32 * 0.31 + d as f32) * 0.7).sin()).collect());
+        let (entry_id, entry_level) = graph.file.entry_point();
+        let entry_dist = graph.distance_to(entry_id, &query).expect("the entry point is live");
+        let mut descent = SearchStats { visits: 0 };
+        beam_descend(&graph, &query, entry_id, entry_dist, entry_level, 0, DESCENT_EF, &mut scratch, &mut descent);
+
+        let budget = 64u64;
+        assert!(
+            descent.visits > budget,
+            "precondition: the descent ({} visits) must cost more than the whole budget ({budget})",
+            descent.visits
+        );
+
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<Vec<u32>>();
+        let (res_tx, res_rx) = std::sync::mpsc::channel::<(Vec<u32>, Vec<u8>)>();
+        let worker = std::thread::spawn(move || {
+            while let Ok(ids) = req_rx.recv() {
+                let verdicts = vec![1u8; ids.len()];
+                if res_tx.send((ids, verdicts)).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut pipe = PredicatePipe { dispatch: Box::new(move |ids| req_tx.send(ids).is_ok()), rx: res_rx };
+        let (hits, stats) = search_predicated(&graph, &query, 10, 16, &mut pipe, budget, &mut scratch);
+
+        assert_eq!(hits.len(), 10, "layer 0 got no budget of its own: {hits:?}");
+        assert!(
+            stats.visits > descent.visits,
+            "layer 0 expanded nothing beyond the descent ({} total vs {} for the descent alone)",
+            stats.visits,
+            descent.visits
+        );
+        drop(pipe);
+        worker.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 #[cfg(test)]

@@ -210,6 +210,60 @@ search(sliceHandles, queryVector: Float32Array, k, ef, filter?): Promise<{ids, d
 - Auto-ef / auto-efC read the node count from the header high-water minus freelist length —
   same semantics as today, minus the #2182 inflation (freed ids return to the pool).
 
+**Upper-layer descent is a beam, not hill climbing** (`beam_descend`, `DESCENT_EF = 16`). The
+textbook width-1 descent halts at the first upper-layer node no neighbor improves on. On a
+clustered corpus that local minimum can sit in the wrong basin, and layer-0 adjacency is
+intra-basin, so the layer-0 beam has no uphill edge with which to leave — the query's true
+nearest neighbor is then unreachable at *any* ef, and raising ef only expands the wrong basin.
+Measured on the `tests/concurrent.rs` corpus (8 000 nodes, 64-d, self-query every node at
+ef 256, insertion order fixed by seed): width 1 loses 125 nodes over 200 builds, width 4 loses
+20 over 200, width 8 loses 8 over 700, width 16 loses 0 over 700. Cost at 50 000 × 768-d:
+visits/query +17 % to +27 %, p50 +0.06 ms flat (0.15 → 0.21 ms at ef 16, 0.21 → 0.28 at ef 64,
+0.46 → 0.47 at ef 512 — the descent is a fixed cost, so it hurts most where ef is small), build
+throughput -20 %. recall@10 improves below ef 128 (0.844 → 0.903 at ef 16, 0.983 → 1.000 at
+ef 64) and is unchanged above.
+
+`beam_descend` is shared by the read and write paths deliberately: insert must route through
+the same graph its queries will, or nodes get their neighbors chosen from a basin searches
+never reach. The width is a compile-time constant rather than a parameter because it is a
+correctness floor, not a recall/latency dial — `ef` is the dial.
+
+Three facts worth keeping when working on this.
+
+The trap is a property of graph *shape*, not of concurrency: it reproduces single-threaded from
+a fixed insertion permutation, and concurrency only shuffles that permutation. It also needs the
+full corpus — no seed reproduces it at 32 dims, or at 2 000 / 4 000 nodes, so a shrunken repro
+is not evidence of a fix. `descent_width_sweep` in `tests/concurrent.rs` (ignored by default) is
+the harness behind the table above.
+
+Read and write descent widths must match. Measured over 200 builds per cell: width 1 both sides
+loses 125 nodes, read-only widening loses 37, **write-only widening loses 245 — worse than
+either**, and both sides widened loses 0. `insert` seeds each level's `search_layer` from the
+descent's landing point, so a graph wired under one routing policy and queried under another is
+less navigable than one where they agree. This is also the upgrade story: an existing plane file
+read by a new binary is the read-only row, improved but not repaired until its nodes are
+re-inserted.
+
+`HNSW_SWEEP_READ_EF` sets the sweep's query-side width; the build side is whatever `DESCENT_EF`
+is compiled as, so the four cells are two runs per value of the constant:
+
+```text
+HNSW_SWEEP_SEEDS=200 HNSW_SWEEP_READ_EF=1  cargo test --release --test concurrent \
+    descent_width_sweep -- --ignored --nocapture
+HNSW_SWEEP_SEEDS=200 HNSW_SWEEP_READ_EF=16 cargo test --release --test concurrent \
+    descent_width_sweep -- --ignored --nocapture
+```
+
+Do not add a per-level visit cap to the descent without re-measuring. The obvious ceiling,
+`DESCENT_EF * UPPER_CAP` = 1024, is already exceeded by ordinary queries: the worst of 3 000
+random queries visits 788 nodes at level 1 on a 50 000-node graph and 1 044 on a 500 000-node
+one. A cap that binds silently degrades recall, which is the defect this exists to fix. What
+bounds the pathological case instead is `search_layer`'s strict `d < worst`: with every distance
+tied — a zero query ties them all at exactly 1.0 — a full result set never admits another
+candidate, so the descent drains after `ef` expansions per level (measured 608 visits at 50 000
+nodes, 990 at 500 000). `a_tied_distance_descent_stops_at_its_visit_cap` fails if that `<` is
+ever relaxed.
+
 **Filtering** (predicate-aware / ACORN, `filteredSearch = true` today):
 
 1. **Bitset fast path.** RBAC allow-lists and companion-condition candidate sets are computed

@@ -1,9 +1,11 @@
 //! Concurrent-write torture: writers insert while readers search; then verify the graph is
-//! coherent (every stored vector findable, edge lists within cap, freelist reuse works).
+//! coherent (every stored vector findable, edge lists within cap, freelist reuse works). The
+//! deterministic descent tests at the bottom share `vector_for`: its clustered corpus is what
+//! makes them bite.
 
 use hnsw_plane::distance::Query;
 use hnsw_plane::insert::{insert, InsertParams};
-use hnsw_plane::search::{search, SearchScratch};
+use hnsw_plane::search::{beam_descend, search, search_layer, SearchScratch, SearchStats, DESCENT_EF};
 use hnsw_plane::{Graph, PlaneFile};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
@@ -171,4 +173,150 @@ fn racing_first_inserts_all_stay_reachable() {
         drop(graph);
         let _ = std::fs::remove_file(&path);
     }
+}
+
+/// Fisher-Yates over a xorshift stream: one seed names one exact graph, with no thread
+/// interleaving in it.
+fn insertion_order(n: u32, seed: u64) -> Vec<u32> {
+    let mut order: Vec<u32> = (0..n).collect();
+    let mut s = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    for i in (1..order.len()).rev() {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        order.swap(i, (s % (i as u64 + 1)) as usize);
+    }
+    order
+}
+
+/// `concurrent_insert_search`'s reachability assertion with the concurrency removed. Concurrency
+/// only shuffles the insertion order, which this fixes outright, so what remains is the descent:
+/// a width-1 hill climb halts in the first basin no neighbor improves on, and layer-0 adjacency
+/// is intra-basin, leaving the query's own vector unreachable at any ef. Sampling every 97th node
+/// as the test above does catches that ~1.5% of the time; these two seeds catch it every time,
+/// losing 55 and 22 of their 8000 self-queries on a width-1 descent.
+#[test]
+fn a_descent_that_traps_at_a_local_minimum_still_reaches_the_true_neighborhood() {
+    let dims = 64;
+    let n = 8_000u32;
+    for &seed in &[57u64, 240] {
+        let path = std::env::temp_dir().join(format!("hnsw-descent-{}-{seed}.hnsw", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let graph = Graph::new(PlaneFile::create(&path, dims, 32, n as u64 + 1024).expect("create"));
+        let params = InsertParams::default();
+        let mut scratch = SearchScratch::new();
+
+        let inserted: Vec<(u32, u32)> = insertion_order(n, seed)
+            .into_iter()
+            .map(|index| {
+                let v = vector_for(index, dims);
+                (index, insert(&graph, &v, &params, &mut scratch).expect("insert"))
+            })
+            .collect();
+
+        let mut misses = Vec::new();
+        for &(index, id) in &inserted {
+            let query = Query::new(vector_for(index, dims));
+            let (results, _) = search(&graph, &query, 10, 256, &mut scratch);
+            if !results.iter().any(|&(rid, _)| rid == id) {
+                misses.push((index, id));
+            }
+        }
+        assert!(
+            misses.is_empty(),
+            "seed {seed}: {} of {n} nodes are their own true nearest neighbor but unreachable \
+from the entry point — the descent stranded the search. First few (corpus index, node id): {:?}",
+            misses.len(),
+            &misses[..misses.len().min(8)]
+        );
+
+        drop(graph);
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// `search` at an explicit descent width — what the sweep varies, since `search` itself reads the
+/// `DESCENT_EF` constant. A single-threaded build always has a live entry point, so this skips
+/// `search`'s dead-entry repair and is otherwise the same sequence.
+fn search_at_descent_width(
+    graph: &Graph,
+    query: &Query,
+    k: usize,
+    ef: usize,
+    descent_ef: usize,
+    scratch: &mut SearchScratch,
+) -> Vec<(u32, f32)> {
+    let (entry_id, entry_level) = graph.file.entry_point();
+    let Some(entry_dist) = graph.distance_to(entry_id, query) else {
+        return Vec::new();
+    };
+    let mut stats = SearchStats { visits: 0 };
+    let (ep, ep_dist) =
+        beam_descend(graph, query, entry_id, entry_dist, entry_level, 0, descent_ef, scratch, &mut stats);
+    scratch.begin_public(graph.file.id_high_water());
+    let mut out = Vec::new();
+    search_layer(graph, query, ep, ep_dist, ef, 0, scratch, &mut stats, None, u64::MAX, &mut out);
+    out.truncate(k);
+    out
+}
+
+/// The measurement behind DESIGN.md's descent-width table, kept runnable so the numbers can be
+/// re-derived when M, ml or the prune policy changes. Ignored: it reports rather than asserts,
+/// and a full sweep is minutes of CPU.
+///
+/// `HNSW_SWEEP_READ_EF` sets the query-side descent width; the build side is whatever
+/// `DESCENT_EF` is compiled as. Varying them independently is what separates a routing defect
+/// from a construction one — DESIGN.md §7 records that matrix.
+///
+/// ```text
+/// HNSW_SWEEP_SEEDS=700 HNSW_SWEEP_READ_EF=8 cargo test --release --test concurrent \
+///     descent_width_sweep -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+fn descent_width_sweep() {
+    let dims = 64;
+    let n = 8_000u32;
+    let seeds: u64 = std::env::var("HNSW_SWEEP_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(50);
+    // 0 would silently mean width 1, since the entry is admitted before any cap check
+    let read_ef: usize = std::env::var("HNSW_SWEEP_READ_EF")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(|v: usize| v.max(1))
+        .unwrap_or(DESCENT_EF);
+    let mut total = 0usize;
+    let mut bad = 0usize;
+    for seed in 0..seeds {
+        let path = std::env::temp_dir().join(format!("hnsw-sweep-{}-{seed}.hnsw", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let graph = Graph::new(PlaneFile::create(&path, dims, 32, n as u64 + 1024).expect("create"));
+        let params = InsertParams::default();
+        let mut scratch = SearchScratch::new();
+        let inserted: Vec<(u32, u32)> = insertion_order(n, seed)
+            .into_iter()
+            .map(|index| {
+                let v = vector_for(index, dims);
+                (index, insert(&graph, &v, &params, &mut scratch).expect("insert"))
+            })
+            .collect();
+        let misses = inserted
+            .iter()
+            .filter(|&&(index, id)| {
+                let q = Query::new(vector_for(index, dims));
+                let results = search_at_descent_width(&graph, &q, 10, 256, read_ef, &mut scratch);
+                !results.iter().any(|&(rid, _)| rid == id)
+            })
+            .count();
+        if misses > 0 {
+            println!("seed {seed}: {misses} misses");
+            bad += 1;
+        }
+        total += misses;
+        drop(graph);
+        let _ = std::fs::remove_file(&path);
+    }
+    println!(
+        "descent width sweep (build {DESCENT_EF} / read {read_ef}): {total} misses over {seeds} \
+builds of {n}, {bad} builds affected"
+    );
 }
