@@ -1,5 +1,5 @@
-//! On-disk format: 4 KB header + fixed-size layer-0 slot array + upper-layer region.
-//! See ../DESIGN.md §4. Format changes bump VERSION and require reindex.
+//! On-disk format: 4 KB header + fixed-size layer-0 slot array + upper-layer region + key
+//! overflow arena. See ../DESIGN.md §4. Format changes bump VERSION and require reindex.
 
 use memmap2::MmapMut;
 use std::fs::OpenOptions;
@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 pub const MAGIC: u32 = 0x484e_5357; // "HNSW"
-pub const VERSION: u32 = 7; // v7: sticky invalidation latch; v6: 4-aligned neighbor + upper id arrays (older files: reindex)
+pub const VERSION: u32 = 8; // v8: per-slot host keys + overflow arena; v7: sticky invalidation latch (older files: reindex)
 pub const HEADER_SIZE: usize = 4096;
 
 // Header field byte offsets.
@@ -33,6 +33,8 @@ const H_MAX_NODES: usize = 64; // u64
 const H_UPPER_HIGH_WATER: usize = 72; // u64 atomic: upper-entry allocator
 const H_UPPER_FREELIST: usize = 80; // u64 atomic: (tag<<32)|idx; NO_UPPER = empty
 const H_ENTRY_PREV: usize = 88; // u64: last replaced entry point (re-election hint)
+const H_KEY_CAP: usize = 22; // u16: inline key bytes per slot; 0 = slots carry no keys
+const H_KEY_ARENA_HIGH_WATER: usize = 104; // u64 atomic: bump allocator over the key overflow arena
 // Opener registry: each live handle claims one slot, writes its random tag there, and holds
 // a kernel OFD byte-range lock on the slot (released automatically when the handle - or its
 // whole process - dies). A lock word's owner is dead iff its registry slot no longer carries
@@ -66,6 +68,21 @@ pub const S_INV_MAG: usize = 12; // f32
 pub const S_UPPER_IDX: usize = 16; // u32 index into the upper region; NO_UPPER = none
 pub const S_VECTOR: usize = 20; // dims bytes (int8) or dims*4 (f32)
                                 // neighbors: u32 * layer0_cap, follows the 4-padded vector
+                                // key (key_cap > 0): u16 len, u16 pad, then key_cap bytes at a
+                                // 4-aligned offset — the key inline when len <= key_cap, else
+                                // the arena offset as u32 lo, u32 hi; the range's capacity is
+                                // key_class(len)
+
+/// Sparse: an unused arena costs nothing.
+pub const KEY_ARENA_BYTES_PER_NODE: u64 = 128;
+/// Room for an overflow record (the offset halves) in the inline payload.
+pub const KEY_CAP_MIN: usize = 8;
+/// Arena ranges are reserved in 64-byte classes, so a range's capacity follows from the key
+/// length stored with it: no separate capacity word can be torn away from the offset.
+pub const fn key_class(len: usize) -> usize {
+    len.next_multiple_of(64)
+}
+pub const MAX_KEY_LEN: usize = u16::MAX as usize;
 
 /// Byte offset of a slot's neighbor array. The vector is padded to a 4-byte boundary so this
 /// is 4-aligned for every dims: the search hot path then reads each neighbor as one aligned
@@ -74,6 +91,14 @@ pub const S_VECTOR: usize = 20; // dims bytes (int8) or dims*4 (f32)
 pub const fn neighbor_offset(dims: usize) -> usize {
     S_VECTOR + (dims + 3) / 4 * 4
 }
+
+/// Byte offset of a slot's key field (the u16 length), after the neighbor array; 4-aligned,
+/// so the payload at `+ KEY_PAYLOAD` is too and the overflow offset reads as aligned u32s.
+#[inline]
+pub const fn key_offset(dims: usize, layer0_cap: usize) -> usize {
+    neighbor_offset(dims) + layer0_cap * 4
+}
+pub const KEY_PAYLOAD: usize = 4;
 
 pub const FLAG_VALID: u8 = 1;
 pub const FLAG_DELETED: u8 = 2;
@@ -96,6 +121,10 @@ pub struct PlaneFile {
     pub max_nodes: u64,
     upper_offset: usize,
     pub upper_capacity: u64,
+    /// Inline key bytes per slot; 0 = this plane stores no host keys.
+    pub key_cap: usize,
+    key_arena_offset: usize,
+    pub key_arena_len: u64,
     /// Whether the file recorded a clean shutdown when opened (create() reports true).
     /// Advisory only: open() performs no repair — torn seqlocks are taken over lazily at
     /// their slot (seqlock.rs) — and slots may hold unflushed states; hosts rebuild rather
@@ -135,9 +164,13 @@ fn invalidated_error(path: &Path) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("{} was invalidated: delete it and its .stale sidecar, then rebuild the index", path.display()))
 }
 
-fn slot_size_for(dims: usize, layer0_cap: usize) -> usize {
-    let raw = neighbor_offset(dims) + layer0_cap * 4;
+fn slot_size_for(dims: usize, layer0_cap: usize, key_cap: usize) -> usize {
+    let raw = key_offset(dims, layer0_cap) + if key_cap > 0 { KEY_PAYLOAD + key_cap } else { 0 };
     raw.next_multiple_of(64) // cache-line align
+}
+
+fn key_arena_len_for(max_nodes: u64, key_cap: usize) -> u64 {
+    if key_cap > 0 { max_nodes * KEY_ARENA_BYTES_PER_NODE } else { 0 }
 }
 
 fn upper_entry_size() -> usize {
@@ -164,20 +197,31 @@ fn slots_per_page_for(slot_size: usize) -> usize {
 
 impl PlaneFile {
     /// Create a new plane file with capacity for `max_nodes` (sparse; pages materialize on write).
+    /// Slots carry no host keys; see `create_with_keys`.
     pub fn create(path: &Path, dims: usize, layer0_cap: usize, max_nodes: u64) -> io::Result<Self> {
+        Self::create_with_keys(path, dims, layer0_cap, max_nodes, 0)
+    }
+
+    /// Create a plane whose slots carry a host key of up to `key_cap` bytes inline (longer
+    /// keys spill to the overflow arena). `key_cap` must be 0 or at least 8 (an arena offset).
+    pub fn create_with_keys(path: &Path, dims: usize, layer0_cap: usize, max_nodes: u64, key_cap: usize) -> io::Result<Self> {
         if max_nodes >= NO_ID as u64 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "maxNodes must be below 2^32-1"));
+        }
+        if key_cap != 0 && !(KEY_CAP_MIN..=MAX_KEY_LEN).contains(&key_cap) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "keyCap must be 0 or between 8 and 65535"));
         }
         if stale_sidecar_present(path) {
             // a leftover sidecar would make the new file unopenable forever; the host must
             // clear it deliberately
             return Err(io::Error::other(format!("{} has a stale sidecar: remove {} before creating", path.display(), crate::invalidate::stale_path_for(path).display())));
         }
-        let slot_size = slot_size_for(dims, layer0_cap);
+        let slot_size = slot_size_for(dims, layer0_cap, key_cap);
         let slots_per_page = slots_per_page_for(slot_size);
         let data_len = slot_region_len(max_nodes, slot_size, slots_per_page);
         let upper_capacity = max_nodes / 8 + 64;
-        let len = HEADER_SIZE as u64 + data_len + upper_capacity * upper_entry_size() as u64;
+        let key_arena_len = key_arena_len_for(max_nodes, key_cap);
+        let len = HEADER_SIZE as u64 + data_len + upper_capacity * upper_entry_size() as u64 + key_arena_len;
         let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path)?;
         file.set_len(len)?;
         let mut map = unsafe { MmapMut::map_mut(&file)? };
@@ -190,6 +234,7 @@ impl PlaneFile {
         map[H_LAYER0_CAP..H_LAYER0_CAP + 2].copy_from_slice(&(layer0_cap as u16).to_le_bytes());
         map[H_SLOT_SIZE..H_SLOT_SIZE + 4].copy_from_slice(&(slot_size as u32).to_le_bytes());
         map[H_SLOTS_PER_PAGE..H_SLOTS_PER_PAGE + 2].copy_from_slice(&(slots_per_page as u16).to_le_bytes());
+        map[H_KEY_CAP..H_KEY_CAP + 2].copy_from_slice(&(key_cap as u16).to_le_bytes());
         map[H_ENTRY..H_ENTRY + 8].copy_from_slice(&(NO_ID as u64).to_le_bytes());
         map[H_FREELIST_HEAD..H_FREELIST_HEAD + 8]
             .copy_from_slice(&((NO_ID as u64) | 0u64 << 32).to_le_bytes());
@@ -202,6 +247,7 @@ impl PlaneFile {
         std::sync::atomic::fence(Ordering::Release);
         map[H_MAGIC..H_MAGIC + 4].copy_from_slice(&MAGIC.to_le_bytes());
         let upper_offset = HEADER_SIZE + slot_region_len(max_nodes, slot_size, slots_per_page) as usize;
+        let key_arena_offset = upper_offset + upper_capacity as usize * upper_entry_size();
         let mut plane = PlaneFile {
             file,
             path: path.to_path_buf(),
@@ -213,6 +259,9 @@ impl PlaneFile {
             max_nodes,
             upper_offset,
             upper_capacity,
+            key_cap,
+            key_arena_offset,
+            key_arena_len,
             slots_per_page,
             opened_clean: true,
         };
@@ -265,7 +314,11 @@ impl PlaneFile {
         let slot_size = u32::from_le_bytes(map[H_SLOT_SIZE..H_SLOT_SIZE + 4].try_into().unwrap()) as usize;
         let slots_per_page = u16::from_le_bytes(map[H_SLOTS_PER_PAGE..H_SLOTS_PER_PAGE + 2].try_into().unwrap()) as usize;
         let max_nodes = u64::from_le_bytes(map[H_MAX_NODES..H_MAX_NODES + 8].try_into().unwrap());
-        if dims == 0 || slot_size == 0 || slot_size != slot_size_for(dims, layer0_cap) {
+        let key_cap = u16::from_le_bytes(map[H_KEY_CAP..H_KEY_CAP + 2].try_into().unwrap()) as usize;
+        if key_cap != 0 && key_cap < KEY_CAP_MIN {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "plane header geometry is inconsistent: recreate the index"));
+        }
+        if dims == 0 || slot_size == 0 || slot_size != slot_size_for(dims, layer0_cap, key_cap) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "plane header geometry is inconsistent: recreate the index"));
         }
         if max_nodes > NO_ID as u64 || slots_per_page != slots_per_page_for(slot_size) {
@@ -273,11 +326,12 @@ impl PlaneFile {
         }
         let upper_offset = HEADER_SIZE + slot_region_len(max_nodes, slot_size, slots_per_page) as usize;
         let upper_capacity = max_nodes / 8 + 64;
-        let expected = (upper_offset as u64)
-            .checked_add(upper_capacity.checked_mul(upper_entry_size() as u64).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "plane header geometry overflows: recreate the index")
-            })?)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "plane header geometry overflows: recreate the index"))?;
+        let key_arena_len = key_arena_len_for(max_nodes, key_cap);
+        let overflow = || io::Error::new(io::ErrorKind::InvalidData, "plane header geometry overflows: recreate the index");
+        let key_arena_offset = (upper_offset as u64)
+            .checked_add(upper_capacity.checked_mul(upper_entry_size() as u64).ok_or_else(overflow)?)
+            .ok_or_else(overflow)?;
+        let expected = key_arena_offset.checked_add(key_arena_len).ok_or_else(overflow)?;
         if file_len < expected {
             // header-valid but short (rsync/backup truncation): mid-range slot_ptr/upper_ptr
             // would otherwise read off the mapping
@@ -298,6 +352,9 @@ impl PlaneFile {
             max_nodes,
             upper_offset,
             upper_capacity,
+            key_cap,
+            key_arena_offset: key_arena_offset as usize,
+            key_arena_len,
             slots_per_page,
             opened_clean,
         };
@@ -407,6 +464,16 @@ impl PlaneFile {
 
     pub fn id_high_water(&self) -> u64 {
         self.header_atomic_u64(H_ID_HIGH_WATER).load(Ordering::Acquire)
+    }
+
+    /// Whether a `len`-byte key could be reserved right now (advisory; the reservation itself
+    /// is the check that counts).
+    pub fn key_arena_has_room(&self, len: usize) -> bool {
+        self.key_arena_high_water().checked_add(key_class(len) as u64).is_some_and(|end| end <= self.key_arena_len)
+    }
+
+    pub fn key_arena_high_water(&self) -> u64 {
+        self.header_atomic_u64(H_KEY_ARENA_HIGH_WATER).load(Ordering::Acquire)
     }
 
     pub fn upper_high_water(&self) -> u64 {
@@ -635,6 +702,38 @@ impl PlaneFile {
                 return;
             }
         }
+    }
+
+    /// Reserve `len` bytes in the key overflow arena (4-aligned bump allocation; ranges are
+    /// never reclaimed — a rebuild compacts). None when the arena is exhausted. A CAS loop
+    /// rather than fetch_add with a rollback: a failed reservation's rollback could rewind the
+    /// high-water below a reservation that succeeded meanwhile, handing out overlapping ranges.
+    pub fn allocate_key_bytes(&self, len: usize) -> Option<u64> {
+        let aligned = (len as u64).next_multiple_of(4);
+        let hw = self.header_atomic_u64(H_KEY_ARENA_HIGH_WATER);
+        let mut cur = hw.load(Ordering::Acquire);
+        loop {
+            let end = cur.checked_add(aligned)?;
+            if end > self.key_arena_len {
+                return None;
+            }
+            match hw.compare_exchange_weak(cur, end, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(cur),
+                Err(now) => cur = now,
+            }
+        }
+    }
+
+    /// Pointer into the key overflow arena. Callers bounds-check `offset + len` against
+    /// `key_arena_len` first: offsets are file-sourced.
+    #[inline]
+    pub fn key_arena_ptr(&self, offset: u64) -> *const u8 {
+        unsafe { self.map.as_ptr().add(self.key_arena_offset + offset as usize) }
+    }
+
+    #[inline]
+    pub fn key_arena_ptr_mut(&self, offset: u64) -> *mut u8 {
+        self.key_arena_ptr(offset) as *mut u8
     }
 
     #[inline]

@@ -8,7 +8,6 @@
 pub struct Query {
     pub vector: Vec<f32>,
     pub inv_mag: f32,
-    /// Dot kernel resolved once per query (a per-visit feature probe was measurable).
     kernel: unsafe fn(&[f32], *const i8) -> f32,
 }
 

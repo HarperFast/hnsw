@@ -1,7 +1,13 @@
-/** Parallel arrays, ascending by distance: hit i is (ids[i], distances[i]). */
+/**
+ * Parallel arrays, ascending by distance: hit i is (ids[i], distances[i]) with host key
+ * keys.subarray(keyEnds[i - 1] ?? 0, keyEnds[i]). keys/keyEnds are empty on a plane created
+ * without keyCap; a hit whose node vanished mid-query has an empty key.
+ */
 export interface SearchHits {
 	ids: Uint32Array;
 	distances: Float32Array;
+	keys: Buffer;
+	keyEnds: Uint32Array;
 }
 
 /**
@@ -11,19 +17,30 @@ export interface SearchHits {
  * distance. See DESIGN.md for the file format, concurrency model, and durability contract.
  */
 export declare class Plane {
-	/** Create a new plane file. `maxNodes` is a sparse reservation — pages materialize on write. */
-	static create(path: string, dims: number, layer0Cap: number, maxNodes: number): Plane;
+	/**
+	 * Create a new plane file. `maxNodes` is a sparse reservation — pages materialize on write.
+	 * `keyCap` (default 0, else at least 8) reserves that many inline bytes per slot for the host
+	 * key passed to `insert`; longer keys spill to an overflow arena of 128 bytes per node. Searches return
+	 * the keys, so a hit resolves without a lookup by node id.
+	 */
+	static create(path: string, dims: number, layer0Cap: number, maxNodes: number, keyCap?: number): Plane;
 	/**
 	 * Open an existing plane file. Throws on a format-version mismatch and on an invalidated
 	 * plane (header latch or `.stale` sidecar): delete the file and its sidecar, rebuild.
 	 */
 	static open(path: string): Plane;
 
+	readonly dims: number;
+	readonly layer0Cap: number;
+	/** Inline key bytes per slot (0 = the plane stores no keys). */
+	readonly keyCap: number;
+
 	/**
-	 * Insert a vector; returns the allocated node id (freed ids are reused). Throws on a
-	 * dimension mismatch or when the plane is full (maxNodes reached).
+	 * Insert a vector; returns the allocated node id (freed ids are reused). `key` is the host's
+	 * key bytes (needs a `keyCap` at create). Throws on a dimension mismatch, a full plane
+	 * (maxNodes reached), an exhausted key arena, or a key the plane cannot store.
 	 */
-	insert(vector: Float32Array): number;
+	insert(vector: Float32Array, key?: Buffer): number;
 	/** Delete a node; its id returns to the freelist. Pairs with insert(). */
 	remove(id: number): void;
 
@@ -42,7 +59,7 @@ export declare class Plane {
 		vector: Float32Array,
 		k: number,
 		ef: number,
-		predicate: (ids: Array<number>) => Uint8Array,
+		predicate: (ids: Array<number>, keys: Buffer, keyEnds: Uint32Array) => Uint8Array,
 		filterExpansion?: number,
 		visitBudget?: number
 	): Promise<SearchHits>;
@@ -62,7 +79,8 @@ export declare class Plane {
 		scale: number,
 		invMag: number,
 		neighbors: Uint32Array,
-		upper?: Array<Uint32Array> | null
+		upper?: Array<Uint32Array> | null,
+		key?: Buffer // omitted: the stored key is kept
 	): void;
 	/** Mark a node deleted without touching the plane freelist (dual-write mode). */
 	clearNode(id: number): void;
@@ -78,7 +96,8 @@ export declare class Plane {
 		scale: number,
 		invMag: number,
 		neighbors: Uint32Array,
-		upper?: Array<Uint32Array> | null
+		upper?: Array<Uint32Array> | null,
+		key?: Buffer
 	): boolean;
 	/**
 	 * Advisory: whether the file recorded a durability barrier (flush) as its last state when

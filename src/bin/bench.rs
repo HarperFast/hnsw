@@ -4,13 +4,13 @@
 //!
 //! Usage: bench [n=100000] [dims=768] [queries=200] [ef=512] [path=/tmp/bench.hnsw] [cap=128] [threads=0]
 //! Env: HNSW_BENCH_FVECS=<dir> reads SIFT-style `sift_base.fvecs` / `sift_query.fvecs` from that
-//! directory (dims from the file; n rows from base, queries from query) instead of the synthetic
+//! directory (its dims must match the argument; n rows from base, queries from query) instead of the synthetic
 //! corpus, so a run matches the Harper-vs-pgvector benchmark's data. `ef` may be a comma list.
 //! threads > 0 adds a concurrent-throughput pass: T searcher threads (queries each) + one
 //! background writer inserting throughout, reporting aggregate QPS and per-thread p50/p99.
 
 use hnsw_plane::distance::Query;
-use hnsw_plane::insert::{insert, InsertParams};
+use hnsw_plane::insert::{insert, insert_with_key, InsertParams};
 use hnsw_plane::search::{search, SearchScratch};
 use hnsw_plane::{Graph, PlaneFile};
 use std::path::PathBuf;
@@ -100,7 +100,6 @@ fn read_fvecs(path: &std::path::Path, limit: usize) -> Vec<Vec<f32>> {
     rows
 }
 
-/// Row source: synthetic mixture (replayable RNG) or fvecs files loaded up front.
 enum Source {
     Synthetic(Corpus),
     Fvecs { base: Vec<Vec<f32>>, query: Vec<Vec<f32>> },
@@ -133,17 +132,20 @@ fn main() {
     let path: PathBuf = args.get(5).map(Into::into).unwrap_or_else(|| "/tmp/bench.hnsw".into());
     let layer0_cap: usize = args.get(6).and_then(|a| a.parse().ok()).unwrap_or(128);
 
-    // Reuse an existing plane file when it already holds exactly n nodes at the same cap
-    // (ef sweeps without rebuilding). The corpus RNG below replays identically.
+    // Reuse an existing plane file when it holds exactly n nodes at the same geometry from the
+    // same corpus (a sidecar names the corpus): ef sweeps without rebuilding.
+    let corpus_id = std::env::var("HNSW_BENCH_FVECS").map(|d| format!("fvecs:{d}")).unwrap_or_else(|_| "synthetic".into());
+    let sidecar = path.with_extension("hnsw.corpus");
     let reuse = PlaneFile::open(&path)
         .ok()
-        .filter(|f| f.id_high_water() == n && f.layer0_cap == layer0_cap)
-        .is_some();
+        .filter(|f| f.id_high_water() == n && f.layer0_cap == layer0_cap && f.dims == dims)
+        .is_some()
+        && std::fs::read_to_string(&sidecar).map(|c| c == corpus_id).unwrap_or(false);
     let file = if reuse {
         println!("reusing existing plane at {}", path.display());
         PlaneFile::open(&path).expect("open")
     } else {
-        PlaneFile::create(&path, dims, layer0_cap, n + 1024).expect("create")
+        PlaneFile::create_with_keys(&path, dims, layer0_cap, n + 1024, 40).expect("create")
     };
     println!(
         "plane: {} nodes x {} dims, slot {} B, file {:.1} GB (sparse)",
@@ -180,7 +182,7 @@ fn main() {
         let build_start = Instant::now();
         for i in 0..n {
             let v = corpus.base_row(i as usize, &mut rng);
-            insert(&graph, &v, &params, &mut scratch).expect("build insert");
+            insert_with_key(&graph, &v, &i.to_le_bytes(), &params, &mut scratch).expect("build insert");
             if (i + 1) % 50_000 == 0 {
                 let rate = (i + 1) as f64 / build_start.elapsed().as_secs_f64();
                 println!("  built {} ({:.0} inserts/s)", i + 1, rate);
@@ -189,6 +191,7 @@ fn main() {
         let build = build_start.elapsed();
         println!("build: {:.1}s ({:.0} inserts/s)", build.as_secs_f64(), n as f64 / build.as_secs_f64());
         graph.file.msync().expect("msync");
+        std::fs::write(&sidecar, &corpus_id).expect("write corpus sidecar");
     }
 
     // Query with held-out vectors; measure latency and set-recall@10 vs brute-force truth
@@ -211,7 +214,6 @@ fn main() {
         let mut total_visits = 0u64;
         let mut recall_hits = 0usize;
         let mut recall_total = 0usize;
-        // warm pass so page faults and cache state do not land on the first ef point
         for q in &qs {
             let _ = search(&graph, q, 10, ef, &mut scratch);
         }

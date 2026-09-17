@@ -59,10 +59,10 @@ const native = native0;
 const nativeSearchWithPredicate = native.Plane.prototype.searchWithPredicate;
 native.Plane.prototype.searchWithPredicate = function (vector, k, ef, predicate, ...rest) {
 	let predicateError;
-	const guarded = (ids) => {
+	const guarded = (ids, keys, keyEnds) => {
 		if (predicateError !== undefined) return new Uint8Array(ids.length);
 		try {
-			const verdicts = predicate(ids);
+			const verdicts = predicate(ids, keys, keyEnds);
 			return verdicts instanceof Uint8Array ? verdicts : Uint8Array.from(verdicts ?? []);
 		} catch (error) {
 			predicateError = error;

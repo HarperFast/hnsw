@@ -386,7 +386,7 @@ fn a_wedged_untouched_write_frees_its_upper_entry() {
     let graph = std::sync::Arc::new(Graph::new(PlaneFile::create(&path, dims, 16, 64).expect("create")));
     let write = |id: u32| {
         let q = hnsw_plane::distance::quantize_int8(&vector_for(id, dims));
-        graph.write_node_if_untouched(id, 1, &q.0, q.1, q.2, &[1, 2], &[vec![id]])
+        graph.write_node_if_untouched(id, 1, &q.0, q.1, q.2, &[1, 2], &[vec![id]], None)
     };
 
     assert_eq!(write(1), Ok(true));
@@ -408,7 +408,7 @@ fn a_wedged_untouched_write_frees_its_upper_entry() {
         drop(guard);
     });
     await_lock(&held);
-    assert_eq!(write(9), Err(hnsw_plane::seqlock::Wedged), "the held lock must wedge this write");
+    assert_eq!(write(9), Err(hnsw_plane::graph::WriteError::Wedged), "the held lock must wedge this write");
     hold.join().unwrap();
 
     assert_eq!(write(2), Ok(true));

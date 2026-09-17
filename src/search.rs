@@ -52,6 +52,7 @@ pub struct SearchScratch {
     candidates: BinaryHeap<Candidate>,
     results: BinaryHeap<Result_>,
     descent_out: Vec<(u32, f32)>,
+    batch_keys: BatchKeys,
 }
 
 impl SearchScratch {
@@ -63,6 +64,7 @@ impl SearchScratch {
             candidates: BinaryHeap::new(),
             results: BinaryHeap::new(),
             descent_out: Vec::new(),
+            batch_keys: BatchKeys::default(),
         }
     }
 
@@ -119,6 +121,28 @@ fn bit_allowed(filter: Option<&[u8]>, id: u32) -> bool {
     }
 }
 
+
+/// Compact `nbuf` to its unvisited, in-range ids (marking them visited) and prefetch their
+/// slots, so the distance reads that follow find the lines in flight instead of missing one
+/// at a time. Returns the compacted length.
+#[inline]
+fn unvisited_prefetched(graph: &Graph, scratch: &mut SearchScratch, nbuf: &mut [u32]) -> usize {
+    let mut kept = 0;
+    for i in 0..nbuf.len() {
+        let nid = nbuf[i];
+        if (nid as u64) >= graph.file.max_nodes {
+            continue; // corrupt/torn neighbor id: skip rather than size allocations by it
+        }
+        if !scratch.visit(nid) {
+            continue;
+        }
+        graph.prefetch_slot(nid);
+        nbuf[kept] = nid;
+        kept += 1;
+    }
+    kept
+}
+
 /// Beam search within one layer, starting from `entry`. Level 0 reads slot adjacency; upper
 /// levels read the resident upper map. Fills `out` with (id, distance) ascending by distance.
 /// Assumes scratch.begin() was called for this query; entry is marked visited here.
@@ -171,21 +195,7 @@ pub fn search_layer(
         } else {
             graph.upper_neighbors_into(c.id, level, &mut nbuf);
         }
-        // Pass 1: compact to the unvisited neighbors and prefetch their slots, so pass 2's
-        // distance reads find the lines in flight rather than missing one at a time.
-        let mut kept = 0;
-        for i in 0..nbuf.len() {
-            let nid = nbuf[i];
-            if (nid as u64) >= graph.file.max_nodes {
-                continue; // corrupt/torn neighbor id: skip rather than size allocations by it
-            }
-            if !scratch.visit(nid) {
-                continue;
-            }
-            graph.prefetch_slot(nid);
-            nbuf[kept] = nid;
-            kept += 1;
-        }
+        let kept = unvisited_prefetched(graph, scratch, &mut nbuf);
         for i in 0..kept {
             let nid = nbuf[i];
             if let Some(d) = graph.distance_to(nid, query) {
@@ -344,16 +354,98 @@ pub fn search_filtered(
 /// steer result admission only; routing uses pure distance order, bounded by the visit
 /// budget, so a slow or saturated JS loop degrades speculative overshoot, not correctness.
 pub struct PredicatePipe {
-    /// Sends one batch of ids for evaluation. Must not block. Returns whether the batch was
-    /// actually handed off: a refused enqueue never produces a verdict, so counting it as
-    /// outstanding would make the tail drain wait out its whole deadline for an answer that
-    /// cannot arrive.
-    pub dispatch: Box<dyn FnMut(Vec<u32>) -> bool + Send>,
+    /// Sends one batch for evaluation: the candidate ids plus their host keys (see
+    /// `gather_keys`; both empty on a plane without key capacity). Must not block. Returns
+    /// whether the batch was actually handed off: a refused enqueue never produces a verdict,
+    /// so counting it as outstanding would make the tail drain wait out its whole deadline
+    /// for an answer that cannot arrive.
+    pub dispatch: Box<dyn FnMut(Vec<u32>, Vec<u8>, Vec<u32>) -> bool + Send>,
     /// Receives (ids, verdicts) pairs; verdicts[i] != 0 admits ids[i].
     pub rx: std::sync::mpsc::Receiver<(Vec<u32>, Vec<u8>)>,
 }
 
 const PREDICATE_BATCH: usize = 64;
+
+/// The host keys of `ids`, concatenated, with `ends[i]` the end offset of key i (so key i is
+/// `keys[ends[i-1]..ends[i]]`, ends[-1] = 0). A node that is gone or keyless contributes an
+/// empty key. Both vectors stay empty on a plane created without key capacity.
+pub fn gather_keys(graph: &Graph, ids: &[u32]) -> (Vec<u8>, Vec<u32>) {
+    if graph.file.key_cap == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let mut keys = Vec::with_capacity(ids.len() * graph.file.key_cap.min(64));
+    let mut ends = Vec::with_capacity(ids.len());
+    let mut one = Vec::new();
+    for &id in ids {
+        if graph.key_into(id, &mut one).is_some() {
+            keys.extend_from_slice(&one);
+        }
+        ends.push(keys.len() as u32);
+    }
+    (keys, ends)
+}
+
+/// Batch-time keys of every dispatched candidate, so an admitted hit returns the key the
+/// predicate ruled on rather than whatever the slot holds after the traversal.
+#[derive(Default)]
+struct BatchKeys {
+    bytes: Vec<u8>,
+    entries: Vec<(u32, u32, u32)>,
+}
+
+impl BatchKeys {
+    fn clear(&mut self) {
+        self.bytes.clear();
+        self.entries.clear();
+    }
+
+    fn record(&mut self, ids: &[u32], keys: &[u8], ends: &[u32]) {
+        let base = self.bytes.len() as u32;
+        self.bytes.extend_from_slice(keys);
+        let mut start = 0u32;
+        for (i, &id) in ids.iter().enumerate() {
+            self.entries.push((id, base + start, base + ends[i]));
+            start = ends[i];
+        }
+    }
+
+    /// Keys of `hits` in order, concatenated with end offsets: one pass over the entries
+    /// (a candidate is dispatched at most once per search).
+    fn keys_for(&self, hits: &[(u32, f32)]) -> (Vec<u8>, Vec<u32>) {
+        let mut ranges: Vec<Option<(u32, u32)>> = vec![None; hits.len()];
+        for &(id, start, end) in &self.entries {
+            if let Some(pos) = hits.iter().position(|&(hit, _)| hit == id) {
+                ranges[pos] = Some((start, end));
+            }
+        }
+        let mut keys = Vec::new();
+        let mut ends = Vec::with_capacity(hits.len());
+        for range in ranges {
+            if let Some((start, end)) = range {
+                keys.extend_from_slice(&self.bytes[start as usize..end as usize]);
+            }
+            ends.push(keys.len() as u32);
+        }
+        (keys, ends)
+    }
+}
+
+/// Results of a predicated search: hits ascending by distance, with each hit's key as the
+/// predicate saw it (`keys`/`key_ends` laid out as in `gather_keys`).
+pub struct PredicatedHits {
+    pub hits: Vec<(u32, f32)>,
+    pub keys: Vec<u8>,
+    pub key_ends: Vec<u32>,
+}
+
+fn dispatch_batch(graph: &Graph, pipe: &mut PredicatePipe, batch: &mut Vec<u32>, seen: &mut BatchKeys) -> bool {
+    let ids = std::mem::take(batch);
+    let (keys, ends) = gather_keys(graph, &ids);
+    if graph.file.key_cap > 0 {
+        seen.record(&ids, &keys, &ends);
+    }
+    (pipe.dispatch)(ids, keys, ends)
+}
 const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Full search with a pipelined predicate filter (upper-layer descent is unfiltered, as in
@@ -368,11 +460,14 @@ pub fn search_predicated(
     pipe: &mut PredicatePipe,
     visit_budget: u64,
     scratch: &mut SearchScratch,
-) -> (Vec<(u32, f32)>, SearchStats) {
+) -> (PredicatedHits, SearchStats) {
     let mut stats = SearchStats { visits: 0 };
+    let empty = || PredicatedHits { hits: Vec::new(), keys: Vec::new(), key_ends: Vec::new() };
     let Some((entry_id, entry_level, entry_dist)) = resolve_entry(graph, query, &mut stats) else {
-        return (Vec::new(), stats);
+        return (empty(), stats);
     };
+    let mut batch_keys = std::mem::take(&mut scratch.batch_keys);
+    batch_keys.clear();
     let (ep, ep_dist) =
         beam_descend(graph, query, entry_id, entry_dist, entry_level, 0, DESCENT_EF, scratch, &mut stats);
     scratch.begin_public(graph.file.id_high_water());
@@ -440,19 +535,7 @@ pub fn search_predicated(
         if graph.neighbors_into(c.id, &mut nbuf).is_none() {
             continue;
         }
-        let mut kept = 0;
-        for i in 0..nbuf.len() {
-            let nid = nbuf[i];
-            if (nid as u64) >= graph.file.max_nodes {
-                continue; // corrupt/torn neighbor id: skip rather than size allocations by it
-            }
-            if !scratch.visit(nid) {
-                continue;
-            }
-            graph.prefetch_slot(nid);
-            nbuf[kept] = nid;
-            kept += 1;
-        }
+        let kept = unvisited_prefetched(graph, scratch, &mut nbuf);
         for i in 0..kept {
             let nid = nbuf[i];
             if let Some(d) = graph.distance_to(nid, query) {
@@ -462,7 +545,7 @@ pub fn search_predicated(
                     candidates.push(Candidate { distance: d, id: nid });
                     speculative.push((nid, d));
                     batch.push(nid);
-                    if batch.len() >= PREDICATE_BATCH && (pipe.dispatch)(std::mem::take(&mut batch)) {
+                    if batch.len() >= PREDICATE_BATCH && dispatch_batch(graph, pipe, &mut batch, &mut batch_keys) {
                         outstanding += 1;
                     }
                 }
@@ -472,7 +555,7 @@ pub fn search_predicated(
     scratch.neighbors = nbuf;
 
     // flush the tail batch and block-drain what's still in flight
-    if !batch.is_empty() && (pipe.dispatch)(std::mem::take(&mut batch)) {
+    if !batch.is_empty() && dispatch_batch(graph, pipe, &mut batch, &mut batch_keys) {
         outstanding += 1;
     }
     let deadline = std::time::Instant::now() + DRAIN_TIMEOUT;
@@ -492,11 +575,13 @@ pub fn search_predicated(
     let mut out: Vec<(u32, f32)> = results.drain().map(|r| (r.id, r.distance)).collect();
     out.sort_by(|a, b| a.1.total_cmp(&b.1));
     out.truncate(k);
+    let (keys, key_ends) = if graph.file.key_cap > 0 { batch_keys.keys_for(&out) } else { (Vec::new(), Vec::new()) };
 
     candidates.clear();
     scratch.candidates = candidates;
     scratch.results = results;
-    (out, stats)
+    scratch.batch_keys = batch_keys;
+    (PredicatedHits { hits: out, keys, key_ends }, stats)
 }
 
 #[cfg(test)]
@@ -655,8 +740,9 @@ level 1 holds roughly {} nodes, and a beam that pushed tied candidates would wal
                 }
             }
         });
-        let mut pipe = PredicatePipe { dispatch: Box::new(move |ids| req_tx.send(ids).is_ok()), rx: res_rx };
+        let mut pipe = PredicatePipe { dispatch: Box::new(move |ids, _keys, _ends| req_tx.send(ids).is_ok()), rx: res_rx };
         let (hits, stats) = search_predicated(&graph, &query, 10, 16, &mut pipe, budget, &mut scratch);
+        let hits = hits.hits;
 
         assert_eq!(hits.len(), 10, "layer 0 got no budget of its own: {hits:?}");
         assert!(
@@ -704,12 +790,13 @@ mod predicate_tests {
         });
 
         let mut pipe = PredicatePipe {
-            dispatch: Box::new(move |ids| req_tx.send(ids).is_ok()),
+            dispatch: Box::new(move |ids, _keys, _ends| req_tx.send(ids).is_ok()),
             rx: res_rx,
         };
         let q: Vec<f32> = (0..dims).map(|d| ((41.0f32 * 0.31 + d as f32) * 0.7).sin()).collect();
         let (hits, _) =
             search_predicated(&graph, &Query::new(q), 10, 64, &mut pipe, 64 * 24, &mut scratch);
+        let hits = hits.hits;
         assert!(!hits.is_empty());
         for (id, _) in &hits {
             assert_eq!(id % 2, 0, "odd id {id} leaked through the predicate");
@@ -754,7 +841,7 @@ mod predicate_tests {
         });
 
         let mut pipe = PredicatePipe {
-            dispatch: Box::new(move |ids| req_tx.send(ids).is_ok()),
+            dispatch: Box::new(move |ids, _keys, _ends| req_tx.send(ids).is_ok()),
             rx: res_rx,
         };
         let q: Vec<f32> = (0..dims).map(|d| ((41.0f32 * 0.31 + d as f32) * 0.7).sin()).collect();
@@ -770,7 +857,7 @@ mod predicate_tests {
                 &mut scratch,
             );
             let tail = last_send.lock().unwrap().expect("the evaluator answered a batch").elapsed();
-            assert!(!hits.is_empty(), "precondition: an admitting predicate returns results");
+            assert!(!hits.hits.is_empty(), "precondition: an admitting predicate returns results");
             best = best.min(tail);
         }
         assert!(
@@ -802,14 +889,14 @@ mod predicate_tests {
         // the sender stays alive for the whole search, so a drain that believes a batch is
         // outstanding blocks on the deadline rather than on a disconnected channel
         let (tx, rx) = std::sync::mpsc::channel::<(Vec<u32>, Vec<u8>)>();
-        let mut pipe = PredicatePipe { dispatch: Box::new(|_ids| false), rx };
+        let mut pipe = PredicatePipe { dispatch: Box::new(|_ids, _keys, _ends| false), rx };
         let q: Vec<f32> = (0..dims).map(|d| ((41.0f32 * 0.31 + d as f32) * 0.7).sin()).collect();
         let started = std::time::Instant::now();
         let (hits, _) =
             search_predicated(&graph, &Query::new(q), 10, 64, &mut pipe, 64 * 24, &mut scratch);
         let elapsed = started.elapsed();
         drop(tx);
-        assert!(hits.is_empty(), "no verdict can arrive for a refused batch, so nothing may be admitted");
+        assert!(hits.hits.is_empty(), "no verdict can arrive for a refused batch, so nothing may be admitted");
         assert!(
             elapsed < std::time::Duration::from_secs(1),
             "the search waited {elapsed:?} on batches that were never enqueued (deadline is {DRAIN_TIMEOUT:?})"
