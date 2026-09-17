@@ -1,6 +1,7 @@
-export interface SearchHit {
-	id: number;
-	distance: number;
+/** Parallel arrays, ascending by distance: hit i is (ids[i], distances[i]). */
+export interface SearchHits {
+	ids: Uint32Array;
+	distances: Float32Array;
 }
 
 /**
@@ -30,7 +31,7 @@ export declare class Plane {
 	 * Async k-NN search. `filter` is an allow-bitset over node ids (bit i of byte i>>3);
 	 * filtered searches are visit-bounded by ef * filterExpansion (default 24).
 	 */
-	search(vector: Float32Array, k: number, ef: number, filter?: Uint8Array, filterExpansion?: number): Promise<Array<SearchHit>>;
+	search(vector: Float32Array, k: number, ef: number, filter?: Uint8Array, filterExpansion?: number): Promise<SearchHits>;
 	/**
 	 * Async k-NN search with a JS predicate, evaluated in batches over a threadsafe function
 	 * while traversal keeps expanding (the search thread never blocks on the event loop).
@@ -44,9 +45,9 @@ export declare class Plane {
 		predicate: (ids: Array<number>) => Uint8Array,
 		filterExpansion?: number,
 		visitBudget?: number
-	): Promise<Array<SearchHit>>;
+	): Promise<SearchHits>;
 	/** Synchronous search (benchmarks/tests; blocks the calling thread). */
-	searchSync(vector: Float32Array, k: number, ef: number): Array<SearchHit>;
+	searchSync(vector: Float32Array, k: number, ef: number): SearchHits;
 
 	/**
 	 * Mirror a host-maintained node into the plane (dual-write mode): full node state per

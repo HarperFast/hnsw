@@ -91,10 +91,23 @@ pub fn stale_path_for(path: String) -> String {
     crate::invalidate::stale_path_for(std::path::Path::new(&path)).to_string_lossy().into_owned()
 }
 
+/// Search results as two parallel typed arrays, ascending by distance. Two allocations per
+/// query instead of one object per hit: at ef-sized result sets the per-hit object creation
+/// was a measurable share of the crossing.
 #[napi(object)]
-pub struct SearchHit {
-    pub id: u32,
-    pub distance: f64,
+pub struct SearchHits {
+    pub ids: Uint32Array,
+    pub distances: Float32Array,
+}
+
+fn hits_to_js(hits: Vec<(u32, f32)>) -> SearchHits {
+    let mut ids = Vec::with_capacity(hits.len());
+    let mut distances = Vec::with_capacity(hits.len());
+    for (id, d) in hits {
+        ids.push(id);
+        distances.push(d);
+    }
+    SearchHits { ids: Uint32Array::new(ids), distances: Float32Array::new(distances) }
 }
 
 pub struct SearchTask {
@@ -110,7 +123,7 @@ pub struct SearchTask {
 #[napi]
 impl Task for SearchTask {
     type Output = Vec<(u32, f32)>;
-    type JsValue = Vec<SearchHit>;
+    type JsValue = SearchHits;
 
     fn compute(&mut self) -> Result<Self::Output> {
         let mut scratch = self.pool.take();
@@ -129,7 +142,7 @@ impl Task for SearchTask {
     }
 
     fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
-        Ok(output.into_iter().map(|(id, d)| SearchHit { id, distance: d as f64 }).collect())
+        Ok(hits_to_js(output))
     }
 }
 
@@ -146,7 +159,7 @@ pub struct PredicateSearchTask {
 #[napi]
 impl Task for PredicateSearchTask {
     type Output = Vec<(u32, f32)>;
-    type JsValue = Vec<SearchHit>;
+    type JsValue = SearchHits;
 
     fn compute(&mut self) -> Result<Self::Output> {
         let tsfn = self.tsfn.take().ok_or_else(|| Error::from_reason("task reused"))?;
@@ -181,7 +194,7 @@ impl Task for PredicateSearchTask {
     }
 
     fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
-        Ok(output.into_iter().map(|(id, d)| SearchHit { id, distance: d as f64 }).collect())
+        Ok(hits_to_js(output))
     }
 }
 
@@ -453,7 +466,7 @@ impl Plane {
     /// Async k-NN search on the libuv thread pool. `filter` is an optional allow-bitset
     /// over node ids (bit i of byte i>>3); filtered searches are visit-bounded by
     /// ef * filterExpansion (default 24).
-    #[napi(ts_return_type = "Promise<Array<SearchHit>>")]
+    #[napi(ts_return_type = "Promise<SearchHits>")]
     pub fn search(
         &self,
         vector: Float32Array,
@@ -482,7 +495,7 @@ impl Plane {
     /// `visitBudget` caps layer-0 visits absolutely (a host budget may sit below ef, which a
     /// multiplier cannot express); when absent the budget is ef * filterExpansion.
     /// Must not be awaited synchronously from code the predicate itself blocks.
-    #[napi(ts_return_type = "Promise<Array<SearchHit>>")]
+    #[napi(ts_return_type = "Promise<SearchHits>")]
     pub fn search_with_predicate(
         &self,
         vector: Float32Array,
@@ -514,13 +527,13 @@ impl Plane {
 
     /// Synchronous search (benchmarks/tests; blocks the calling thread).
     #[napi]
-    pub fn search_sync(&self, vector: Float32Array, k: u32, ef: u32) -> Result<Vec<SearchHit>> {
+    pub fn search_sync(&self, vector: Float32Array, k: u32, ef: u32) -> Result<SearchHits> {
         self.check_query_dims(vector.len())?;
         let mut scratch = self.pool.take();
         let query = Query::new(vector.to_vec());
         let (hits, _) = search_filtered(&self.graph, &query, k as usize, ef as usize, None, 24, &mut scratch);
         self.pool.put(scratch);
-        Ok(hits.into_iter().map(|(id, d)| SearchHit { id, distance: d as f64 }).collect())
+        Ok(hits_to_js(hits))
     }
 
     /// Lifetime id high-water (allocated ids, including freed ones awaiting reuse).

@@ -171,6 +171,9 @@ pub fn search_layer(
         } else {
             graph.upper_neighbors_into(c.id, level, &mut nbuf);
         }
+        // Pass 1: compact to the unvisited neighbors and prefetch their slots, so pass 2's
+        // distance reads find the lines in flight rather than missing one at a time.
+        let mut kept = 0;
         for i in 0..nbuf.len() {
             let nid = nbuf[i];
             if (nid as u64) >= graph.file.max_nodes {
@@ -179,6 +182,12 @@ pub fn search_layer(
             if !scratch.visit(nid) {
                 continue;
             }
+            graph.prefetch_slot(nid);
+            nbuf[kept] = nid;
+            kept += 1;
+        }
+        for i in 0..kept {
+            let nid = nbuf[i];
             if let Some(d) = graph.distance_to(nid, query) {
                 stats.visits += 1;
                 let worst = results.peek().map(|r| r.distance).unwrap_or(f32::INFINITY);
@@ -431,6 +440,7 @@ pub fn search_predicated(
         if graph.neighbors_into(c.id, &mut nbuf).is_none() {
             continue;
         }
+        let mut kept = 0;
         for i in 0..nbuf.len() {
             let nid = nbuf[i];
             if (nid as u64) >= graph.file.max_nodes {
@@ -439,6 +449,12 @@ pub fn search_predicated(
             if !scratch.visit(nid) {
                 continue;
             }
+            graph.prefetch_slot(nid);
+            nbuf[kept] = nid;
+            kept += 1;
+        }
+        for i in 0..kept {
+            let nid = nbuf[i];
             if let Some(d) = graph.distance_to(nid, query) {
                 stats.visits += 1;
                 let worst = results.peek().map(|r| r.distance).unwrap_or(f32::INFINITY);

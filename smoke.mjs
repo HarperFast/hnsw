@@ -21,15 +21,16 @@ console.log('inserted 2000, highWater =', plane.idHighWater());
 
 // async search: nearest neighbor of an inserted vector is itself (distance ~0)
 const hits = await plane.search(vec(42), 5, 128);
-console.log('top hit:', hits[0]);
-if (hits[0].distance > 1e-3) throw new Error('self-query failed');
+console.log('top hit:', hits.ids[0], hits.distances[0]);
+if (!(hits.ids instanceof Uint32Array) || !(hits.distances instanceof Float32Array)) throw new Error('hits are not typed arrays');
+if (hits.distances[0] > 1e-3) throw new Error('self-query failed');
 
 // filtered search: allow only even ids
 const bitset = new Uint8Array(Math.ceil(plane.idHighWater() / 8));
 for (const id of ids) if (id % 2 === 0) bitset[id >> 3] |= 1 << (id & 7);
 const filtered = await plane.search(vec(43), 5, 128, bitset);
-for (const h of filtered) if (h.id % 2 !== 0) throw new Error(`filter leak: id ${h.id}`);
-console.log('filtered top hit:', filtered[0]);
+for (const id of filtered.ids) if (id % 2 !== 0) throw new Error(`filter leak: id ${id}`);
+console.log('filtered top hit:', filtered.ids[0], filtered.distances[0]);
 
 // delete + reinsert reuses the id (the #2182 fix)
 plane.remove(ids[7]);
@@ -44,9 +45,9 @@ const pred = await plane.searchWithPredicate(vec(44), 5, 128, (ids) => {
 	predicateCalls++;
 	return Uint8Array.from(ids, (id) => (id % 3 === 0 ? 1 : 0));
 });
-for (const h of pred) if (h.id % 3 !== 0) throw new Error(`predicate leak: id ${h.id}`);
-if (pred.length === 0) throw new Error('predicate search returned nothing');
-console.log(`predicate top hit: id ${pred[0].id} (calls: ${predicateCalls})`);
+for (const id of pred.ids) if (id % 3 !== 0) throw new Error(`predicate leak: id ${id}`);
+if (pred.ids.length === 0) throw new Error('predicate search returned nothing');
+console.log(`predicate top hit: id ${pred.ids[0]} (calls: ${predicateCalls})`);
 
 // raw mirroring path (dual-write phase 1): host-allocated ids, full node state per call
 const mirror = Plane.create(join(tmpdir(), `smoke-mirror-${process.pid}.hnsw`), dims, 32, 10_000);
@@ -70,17 +71,17 @@ mirror.writeNodeRaw(10, 1, a.bytes, a.scale, a.invMag, Uint32Array.from([20]), [
 mirror.writeNodeRaw(20, 0, b.bytes, b.scale, b.invMag, Uint32Array.from([10]), null);
 mirror.setEntryPoint(10, 1);
 const mhits = mirror.searchSync(q42, 2, 16);
-if (mhits[0].id !== 10 || mhits[0].distance > 1e-3)
-	throw new Error(`mirror self-query failed: ${JSON.stringify(mhits)}`);
+if (mhits.ids[0] !== 10 || mhits.distances[0] > 1e-3)
+	throw new Error(`mirror self-query failed: ${JSON.stringify([...mhits.ids])}`);
 mirror.clearNode(20);
 const mhits2 = mirror.searchSync(vec(43), 2, 16);
-if (mhits2.some((h) => h.id === 20)) throw new Error('cleared node still returned');
+if (mhits2.ids.includes(20)) throw new Error('cleared node still returned');
 console.log('raw mirroring OK');
 
 plane.flush();
 const reopened = Plane.open(path);
 const hits2 = reopened.searchSync(vec(42), 5, 128);
-if (hits2[0].distance > 1e-3) throw new Error('reopened self-query failed');
+if (hits2.distances[0] > 1e-3) throw new Error('reopened self-query failed');
 console.log('reopen OK');
 
 // invalidation through the caller's own handle: both markers land, the latch survives a

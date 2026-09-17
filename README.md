@@ -55,7 +55,7 @@ const { Plane } = require('@harperfast/hnsw');
 
 const plane = Plane.create('/data/vectors.hnsw', 768, 128, 10_000_000);
 const id = plane.insert(myFloat32Vector);
-const hits = await plane.search(queryVector, 10, 512); // [{ id, distance }, ...]
+const { ids, distances } = await plane.search(queryVector, 10, 512); // parallel typed arrays, ascending
 
 // filtered: allow-bitset over node ids
 const allowed = new Uint8Array(Math.ceil(plane.idHighWater() / 8));

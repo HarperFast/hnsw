@@ -3,6 +3,9 @@
 //! budget (JS baseline: 4.34 µs/visit at 5M/ef 512).
 //!
 //! Usage: bench [n=100000] [dims=768] [queries=200] [ef=512] [path=/tmp/bench.hnsw] [cap=128] [threads=0]
+//! Env: HNSW_BENCH_FVECS=<dir> reads SIFT-style `sift_base.fvecs` / `sift_query.fvecs` from that
+//! directory (dims from the file; n rows from base, queries from query) instead of the synthetic
+//! corpus, so a run matches the Harper-vs-pgvector benchmark's data. `ef` may be a comma list.
 //! threads > 0 adds a concurrent-throughput pass: T searcher threads (queries each) + one
 //! background writer inserting throughout, reporting aggregate QPS and per-thread p50/p99.
 
@@ -78,12 +81,55 @@ impl Corpus {
     }
 }
 
+
+/// SIFT-style fvecs: per row an i32 dimension count then that many f32s.
+fn read_fvecs(path: &std::path::Path, limit: usize) -> Vec<Vec<f32>> {
+    let bytes = std::fs::read(path).expect("read fvecs");
+    let mut rows = Vec::new();
+    let mut off = 0usize;
+    while off + 4 <= bytes.len() && rows.len() < limit {
+        let d = i32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
+        off += 4;
+        let mut v = Vec::with_capacity(d);
+        for i in 0..d {
+            v.push(f32::from_le_bytes(bytes[off + i * 4..off + i * 4 + 4].try_into().unwrap()));
+        }
+        off += d * 4;
+        rows.push(v);
+    }
+    rows
+}
+
+/// Row source: synthetic mixture (replayable RNG) or fvecs files loaded up front.
+enum Source {
+    Synthetic(Corpus),
+    Fvecs { base: Vec<Vec<f32>>, query: Vec<Vec<f32>> },
+}
+
+impl Source {
+    fn base_row(&self, i: usize, rng: &mut Rng) -> Vec<f32> {
+        match self {
+            Source::Synthetic(c) => c.row(rng),
+            Source::Fvecs { base, .. } => base[i].clone(),
+        }
+    }
+    fn query_row(&self, i: usize, rng: &mut Rng) -> Vec<f32> {
+        match self {
+            Source::Synthetic(c) => c.row(rng),
+            Source::Fvecs { query, .. } => query[i % query.len()].clone(),
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let n: u64 = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(100_000);
     let dims: usize = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(768);
     let queries: usize = args.get(3).and_then(|a| a.parse().ok()).unwrap_or(200);
-    let ef: usize = args.get(4).and_then(|a| a.parse().ok()).unwrap_or(512);
+    let efs: Vec<usize> = args
+        .get(4)
+        .map(|a| a.split(',').map(|e| e.parse().expect("ef")).collect())
+        .unwrap_or_else(|| vec![512]);
     let path: PathBuf = args.get(5).map(Into::into).unwrap_or_else(|| "/tmp/bench.hnsw".into());
     let layer0_cap: usize = args.get(6).and_then(|a| a.parse().ok()).unwrap_or(128);
 
@@ -110,18 +156,30 @@ fn main() {
     let params = InsertParams::default();
     let mut scratch = SearchScratch::new();
     let mut rng = Rng(0x1234_5678_9abc_def0);
-    let corpus = Corpus::new(n, dims, &mut rng);
+    let source = match std::env::var("HNSW_BENCH_FVECS") {
+        Ok(dir) => {
+            let dir = PathBuf::from(dir);
+            let base = read_fvecs(&dir.join("sift_base.fvecs"), n as usize);
+            let query = read_fvecs(&dir.join("sift_query.fvecs"), queries);
+            assert_eq!(base.len(), n as usize, "fvecs base holds fewer than n rows");
+            assert_eq!(base[0].len(), dims, "fvecs dims differ from the dims argument");
+            println!("fvecs corpus: {} base rows, {} query rows", base.len(), query.len());
+            Source::Fvecs { base, query }
+        }
+        Err(_) => Source::Synthetic(Corpus::new(n, dims, &mut rng)),
+    };
+    let corpus = &source;
 
     if reuse {
         // replay the build's RNG draws so query rows match a fresh run; the upper region
         // persists inside the plane file
-        for _ in 0..n {
-            let _ = corpus.row(&mut rng);
+        for i in 0..n {
+            let _ = corpus.base_row(i as usize, &mut rng);
         }
     } else {
         let build_start = Instant::now();
         for i in 0..n {
-            let v = corpus.row(&mut rng);
+            let v = corpus.base_row(i as usize, &mut rng);
             insert(&graph, &v, &params, &mut scratch).expect("build insert");
             if (i + 1) % 50_000 == 0 {
                 let rate = (i + 1) as f64 / build_start.elapsed().as_secs_f64();
@@ -135,62 +193,76 @@ fn main() {
 
     // Query with held-out vectors; measure latency and set-recall@10 vs brute-force truth
     // (same asymmetric metric, so recall isolates graph quality, not quantization).
-    let mut latencies = Vec::with_capacity(queries);
-    let mut total_visits = 0u64;
-    let mut recall_hits = 0usize;
-    let mut recall_total = 0usize;
-    for _ in 0..queries {
-        let q = Query::new(corpus.row(&mut rng));
-        let start = Instant::now();
-        let (results, stats) = search(&graph, &q, 10, ef, &mut scratch);
-        latencies.push(start.elapsed());
-        total_visits += stats.visits;
-        assert!(!results.is_empty());
-
-        let mut truth: Vec<(u32, f32)> = (0..n as u32)
-            .filter_map(|id| graph.distance_to(id, &q).map(|d| (id, d)))
-            .collect();
-        truth.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        truth.truncate(10);
-        recall_total += truth.len();
-        recall_hits += truth.iter().filter(|(tid, _)| results.iter().any(|(rid, _)| rid == tid)).count();
+    let qs: Vec<Query> = (0..queries).map(|i| Query::new(corpus.query_row(i, &mut rng))).collect();
+    let truths: Vec<Vec<u32>> = qs
+        .iter()
+        .map(|q| {
+            let mut truth: Vec<(u32, f32)> =
+                (0..n as u32).filter_map(|id| graph.distance_to(id, q).map(|d| (id, d))).collect();
+            truth.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            truth.truncate(10);
+            truth.into_iter().map(|(id, _)| id).collect()
+        })
+        .collect();
+    let mut ef = efs[0];
+    for &ef_i in &efs {
+        ef = ef_i;
+        let mut latencies = Vec::with_capacity(queries);
+        let mut total_visits = 0u64;
+        let mut recall_hits = 0usize;
+        let mut recall_total = 0usize;
+        // warm pass so page faults and cache state do not land on the first ef point
+        for q in &qs {
+            let _ = search(&graph, q, 10, ef, &mut scratch);
+        }
+        for (q, truth) in qs.iter().zip(&truths) {
+            let start = Instant::now();
+            let (results, stats) = search(&graph, q, 10, ef, &mut scratch);
+            latencies.push(start.elapsed());
+            total_visits += stats.visits;
+            assert!(!results.is_empty());
+            recall_total += truth.len();
+            recall_hits += truth.iter().filter(|tid| results.iter().any(|(rid, _)| rid == *tid)).count();
+        }
+        latencies.sort();
+        let p50 = latencies[queries / 2];
+        let p95 = latencies[queries * 95 / 100];
+        let p99 = latencies[(queries * 99 / 100).min(queries - 1)];
+        let mean_visits = total_visits as f64 / queries as f64;
+        let mean_us = latencies.iter().map(|d| d.as_secs_f64()).sum::<f64>() / queries as f64 * 1e6;
+        let us_per_visit = mean_us / mean_visits;
+        println!(
+            "search (ef {:>4}): p50 {:.3} ms  p95 {:.3} ms  p99 {:.3} ms  mean {:.1} us  visits/query {:.0}  ->  {:.3} us/visit  recall@10 {:.4}",
+            ef,
+            p50.as_secs_f64() * 1e3,
+            p95.as_secs_f64() * 1e3,
+            p99.as_secs_f64() * 1e3,
+            mean_us,
+            mean_visits,
+            us_per_visit,
+            recall_hits as f64 / recall_total as f64
+        );
     }
-    latencies.sort();
-    let p50 = latencies[queries / 2];
-    let p95 = latencies[queries * 95 / 100];
-    let p99 = latencies[(queries * 99 / 100).min(queries - 1)];
-    let mean_visits = total_visits as f64 / queries as f64;
-    let us_per_visit = p50.as_micros() as f64 / mean_visits;
-    println!(
-        "search (ef {}): p50 {:.2} ms  p95 {:.2} ms  p99 {:.2} ms  visits/query {:.0}  ->  {:.3} us/visit (JS baseline 4.34)",
-        ef,
-        p50.as_secs_f64() * 1e3,
-        p95.as_secs_f64() * 1e3,
-        p99.as_secs_f64() * 1e3,
-        mean_visits,
-        us_per_visit
-    );
-    println!("recall@10 (set): {:.3}", recall_hits as f64 / recall_total as f64);
 
     let threads: usize = args.get(7).and_then(|a| a.parse().ok()).unwrap_or(0);
     if threads > 0 {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
         let graph = Arc::new(graph);
-        let corpus = Arc::new(corpus);
+        let source = Arc::new(source);
         let stop = Arc::new(AtomicBool::new(false));
         let per_thread = queries.max(100);
         let start = Instant::now();
         let mut handles = Vec::new();
         for t in 0..threads {
             let graph = graph.clone();
-            let corpus = corpus.clone();
+            let corpus = source.clone();
             handles.push(std::thread::spawn(move || {
                 let mut scratch = SearchScratch::new();
                 let mut rng = Rng(0x9e37_79b9 ^ (t as u64 + 1) * 0x1234_5677);
                 let mut lat: Vec<std::time::Duration> = Vec::with_capacity(per_thread);
-                for _ in 0..per_thread {
-                    let q = Query::new(corpus.row(&mut rng));
+                for i in 0..per_thread {
+                    let q = Query::new(corpus.query_row(i, &mut rng));
                     let s = Instant::now();
                     let (r, _) = search(&graph, &q, 10, ef, &mut scratch);
                     lat.push(s.elapsed());
@@ -203,7 +275,7 @@ fn main() {
         // background writer: sustained inserts while searchers run
         let writer = {
             let graph = graph.clone();
-            let corpus = corpus.clone();
+            let corpus = source.clone();
             let stop = stop.clone();
             std::thread::spawn(move || {
                 let params = InsertParams::default();
@@ -211,7 +283,7 @@ fn main() {
                 let mut rng = Rng(0xdead_beef_cafe_f00d);
                 let mut count = 0u64;
                 while !stop.load(Ordering::Relaxed) {
-                    let v = corpus.row(&mut rng);
+                    let v = corpus.base_row(count as usize % n as usize, &mut rng);
                     if insert(&graph, &v, &params, &mut scratch).is_err() {
                         break; // plane full
                     }

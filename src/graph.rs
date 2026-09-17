@@ -98,6 +98,26 @@ impl Graph {
         move || unsafe { *self.file.upper_ptr_mut(idx).add(U_LEVELS) = 0 }
     }
 
+    /// Hint the cache lines `distance_to(id)` will read (seqlock word, flags, scale, vector).
+    /// Neighbor slots are scattered through the mapping, so issuing these for a whole
+    /// adjacency list before scoring it overlaps the misses instead of taking them serially.
+    #[inline]
+    pub fn prefetch_slot(&self, id: u32) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            let p = self.file.slot_ptr(id);
+            let end = S_VECTOR + self.file.dims;
+            let mut off = 0;
+            while off < end {
+                _mm_prefetch(p.add(off) as *const i8, _MM_HINT_T0);
+                off += 64;
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = id;
+    }
+
     /// Zero-copy distance from `query` to the stored vector of `id`. None for absent/deleted.
     #[inline]
     pub fn distance_to(&self, id: u32, query: &Query) -> Option<f32> {
