@@ -129,7 +129,8 @@ MB at 100M nodes.
 **Host keys (format v8).** Each slot ends with the host's key for the node: a `u16` length,
 a pad to 4 bytes, then `key_cap` bytes (`key_cap` is a create-time header field; 0 = no keys).
 A key that fits is stored inline; a longer one is copied into a **key overflow arena** after the
-upper region (sparse, 128 B/node, CAS bump allocation) and the payload holds its offset as two
+upper region (sparse; `key_arena_bytes_per_node` at create, default max(128, 4 × key_cap); CAS bump
+allocation) and the payload holds its offset as two
 aligned `u32` halves (every field read on the search path stays a naturally aligned volatile
 load). The key is stored under the slot's write lock, first, so an exhausted arena leaves the
 slot's previous state intact. Ranges are reserved in 64-byte classes, so a range's capacity

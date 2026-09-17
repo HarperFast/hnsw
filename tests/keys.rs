@@ -108,7 +108,8 @@ fn keys_are_refused_where_they_cannot_be_stored() {
 
     assert!(PlaneFile::create_with_keys(&temp("badcap"), dims, 16, 256, 4).is_err(), "keyCap below 8 is refused");
 
-    // arena: 128 bytes per node; 8 nodes -> 1024 bytes; 200-byte keys reserve 256 and fit 4 times
+    // arena: 128 bytes per node (the default at keyCap 8); 8 nodes -> 1024 bytes; 200-byte keys
+    // reserve 256 and fit 4 times
     let path = temp("arena");
     let graph = Graph::new(PlaneFile::create_with_keys(&path, dims, 16, 8, 8).expect("create"));
     let long = vec![b'x'; 200];
@@ -136,6 +137,16 @@ fn keys_are_refused_where_they_cannot_be_stored() {
         Err(InsertError::KeyUnstorable),
         "a key past the u16 length is refused"
     );
+    let _ = std::fs::remove_file(&path);
+
+    // an explicit arena reservation: 32 nodes x 192 B holds twenty-four 256-byte ranges
+    let path = temp("arena-sized");
+    let graph = Graph::new(PlaneFile::create_with_key_arena(&path, dims, 16, 32, 8, 192).expect("create"));
+    for i in 0..24u32 {
+        insert_with_key(&graph, &vector_for(i, dims), &long, &params, &mut scratch).expect("sized arena has room");
+    }
+    assert_eq!(insert_with_key(&graph, &vector_for(24, dims), &long, &params, &mut scratch), Err(InsertError::KeyArenaFull));
+    assert!(PlaneFile::create_with_key_arena(&temp("arena-small"), dims, 16, 32, 8, 32).is_err(), "below 64 is refused");
     let _ = std::fs::remove_file(&path);
 }
 

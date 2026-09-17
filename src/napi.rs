@@ -278,15 +278,25 @@ pub struct Plane {
 impl Plane {
     /// Create a new plane file. `maxNodes` bounds the sparse reservation (pages materialize
     /// on write). `keyCap` (default 0) is the inline key capacity per slot; longer keys spill
-    /// to an overflow arena of 128 bytes per node.
+    /// to an overflow arena of `keyArenaBytesPerNode` bytes per node (default
+    /// max(128, 4 x keyCap); sparse, so size it for the keys that will spill).
     #[napi(factory)]
-    pub fn create(path: String, dims: u32, layer0_cap: u32, max_nodes: f64, key_cap: Option<u32>) -> Result<Plane> {
-        let file = PlaneFile::create_with_keys(
+    pub fn create(
+        path: String,
+        dims: u32,
+        layer0_cap: u32,
+        max_nodes: f64,
+        key_cap: Option<u32>,
+        key_arena_bytes_per_node: Option<u32>,
+    ) -> Result<Plane> {
+        let key_cap = key_cap.unwrap_or(0) as usize;
+        let file = PlaneFile::create_with_key_arena(
             std::path::Path::new(&path),
             dims as usize,
             layer0_cap as usize,
             max_nodes as u64,
-            key_cap.unwrap_or(0) as usize,
+            key_cap,
+            key_arena_bytes_per_node.unwrap_or_else(|| crate::format::default_key_arena_per_node(key_cap)),
         )
         .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(Self::wrap(file))

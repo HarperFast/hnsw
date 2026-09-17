@@ -20,10 +20,18 @@ export declare class Plane {
 	/**
 	 * Create a new plane file. `maxNodes` is a sparse reservation — pages materialize on write.
 	 * `keyCap` (default 0, else at least 8) reserves that many inline bytes per slot for the host
-	 * key passed to `insert`; longer keys spill to an overflow arena of 128 bytes per node. Searches return
-	 * the keys, so a hit resolves without a lookup by node id.
+	 * key passed to `insert`; longer keys spill to an overflow arena of `keyArenaBytesPerNode` bytes
+	 * per node (default max(128, 4 × keyCap), at least 64; sparse, so size it for the keys that will
+	 * spill). Searches return the keys, so a hit resolves without a lookup by node id.
 	 */
-	static create(path: string, dims: number, layer0Cap: number, maxNodes: number, keyCap?: number): Plane;
+	static create(
+		path: string,
+		dims: number,
+		layer0Cap: number,
+		maxNodes: number,
+		keyCap?: number,
+		keyArenaBytesPerNode?: number
+	): Plane;
 	/**
 	 * Open an existing plane file. Throws on a format-version mismatch and on an invalidated
 	 * plane (header latch or `.stale` sidecar): delete the file and its sidecar, rebuild.
