@@ -7,7 +7,8 @@ const dims = 64;
 const { tmpdir } = await import('node:os');
 const { join } = await import('node:path');
 const path = join(tmpdir(), `smoke-${process.pid}.hnsw`);
-const plane = Plane.create(path, dims, 32, 10_000);
+const plane = Plane.create(path, dims, 32, 10_000, 16);
+if (plane.keyCap !== 16) throw new Error('keyCap not reported');
 
 function vec(i) {
 	const v = new Float32Array(dims);
@@ -15,38 +16,59 @@ function vec(i) {
 	return v;
 }
 
+// keys: short ones fit the 16-byte inline capacity, every 100th overflows to the arena
+const keyFor = (i) => (i % 100 === 0 ? `record-${i}-with-a-long-key-that-overflows-the-slot` : `r${i}`);
 const ids = [];
-for (let i = 0; i < 2000; i++) ids.push(plane.insert(vec(i)));
+for (let i = 0; i < 2000; i++) ids.push(plane.insert(vec(i), Buffer.from(keyFor(i))));
 console.log('inserted 2000, highWater =', plane.idHighWater());
+const keyAt = (hits, i) => hits.keys.subarray(i === 0 ? 0 : hits.keyEnds[i - 1], hits.keyEnds[i]).toString();
 
 // async search: nearest neighbor of an inserted vector is itself (distance ~0)
 const hits = await plane.search(vec(42), 5, 128);
-console.log('top hit:', hits[0]);
-if (hits[0].distance > 1e-3) throw new Error('self-query failed');
+console.log('top hit:', hits.ids[0], hits.distances[0], keyAt(hits, 0));
+if (!(hits.ids instanceof Uint32Array) || !(hits.distances instanceof Float32Array)) throw new Error('hits are not typed arrays');
+if (hits.distances[0] > 1e-3) throw new Error('self-query failed');
+if (hits.keyEnds.length !== hits.ids.length) throw new Error('keyEnds must parallel ids');
+for (let i = 0; i < hits.ids.length; i++) {
+	const idx = ids.indexOf(hits.ids[i]);
+	if (keyAt(hits, i) !== keyFor(idx)) throw new Error(`key mismatch for id ${hits.ids[i]}: ${keyAt(hits, i)}`);
+}
+const long = await plane.search(vec(100), 3, 128);
+if (![...long.ids].some((id, i) => keyAt(long, i) === keyFor(100))) throw new Error('overflow key not returned');
 
 // filtered search: allow only even ids
 const bitset = new Uint8Array(Math.ceil(plane.idHighWater() / 8));
 for (const id of ids) if (id % 2 === 0) bitset[id >> 3] |= 1 << (id & 7);
 const filtered = await plane.search(vec(43), 5, 128, bitset);
-for (const h of filtered) if (h.id % 2 !== 0) throw new Error(`filter leak: id ${h.id}`);
-console.log('filtered top hit:', filtered[0]);
+for (const id of filtered.ids) if (id % 2 !== 0) throw new Error(`filter leak: id ${id}`);
+console.log('filtered top hit:', filtered.ids[0], filtered.distances[0]);
 
 // delete + reinsert reuses the id (the #2182 fix)
 plane.remove(ids[7]);
-const reused = plane.insert(vec(9001));
+const reused = plane.insert(vec(9001), Buffer.from('r9001'));
 if (reused !== ids[7]) throw new Error(`expected id reuse of ${ids[7]}, got ${reused}`);
 console.log('freelist reuse OK, highWater still', plane.idHighWater());
 
 // pipelined JS predicate: admit only ids divisible by 3; verdicts computed on the JS
 // event loop while traversal runs on the libuv pool
 let predicateCalls = 0;
-const pred = await plane.searchWithPredicate(vec(44), 5, 128, (ids) => {
+const pred = await plane.searchWithPredicate(vec(44), 5, 128, (batchIds, keys, keyEnds) => {
 	predicateCalls++;
-	return Uint8Array.from(ids, (id) => (id % 3 === 0 ? 1 : 0));
+	if (!(keys instanceof Uint8Array) || keyEnds.length !== batchIds.length) throw new Error('predicate batch lacks keys');
+	for (let i = 0; i < batchIds.length; i++) {
+		const key = keys.subarray(i === 0 ? 0 : keyEnds[i - 1], keyEnds[i]).toString();
+		const expected = batchIds[i] === reused ? 'r9001' : keyFor(ids.indexOf(batchIds[i]));
+		if (key !== expected) throw new Error(`predicate key mismatch for id ${batchIds[i]}: ${key} vs ${expected}`);
+	}
+	return Uint8Array.from(batchIds, (id) => (id % 3 === 0 ? 1 : 0));
 });
-for (const h of pred) if (h.id % 3 !== 0) throw new Error(`predicate leak: id ${h.id}`);
-if (pred.length === 0) throw new Error('predicate search returned nothing');
-console.log(`predicate top hit: id ${pred[0].id} (calls: ${predicateCalls})`);
+for (const id of pred.ids) if (id % 3 !== 0) throw new Error(`predicate leak: id ${id}`);
+if (pred.ids.length === 0) throw new Error('predicate search returned nothing');
+for (let i = 0; i < pred.ids.length; i++) {
+	const expected = pred.ids[i] === reused ? 'r9001' : keyFor(ids.indexOf(pred.ids[i]));
+	if (keyAt(pred, i) !== expected) throw new Error(`predicated hit key mismatch for id ${pred.ids[i]}: ${keyAt(pred, i)}`);
+}
+console.log(`predicate top hit: id ${pred.ids[0]} (calls: ${predicateCalls})`);
 
 // raw mirroring path (dual-write phase 1): host-allocated ids, full node state per call
 const mirror = Plane.create(join(tmpdir(), `smoke-mirror-${process.pid}.hnsw`), dims, 32, 10_000);
@@ -70,17 +92,17 @@ mirror.writeNodeRaw(10, 1, a.bytes, a.scale, a.invMag, Uint32Array.from([20]), [
 mirror.writeNodeRaw(20, 0, b.bytes, b.scale, b.invMag, Uint32Array.from([10]), null);
 mirror.setEntryPoint(10, 1);
 const mhits = mirror.searchSync(q42, 2, 16);
-if (mhits[0].id !== 10 || mhits[0].distance > 1e-3)
-	throw new Error(`mirror self-query failed: ${JSON.stringify(mhits)}`);
+if (mhits.ids[0] !== 10 || mhits.distances[0] > 1e-3)
+	throw new Error(`mirror self-query failed: ${JSON.stringify([...mhits.ids])}`);
 mirror.clearNode(20);
 const mhits2 = mirror.searchSync(vec(43), 2, 16);
-if (mhits2.some((h) => h.id === 20)) throw new Error('cleared node still returned');
+if (mhits2.ids.includes(20)) throw new Error('cleared node still returned');
 console.log('raw mirroring OK');
 
 plane.flush();
 const reopened = Plane.open(path);
 const hits2 = reopened.searchSync(vec(42), 5, 128);
-if (hits2[0].distance > 1e-3) throw new Error('reopened self-query failed');
+if (hits2.distances[0] > 1e-3) throw new Error('reopened self-query failed');
 console.log('reopen OK');
 
 // invalidation through the caller's own handle: both markers land, the latch survives a

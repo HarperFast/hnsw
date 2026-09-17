@@ -4,12 +4,13 @@
 //! txnlog-anchored replay live in the host application.
 
 use crate::distance::Query;
-use crate::insert::{insert, InsertParams};
-use crate::search::{search_filtered, search_predicated, PredicatePipe, SearchScratch};
+use crate::insert::{insert_with_key, InsertError, InsertParams};
+use crate::search::{gather_keys, search_filtered, search_predicated, PredicatePipe, PredicatedHits, SearchScratch};
+use crate::graph::{KeyError, WriteError};
 use crate::{Graph, PlaneFile};
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode};
-use napi::JsFunction;
+use napi::{JsFunction, JsUnknown, NapiValue};
 use napi_derive::napi;
 use std::sync::{Arc, Mutex};
 
@@ -91,10 +92,69 @@ pub fn stale_path_for(path: String) -> String {
     crate::invalidate::stale_path_for(std::path::Path::new(&path)).to_string_lossy().into_owned()
 }
 
+/// Search results as parallel typed arrays, ascending by distance: hit i is
+/// (ids[i], distances[i], keys[keyEnds[i-1]..keyEnds[i]]) with keyEnds[-1] = 0. `keys` and
+/// `keyEnds` are empty on a plane created without key capacity; a hit whose node vanished
+/// mid-query has an empty key.
 #[napi(object)]
-pub struct SearchHit {
-    pub id: u32,
-    pub distance: f64,
+pub struct SearchHits {
+    pub ids: Uint32Array,
+    pub distances: Float32Array,
+    pub keys: Buffer,
+    pub key_ends: Uint32Array,
+}
+
+type HitsWithKeys = (Vec<(u32, f32)>, Vec<u8>, Vec<u32>);
+
+fn with_keys(graph: &Graph, hits: Vec<(u32, f32)>) -> HitsWithKeys {
+    if graph.file.key_cap == 0 {
+        return (hits, Vec::new(), Vec::new());
+    }
+    let ids: Vec<u32> = hits.iter().map(|&(id, _)| id).collect();
+    let (keys, ends) = gather_keys(graph, &ids);
+    (hits, keys, ends)
+}
+
+fn check_key(graph: &Graph, key: &[u8]) -> Result<()> {
+    graph.check_key(key).map_err(|e| match e {
+        KeyError::NoKeys | KeyError::TooLong => Error::from_reason(format!(
+            "key of {} bytes cannot be stored (plane keyCap = {}, max 65535)",
+            key.len(),
+            graph.file.key_cap
+        )),
+    })
+}
+
+fn write_error(error: WriteError) -> Error {
+    match error {
+        WriteError::Wedged => Error::from_reason("plane slot lock is wedged (unreclaimable holder); rebuild the index"),
+        WriteError::KeyArenaFull => Error::from_reason("plane key arena is full; rebuild the index"),
+    }
+}
+
+fn hits_to_js((hits, keys, ends): HitsWithKeys) -> SearchHits {
+    let mut ids = Vec::with_capacity(hits.len());
+    let mut distances = Vec::with_capacity(hits.len());
+    for (id, d) in hits {
+        ids.push(id);
+        distances.push(d);
+    }
+    SearchHits {
+        ids: Uint32Array::new(ids),
+        distances: Float32Array::new(distances),
+        keys: Buffer::from(keys),
+        key_ends: Uint32Array::new(ends),
+    }
+}
+
+pub struct PredicateBatch {
+    ids: Vec<u32>,
+    keys: Vec<u8>,
+    ends: Vec<u32>,
+}
+
+fn to_unknown<T: ToNapiValue>(env: &Env, value: T) -> Result<JsUnknown> {
+    unsafe { JsUnknown::from_raw(env.raw(), ToNapiValue::to_napi_value(env.raw(), value)?) }
 }
 
 pub struct SearchTask {
@@ -109,8 +169,8 @@ pub struct SearchTask {
 
 #[napi]
 impl Task for SearchTask {
-    type Output = Vec<(u32, f32)>;
-    type JsValue = Vec<SearchHit>;
+    type Output = HitsWithKeys;
+    type JsValue = SearchHits;
 
     fn compute(&mut self) -> Result<Self::Output> {
         let mut scratch = self.pool.take();
@@ -125,11 +185,11 @@ impl Task for SearchTask {
             &mut scratch,
         );
         self.pool.put(scratch);
-        Ok(hits)
+        Ok(with_keys(&self.graph, hits))
     }
 
     fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
-        Ok(output.into_iter().map(|(id, d)| SearchHit { id, distance: d as f64 }).collect())
+        Ok(hits_to_js(output))
     }
 }
 
@@ -139,24 +199,24 @@ pub struct PredicateSearchTask {
     query: Vec<f32>,
     k: usize,
     ef: usize,
-    tsfn: Option<ThreadsafeFunction<Vec<u32>, ErrorStrategy::Fatal>>,
+    tsfn: Option<ThreadsafeFunction<PredicateBatch, ErrorStrategy::Fatal>>,
     visit_budget: u64,
 }
 
 #[napi]
 impl Task for PredicateSearchTask {
-    type Output = Vec<(u32, f32)>;
-    type JsValue = Vec<SearchHit>;
+    type Output = HitsWithKeys;
+    type JsValue = SearchHits;
 
     fn compute(&mut self) -> Result<Self::Output> {
         let tsfn = self.tsfn.take().ok_or_else(|| Error::from_reason("task reused"))?;
         let (tx, rx) = std::sync::mpsc::channel::<(Vec<u32>, Vec<u8>)>();
         let mut pipe = PredicatePipe {
-            dispatch: Box::new(move |ids: Vec<u32>| {
+            dispatch: Box::new(move |ids: Vec<u32>, keys: Vec<u8>, ends: Vec<u32>| {
                 let tx = tx.clone();
                 let ids_echo = ids.clone();
                 let status = tsfn.call_with_return_value(
-                    ids,
+                    PredicateBatch { ids, keys, ends },
                     ThreadsafeFunctionCallMode::NonBlocking,
                     move |ret: Uint8Array| {
                         // predicate errors / env teardown surface as a missing send; the
@@ -174,14 +234,14 @@ impl Task for PredicateSearchTask {
         };
         let mut scratch = self.pool.take();
         let query = Query::new(std::mem::take(&mut self.query));
-        let (hits, _stats) =
+        let (PredicatedHits { hits, keys, key_ends }, _stats) =
             search_predicated(&self.graph, &query, self.k, self.ef, &mut pipe, self.visit_budget, &mut scratch);
         self.pool.put(scratch);
-        Ok(hits)
+        Ok((hits, keys, key_ends))
     }
 
     fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
-        Ok(output.into_iter().map(|(id, d)| SearchHit { id, distance: d as f64 }).collect())
+        Ok(hits_to_js(output))
     }
 }
 
@@ -217,11 +277,28 @@ pub struct Plane {
 #[napi]
 impl Plane {
     /// Create a new plane file. `maxNodes` bounds the sparse reservation (pages materialize
-    /// on write).
+    /// on write). `keyCap` (default 0) is the inline key capacity per slot; longer keys spill
+    /// to an overflow arena of `keyArenaBytesPerNode` bytes per node (default
+    /// max(128, 4 x keyCap); sparse, so size it for the keys that will spill).
     #[napi(factory)]
-    pub fn create(path: String, dims: u32, layer0_cap: u32, max_nodes: f64) -> Result<Plane> {
-        let file = PlaneFile::create(std::path::Path::new(&path), dims as usize, layer0_cap as usize, max_nodes as u64)
-            .map_err(|e| Error::from_reason(e.to_string()))?;
+    pub fn create(
+        path: String,
+        dims: u32,
+        layer0_cap: u32,
+        max_nodes: f64,
+        key_cap: Option<u32>,
+        key_arena_bytes_per_node: Option<u32>,
+    ) -> Result<Plane> {
+        let key_cap = key_cap.unwrap_or(0) as usize;
+        let file = PlaneFile::create_with_key_arena(
+            std::path::Path::new(&path),
+            dims as usize,
+            layer0_cap as usize,
+            max_nodes as u64,
+            key_cap,
+            key_arena_bytes_per_node.unwrap_or_else(|| crate::format::default_key_arena_per_node(key_cap)),
+        )
+        .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(Self::wrap(file))
     }
 
@@ -241,10 +318,12 @@ impl Plane {
         }
     }
 
-    /// Insert a vector; returns the allocated node id (freelist ids are reused). Throws on
-    /// a dimension mismatch or a full plane (maxNodes reached).
+    /// Insert a vector; returns the allocated node id (freelist ids are reused). `key` is
+    /// the host's key bytes, returned verbatim with every hit (requires a `keyCap` at create).
+    /// Throws on a dimension mismatch, a full plane (maxNodes reached), an exhausted key
+    /// arena, or a key the plane cannot store.
     #[napi]
-    pub fn insert(&self, vector: Float32Array) -> Result<u32> {
+    pub fn insert(&self, vector: Float32Array, key: Option<Buffer>) -> Result<u32> {
         if vector.len() != self.graph.file.dims {
             return Err(Error::from_reason(format!(
                 "vector has {} dims; plane was created with {}",
@@ -260,11 +339,16 @@ impl Plane {
             }
         }
         let mut scratch = self.insert_scratch.lock().unwrap();
-        insert(&self.graph, &vector, &self.params, &mut scratch).map_err(|e| match e {
-            crate::insert::InsertError::Full => Error::from_reason("plane is full (maxNodes reached)"),
-            crate::insert::InsertError::Wedged => {
-                Error::from_reason("plane slot lock is wedged (unreclaimable holder); rebuild the index")
-            }
+        let key = key.as_deref().unwrap_or(&[]);
+        insert_with_key(&self.graph, &vector, key, &self.params, &mut scratch).map_err(|e| match e {
+            InsertError::Full => Error::from_reason("plane is full (maxNodes reached)"),
+            InsertError::Wedged => Error::from_reason("plane slot lock is wedged (unreclaimable holder); rebuild the index"),
+            InsertError::KeyArenaFull => Error::from_reason("plane key arena is full; rebuild the index"),
+            InsertError::KeyUnstorable => Error::from_reason(format!(
+                "key of {} bytes cannot be stored (plane keyCap = {}, max 65535)",
+                key.len(),
+                self.graph.file.key_cap
+            )),
         })
     }
 
@@ -280,8 +364,10 @@ impl Plane {
     /// Mirror a host-maintained node into the plane (dual-write phase 1): full node state
     /// per call, host-allocated id, int8 vector bin + quantization scale + cached 1/|v|,
     /// layer-0 neighbor ids, and per-upper-level neighbor id arrays (level 1 first). An
-    /// existing upper entry is rewritten in place. Idempotent per (id, state).
+    /// existing upper entry is rewritten in place. Idempotent per (id, state). `key` is
+    /// the host's key bytes, as for `insert`; omitted, the stored key is kept.
     #[napi]
+    #[allow(clippy::too_many_arguments)]
     pub fn write_node_raw(
         &self,
         id: u32,
@@ -291,6 +377,7 @@ impl Plane {
         inv_mag: f64,
         neighbors: Uint32Array,
         upper: Option<Vec<Uint32Array>>,
+        key: Option<Buffer>,
     ) -> Result<()> {
         if vector.len() != self.graph.file.dims {
             return Err(Error::from_reason(format!(
@@ -329,9 +416,11 @@ impl Plane {
                 }
             }
         }
+        let key = key.as_deref();
+        check_key(&self.graph, key.unwrap_or(&[]))?;
         self.graph
-            .write_node_raw(id, level, vec_i8, scale as f32, inv_mag as f32, &neighbors.to_vec(), &upper_levels)
-            .map_err(|_| Error::from_reason("plane slot lock is wedged (unreclaimable holder); rebuild the index"))
+            .write_node_raw_with_key(id, level, vec_i8, scale as f32, inv_mag as f32, &neighbors.to_vec(), &upper_levels, key)
+            .map_err(write_error)
     }
 
     /// Builder-scan variant of writeNodeRaw: writes ONLY when the slot has never been
@@ -350,6 +439,7 @@ impl Plane {
         inv_mag: f64,
         neighbors: Uint32Array,
         upper: Option<Vec<Uint32Array>>,
+        key: Option<Buffer>,
     ) -> Result<bool> {
         if vector.len() != self.graph.file.dims {
             return Err(Error::from_reason(format!(
@@ -384,9 +474,11 @@ impl Plane {
         l0.truncate(self.graph.file.layer0_cap);
         // the untouched check and the write share one seqlock acquisition inside the crate:
         // a live mirror's newer write can never be overwritten by this scan's older snapshot
+        let key = key.as_deref();
+        check_key(&self.graph, key.unwrap_or(&[]))?;
         self.graph
-            .write_node_if_untouched(id, level, vec_i8, scale as f32, inv_mag as f32, &l0, &upper_levels)
-            .map_err(|_| Error::from_reason("plane slot lock is wedged (unreclaimable holder); rebuild the index"))
+            .write_node_if_untouched(id, level, vec_i8, scale as f32, inv_mag as f32, &l0, &upper_levels, key)
+            .map_err(write_error)
     }
 
     /// Advisory: whether the file recorded a durability barrier (flush) as its last state
@@ -441,6 +533,11 @@ impl Plane {
     }
 
     #[napi(getter)]
+    pub fn key_cap(&self) -> u32 {
+        self.graph.file.key_cap as u32
+    }
+
+    #[napi(getter)]
     pub fn dims(&self) -> u32 {
         self.graph.file.dims as u32
     }
@@ -453,7 +550,7 @@ impl Plane {
     /// Async k-NN search on the libuv thread pool. `filter` is an optional allow-bitset
     /// over node ids (bit i of byte i>>3); filtered searches are visit-bounded by
     /// ef * filterExpansion (default 24).
-    #[napi(ts_return_type = "Promise<Array<SearchHit>>")]
+    #[napi(ts_return_type = "Promise<SearchHits>")]
     pub fn search(
         &self,
         vector: Float32Array,
@@ -474,29 +571,34 @@ impl Plane {
         }))
     }
 
-    /// Async k-NN search with a JS predicate: `predicate(ids: number[]) => Uint8Array`
-    /// (one 0/1 byte per id, evaluated synchronously). Batches of candidate ids stream to
+    /// Async k-NN search with a JS predicate: `predicate(ids: number[], keys: Buffer,
+    /// keyEnds: Uint32Array) => Uint8Array` (one 0/1 byte per id, evaluated synchronously). Batches of candidate ids stream to
     /// the predicate over a ThreadsafeFunction while traversal keeps expanding — the search
     /// thread never blocks on the JS event loop until the beam itself is done, so a busy
     /// loop costs speculative overshoot (bounded by the visit budget), not latency.
     /// `visitBudget` caps layer-0 visits absolutely (a host budget may sit below ef, which a
     /// multiplier cannot express); when absent the budget is ef * filterExpansion.
     /// Must not be awaited synchronously from code the predicate itself blocks.
-    #[napi(ts_return_type = "Promise<Array<SearchHit>>")]
+    #[napi(ts_return_type = "Promise<SearchHits>")]
     pub fn search_with_predicate(
         &self,
         vector: Float32Array,
         k: u32,
         ef: u32,
-        #[napi(ts_arg_type = "(ids: Array<number>) => Uint8Array")] predicate: JsFunction,
+        #[napi(ts_arg_type = "(ids: Array<number>, keys: Buffer, keyEnds: Uint32Array) => Uint8Array")] predicate: JsFunction,
         filter_expansion: Option<u32>,
         visit_budget: Option<f64>,
     ) -> Result<AsyncTask<PredicateSearchTask>> {
         self.check_query_dims(vector.len())?;
-        let tsfn: ThreadsafeFunction<Vec<u32>, ErrorStrategy::Fatal> = predicate
-            .create_threadsafe_function(0, |ctx: napi::threadsafe_function::ThreadSafeCallContext<Vec<u32>>| {
-                let ids: Vec<f64> = ctx.value.iter().map(|&v| v as f64).collect();
-                Ok(vec![ids])
+        let tsfn: ThreadsafeFunction<PredicateBatch, ErrorStrategy::Fatal> = predicate
+            .create_threadsafe_function(0, |ctx: napi::threadsafe_function::ThreadSafeCallContext<PredicateBatch>| {
+                let PredicateBatch { ids, keys, ends } = ctx.value;
+                let ids: Vec<f64> = ids.iter().map(|&v| v as f64).collect();
+                Ok(vec![
+                    to_unknown(&ctx.env, ids)?,
+                    to_unknown(&ctx.env, Buffer::from(keys))?,
+                    to_unknown(&ctx.env, Uint32Array::new(ends))?,
+                ])
             })?;
         let ef = ef as usize;
         Ok(AsyncTask::new(PredicateSearchTask {
@@ -514,13 +616,13 @@ impl Plane {
 
     /// Synchronous search (benchmarks/tests; blocks the calling thread).
     #[napi]
-    pub fn search_sync(&self, vector: Float32Array, k: u32, ef: u32) -> Result<Vec<SearchHit>> {
+    pub fn search_sync(&self, vector: Float32Array, k: u32, ef: u32) -> Result<SearchHits> {
         self.check_query_dims(vector.len())?;
         let mut scratch = self.pool.take();
         let query = Query::new(vector.to_vec());
         let (hits, _) = search_filtered(&self.graph, &query, k as usize, ef as usize, None, 24, &mut scratch);
         self.pool.put(scratch);
-        Ok(hits.into_iter().map(|(id, d)| SearchHit { id, distance: d as f64 }).collect())
+        Ok(hits_to_js(with_keys(&self.graph, hits)))
     }
 
     /// Lifetime id high-water (allocated ids, including freed ones awaiting reuse).

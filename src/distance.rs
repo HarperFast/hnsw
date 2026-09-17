@@ -8,18 +8,29 @@
 pub struct Query {
     pub vector: Vec<f32>,
     pub inv_mag: f32,
+    kernel: unsafe fn(&[f32], *const i8) -> f32,
 }
 
 impl Query {
     pub fn new(vector: Vec<f32>) -> Self {
         let mag_sq: f32 = vector.iter().map(|v| v * v).sum();
         let inv_mag = 1.0 / mag_sq.sqrt().max(f32::MIN_POSITIVE);
-        Query { vector, inv_mag }
+        Query { vector, inv_mag, kernel: select_dot_f32_i8() }
     }
 }
 
+fn select_dot_f32_i8() -> unsafe fn(&[f32], *const i8) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+            return dot_f32_i8_avx2;
+        }
+    }
+    dot_f32_i8_scalar
+}
+
 #[inline]
-fn dot_f32_i8_scalar(q: &[f32], v: *const i8) -> f32 {
+unsafe fn dot_f32_i8_scalar(q: &[f32], v: *const i8) -> f32 {
     let mut acc = [0.0f32; 8];
     let chunks = q.len() / 8;
     for c in 0..chunks {
@@ -61,22 +72,11 @@ unsafe fn dot_f32_i8_avx2(q: &[f32], v: *const i8) -> f32 {
     dot
 }
 
-#[inline]
-fn dot_f32_i8(q: &[f32], v: *const i8) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
-            return unsafe { dot_f32_i8_avx2(q, v) };
-        }
-    }
-    dot_f32_i8_scalar(q, v)
-}
-
 /// Cosine distance: f32 query × raw int8 vector at `stored` (dims = query.vector.len()).
 /// Zero-copy: `stored` points into the mmap; the caller's seqlock read discards torn results.
 #[inline]
 pub fn cosine_int8_raw(query: &Query, stored: *const i8, scale: f32, stored_inv_mag: f32) -> f32 {
-    let dot = dot_f32_i8(&query.vector, stored);
+    let dot = unsafe { (query.kernel)(&query.vector, stored) };
     1.0 - dot * scale * stored_inv_mag * query.inv_mag
 }
 

@@ -6,8 +6,9 @@
 
 use crate::distance::{cosine_i8_i8_raw, cosine_int8_raw, Query};
 use crate::format::{
-    neighbor_offset, PlaneFile, FLAG_DELETED, FLAG_VALID, MAX_UPPER_LEVELS, NO_UPPER, S_DEGREE, S_FLAGS, S_INV_MAG,
-    S_LEVEL, S_SCALE, S_UPPER_IDX, S_VECTOR, UPPER_CAP, UPPER_LEVEL_STRIDE, UL_DEGREE, UL_IDS, U_LEVELS, U_LISTS,
+    key_class, key_offset, neighbor_offset, PlaneFile, FLAG_DELETED, FLAG_VALID, KEY_PAYLOAD, MAX_KEY_LEN, MAX_UPPER_LEVELS, NO_UPPER,
+    S_DEGREE, S_FLAGS, S_INV_MAG, S_LEVEL, S_SCALE, S_UPPER_IDX, S_VECTOR, UPPER_CAP, UPPER_LEVEL_STRIDE, UL_DEGREE,
+    UL_IDS, U_LEVELS, U_LISTS,
 };
 use crate::seqlock;
 use crate::seqlock::Wedged;
@@ -27,6 +28,33 @@ unsafe fn vread<T: Copy>(p: *const T) -> T {
     p.read_volatile()
 }
 
+const PREFETCH_BYTES: usize = 256;
+
+#[inline(always)]
+fn prefetch_line(p: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        _mm_prefetch(p as *const i8, _MM_HINT_T0);
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, preserves_flags, readonly));
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = p;
+}
+
+/// Byte copy through volatile loads: key bytes are read inside a seqlock section that a
+/// writer may be rewriting, like every other slot field read here.
+#[inline]
+unsafe fn copy_volatile(out: &mut Vec<u8>, src: *const u8, len: usize) {
+    out.reserve(len);
+    for i in 0..len {
+        out.push(src.add(i).read_volatile());
+    }
+}
+
 pub struct Graph {
     pub file: PlaneFile,
     /// Rotates `probe_for_entry`'s starting offset so this plane's consecutive repairs sample
@@ -43,6 +71,26 @@ pub struct Graph {
     /// One repair probe at a time per handle: concurrent searches on the pool would each pay
     /// the full walk before one of them publishes.
     probe_in_flight: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyError {
+    NoKeys,
+    TooLong,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteError {
+    /// a slot lock could not be acquired or reclaimed within the wedge bound
+    Wedged,
+    /// the key overflow arena is exhausted (only a rebuild recovers the space)
+    KeyArenaFull,
+}
+
+impl From<Wedged> for WriteError {
+    fn from(_: Wedged) -> Self {
+        WriteError::Wedged
+    }
 }
 
 /// A consistent full copy of one node (construction paths only; search uses zero-copy).
@@ -85,6 +133,10 @@ impl Graph {
             // a dead writer's slot may hold a garbage (or zero-initialized) upper index; a
             // later raw rewrite would reuse it and clobber another node's hierarchy
             (p.add(S_UPPER_IDX) as *mut u32).write_unaligned(NO_UPPER);
+            // and a half-written overflow record: a zero length is never reused
+            if self.file.key_cap > 0 {
+                (p.add(key_offset(self.file.dims, self.file.layer0_cap)) as *mut u16).write_unaligned(0);
+            }
             *p.add(S_FLAGS) = FLAG_DELETED;
         }
     }
@@ -96,6 +148,125 @@ impl Graph {
     /// Sanitizer for an upper-entry lock taken over from a dead writer.
     fn upper_sanitizer(&self, idx: u32) -> impl Fn() + '_ {
         move || unsafe { *self.file.upper_ptr_mut(idx).add(U_LEVELS) = 0 }
+    }
+
+    /// Whether `key` can be stored on this plane at all (capacity is checked at write time).
+    pub fn check_key(&self, key: &[u8]) -> Result<(), KeyError> {
+        if key.is_empty() {
+            return Ok(());
+        }
+        if self.file.key_cap == 0 {
+            return Err(KeyError::NoKeys);
+        }
+        if key.len() > MAX_KEY_LEN {
+            return Err(KeyError::TooLong);
+        }
+        Ok(())
+    }
+
+    /// Store `key` in the slot at `p` (caller holds the slot lock; `check_key` passed): the
+    /// u16 length, then the inline bytes or the arena offset (u32 lo, u32 hi). A range is
+    /// reserved at `key_class(len)`, so its capacity follows from the stored length; an
+    /// overflow key reuses the slot's range while it fits that class — safe under the lock,
+    /// since a reader validates the generation after copying the bytes — so only growth past
+    /// the class allocates, and a key that shrinks to inline (or below its class) releases the
+    /// range. A record torn by a dead writer is never reused: the lock takeover sanitizer
+    /// zeroes the length. `None` leaves the stored key untouched.
+    unsafe fn store_key_locked(&self, p: *mut u8, key: Option<&[u8]>) -> Result<(), WriteError> {
+        let Some(key) = key else { return Ok(()) };
+        if self.file.key_cap == 0 {
+            return Ok(());
+        }
+        let kp = p.add(key_offset(self.file.dims, self.file.layer0_cap));
+        let payload = kp.add(KEY_PAYLOAD);
+        if key.len() <= self.file.key_cap {
+            (kp as *mut u16).write_unaligned((key.len() as u16).to_le());
+            std::ptr::copy_nonoverlapping(key.as_ptr(), payload, key.len());
+            return Ok(());
+        }
+        let old_len = u16::from_le((kp as *const u16).read_unaligned()) as usize;
+        let mut reused = None;
+        if old_len > self.file.key_cap && *p.add(S_FLAGS) != 0 && key_class(old_len) >= key.len() {
+            let lo = u32::from_le((payload as *const u32).read_unaligned()) as u64;
+            let hi = u32::from_le((payload.add(4) as *const u32).read_unaligned()) as u64;
+            let existing = lo | (hi << 32);
+            // file-sourced: a range that does not fit the arena is not reused
+            let end = existing.checked_add(key_class(old_len) as u64);
+            if end.is_some_and(|end| end <= self.file.key_arena_len) {
+                reused = Some(existing);
+            }
+        }
+        let offset = match reused {
+            Some(offset) => offset,
+            None => self.file.allocate_key_bytes(key_class(key.len())).ok_or(WriteError::KeyArenaFull)?,
+        };
+        std::ptr::copy_nonoverlapping(key.as_ptr(), self.file.key_arena_ptr_mut(offset), key.len());
+        (payload as *mut u32).write_unaligned((offset as u32).to_le());
+        (payload.add(4) as *mut u32).write_unaligned(((offset >> 32) as u32).to_le());
+        (kp as *mut u16).write_unaligned((key.len() as u16).to_le());
+        Ok(())
+    }
+
+    /// Copy the host key of `id` into `out` (cleared first). None for absent/deleted nodes;
+    /// Some with an empty `out` for a node stored without a key.
+    pub fn key_into(&self, id: u32, out: &mut Vec<u8>) -> Option<()> {
+        out.clear();
+        if !self.in_range(id) {
+            return None;
+        }
+        let key_cap = self.file.key_cap;
+        if key_cap == 0 {
+            return self.node_alive(id).then_some(());
+        }
+        let koff = key_offset(self.file.dims, self.file.layer0_cap);
+        let arena_len = self.file.key_arena_len;
+        let seq = self.file.seq_atomic(id);
+        seqlock::read_consistent(seq, self.file.self_tag, || {
+            out.clear();
+            let p = self.file.slot_ptr(id);
+            unsafe {
+                let flags = vread(p.add(S_FLAGS));
+                if flags & FLAG_VALID == 0 || flags & FLAG_DELETED != 0 {
+                    return None;
+                }
+                let len = u16::from_le(vread(p.add(koff) as *const u16)) as usize;
+                let payload = p.add(koff + KEY_PAYLOAD);
+                if len <= key_cap {
+                    copy_volatile(out, payload, len);
+                } else {
+                    let lo = u32::from_le(vread(payload as *const u32)) as u64;
+                    let hi = u32::from_le(vread(payload.add(4) as *const u32)) as u64;
+                    let offset = lo | (hi << 32);
+                    // file-sourced offset: a corrupt one reads as "no key" rather than off the map
+                    if offset.checked_add(len as u64).is_some_and(|end| end <= arena_len) {
+                        copy_volatile(out, self.file.key_arena_ptr(offset), len);
+                    }
+                }
+                Some(())
+            }
+        }, self.slot_sanitizer(id), || None, self.owner_dead())
+    }
+
+    #[inline]
+    fn node_alive(&self, id: u32) -> bool {
+        let seq = self.file.seq_atomic(id);
+        seqlock::read_consistent(seq, self.file.self_tag, || unsafe { vread(self.file.slot_ptr(id).add(S_FLAGS)) == FLAG_VALID }, self.slot_sanitizer(id), || false, self.owner_dead())
+    }
+
+    /// Hint the cache lines `distance_to(id)` will read, so a whole adjacency list's misses
+    /// overlap instead of being taken one at a time.
+    #[inline]
+    pub fn prefetch_slot(&self, id: u32) {
+        debug_assert!((id as u64) < self.file.max_nodes);
+        let p = self.file.slot_ptr(id);
+        // the header and first vector lines cover a 128-d slot entirely; wider vectors get
+        // their leading lines, enough to overlap the miss without flooding L1 on hub nodes
+        let end = (S_VECTOR + self.file.dims).min(PREFETCH_BYTES);
+        let mut off = 0;
+        while off < end {
+            prefetch_line(unsafe { p.add(off) });
+            off += 64;
+        }
     }
 
     /// Zero-copy distance from `query` to the stored vector of `id`. None for absent/deleted.
@@ -312,7 +483,7 @@ impl Graph {
 
     /// Mirror a host-maintained node into the plane: full state per call, host-allocated id
     /// (high-water is raised, the plane allocator is bypassed), upper entry reused in place
-    /// when present. This is the dual-write phase-1 write path.
+    /// when present. This is the dual-write phase-1 write path; the stored key is kept.
     pub fn write_node_raw(
         &self,
         id: u32,
@@ -322,7 +493,24 @@ impl Graph {
         inv_mag: f32,
         neighbors: &[u32],
         upper_levels: &[Vec<u32>],
-    ) -> Result<(), Wedged> {
+    ) -> Result<(), WriteError> {
+        self.write_node_raw_with_key(id, level, vector, scale, inv_mag, neighbors, upper_levels, None)
+    }
+
+    /// `write_node_raw` carrying the host's key bytes (`check_key` must have passed), or None
+    /// to keep the stored key.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_node_raw_with_key(
+        &self,
+        id: u32,
+        level: u8,
+        vector: &[i8],
+        scale: f32,
+        inv_mag: f32,
+        neighbors: &[u32],
+        upper_levels: &[Vec<u32>],
+        key: Option<&[u8]>,
+    ) -> Result<(), WriteError> {
         self.file.ensure_high_water(id);
         let existing = match self.upper_idx_locked(id)? {
             idx if idx != NO_UPPER && (idx as u64) >= self.file.upper_capacity => NO_UPPER, // corrupt stored index
@@ -349,9 +537,9 @@ impl Graph {
         };
         let mut l0 = neighbors.to_vec();
         l0.truncate(self.file.layer0_cap);
-        if let Err(wedged) = self.write_node(id, level, vector, scale, inv_mag, &l0, upper_idx) {
+        if let Err(error) = self.write_node(id, level, vector, scale, inv_mag, &l0, upper_idx, key) {
             self.file.free_upper(fresh); // unreachable from any slot until publication succeeds
-            return Err(wedged);
+            return Err(error);
         }
         Ok(())
     }
@@ -439,8 +627,11 @@ impl Graph {
     }
 
     /// Write a full slot under its seqlock. `neighbors` is pruned to layer0_cap by the
-    /// caller; `upper_idx` is a write_upper() result (NO_UPPER for level-0 nodes).
-    pub fn write_node(&self, id: u32, level: u8, vector: &[i8], scale: f32, inv_mag: f32, neighbors: &[u32], upper_idx: u32) -> Result<(), Wedged> {
+    /// caller; `upper_idx` is a write_upper() result (NO_UPPER for level-0 nodes); `key` is
+    /// the host's key bytes (`check_key` passed; ignored on a plane without key capacity), or
+    /// None to keep the key the slot already holds.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_node(&self, id: u32, level: u8, vector: &[i8], scale: f32, inv_mag: f32, neighbors: &[u32], upper_idx: u32, key: Option<&[u8]>) -> Result<(), WriteError> {
         debug_assert!(neighbors.len() <= self.file.layer0_cap);
         debug_assert_eq!(vector.len(), self.file.dims);
         let seq = self.file.seq_atomic(id);
@@ -448,6 +639,8 @@ impl Graph {
         let p = self.file.slot_ptr_mut(id);
         let dims = self.file.dims;
         unsafe {
+            // key first: an exhausted arena leaves the slot's previous state intact
+            self.store_key_locked(p, key)?;
             *p.add(S_LEVEL) = level;
             (p.add(S_DEGREE) as *mut u16).write_unaligned((neighbors.len() as u16).to_le());
             (p.add(S_SCALE) as *mut f32).write_unaligned(scale);
@@ -741,7 +934,8 @@ impl Graph {
         inv_mag: f32,
         neighbors: &[u32],
         upper_levels: &[Vec<u32>],
-    ) -> Result<bool, Wedged> {
+        key: Option<&[u8]>,
+    ) -> Result<bool, WriteError> {
         debug_assert!(neighbors.len() <= self.file.layer0_cap);
         debug_assert_eq!(vector.len(), self.file.dims);
         self.file.ensure_high_water(id);
@@ -756,7 +950,7 @@ impl Graph {
                 Ok(guard) => guard,
                 Err(wedged) => {
                     self.file.free_upper(upper_idx);
-                    return Err(wedged);
+                    return Err(wedged.into());
                 }
             };
             let p = self.file.slot_ptr_mut(id);
@@ -765,6 +959,10 @@ impl Graph {
                 if *p.add(S_FLAGS) != 0 {
                     false
                 } else {
+                    if let Err(error) = self.store_key_locked(p, key) {
+                        self.file.free_upper(upper_idx);
+                        return Err(error);
+                    }
                     *p.add(S_LEVEL) = level;
                     (p.add(S_DEGREE) as *mut u16).write_unaligned((neighbors.len() as u16).to_le());
                     (p.add(S_SCALE) as *mut f32).write_unaligned(scale);

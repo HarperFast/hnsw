@@ -126,6 +126,29 @@ level > 0, and upper layers hold neighbor id lists only (vectors live in the mai
 entry: `node_id, level, [degree, ids × upper_cap] × level`. Kept fully resident; a few hundred
 MB at 100M nodes.
 
+**Host keys (format v8).** Each slot ends with the host's key for the node: a `u16` length,
+a pad to 4 bytes, then `key_cap` bytes (`key_cap` is a create-time header field; 0 = no keys).
+A key that fits is stored inline; a longer one is copied into a **key overflow arena** after the
+upper region (sparse; `key_arena_bytes_per_node` at create, default max(128, 4 × key_cap); CAS bump
+allocation) and the payload holds its offset as two
+aligned `u32` halves (every field read on the search path stays a naturally aligned volatile
+load). The key is stored under the slot's write lock, first, so an exhausted arena leaves the
+slot's previous state intact. Ranges are reserved in 64-byte classes, so a range's capacity
+follows from the key length stored with it and no separate capacity word can be torn away from
+the offset by a kill mid-write; a rewrite reuses the range while the key fits that class, so only
+growth past it allocates. Ranges of deleted or outgrown keys, and of keys that shrank below
+their class, are not reclaimed until a rebuild; a record torn by a dead writer is never reused
+(the lock takeover zeroes its length). `key_cap` is at least 8, the size of the offset. Raw
+mirroring without a key keeps the stored one. Searches and predicate batches return the keys with the hits, so the host
+resolves a hit to its record without a lookup by node id: in Harper that lookup was one RocksDB
+read per candidate, about half the per-query CPU once traversal went native. For 128-d/768-d
+int8 slots at cap 128 a 40-byte inline key fits inside the existing 64 B padding (704 B / 1,344 B
+slots, unchanged). A key read happens under the slot's seqlock at result time; a slot deleted or
+reused since the traversal yields an empty key (host skips) or the new occupant's key (the
+host's exact rescore drops it), the same relaxed contract as the mapping race it replaces. A
+predicated search returns each admitted hit with the key its predicate batch carried, so the
+verdict and the returned key always describe the same record.
+
 **Degree cap decision.** Today layer-0 caps at `M<<1` then `<<2` under `optimizeRouting` = 128,
 with transient overshoot to 160 before pruning; measured mean degree is ~37. Sizing slots at
 cap 128 doubles the file for a tail. v1 policy: **hard prune-to-cap-64 on write** — the insert
@@ -200,7 +223,7 @@ per-row path).
 
 ```ts
 // one crossing per query; executes on the module's own thread pool
-search(sliceHandles, queryVector: Float32Array, k, ef, filter?): Promise<{ids, distances}>
+search(sliceHandles, queryVector: Float32Array, k, ef, filter?): Promise<{ids, distances, keys, keyEnds}>
 ```
 
 - Asymmetric distance as today: float query × int8 stored, cached invMag, SIMD (AVX2/VNNI on

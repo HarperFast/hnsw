@@ -6,7 +6,7 @@
 
 use crate::distance::{quantize_int8, Query};
 use crate::format::{NO_ID, NO_UPPER};
-use crate::graph::Graph;
+use crate::graph::{Graph, KeyError, WriteError};
 use crate::search::{beam_descend, search_layer, SearchScratch, SearchStats, DESCENT_EF};
 
 pub struct InsertParams {
@@ -156,20 +156,62 @@ pub enum InsertError {
     Full,
     /// a slot lock could not be acquired or reclaimed within the wedge bound
     Wedged,
+    /// the key overflow arena is exhausted; only a rebuild recovers the space
+    KeyArenaFull,
+    /// the key exceeds the format's u16 length, or the plane has no key capacity
+    KeyUnstorable,
 }
 
-/// Insert a vector, returning its node id.
+fn write_error(error: WriteError) -> InsertError {
+    match error {
+        WriteError::Wedged => InsertError::Wedged,
+        WriteError::KeyArenaFull => InsertError::KeyArenaFull,
+    }
+}
+
 pub fn insert(
     graph: &Graph,
     vector: &[f32],
     params: &InsertParams,
     scratch: &mut SearchScratch,
 ) -> Result<u32, InsertError> {
+    insert_with_key(graph, vector, &[], params, scratch)
+}
+
+/// Insert a vector carrying the host's key bytes (returned verbatim by searches), so a hit
+/// resolves to the host's record without a side lookup by node id.
+pub fn insert_with_key(
+    graph: &Graph,
+    vector: &[f32],
+    key: &[u8],
+    params: &InsertParams,
+    scratch: &mut SearchScratch,
+) -> Result<u32, InsertError> {
+    graph.check_key(key).map_err(|e| match e {
+        KeyError::NoKeys | KeyError::TooLong => InsertError::KeyUnstorable,
+    })?;
+    // best-effort: an arena that cannot hold the key is refused before any neighbor edge is
+    // touched, since an abandoned insert cannot restore the edges its selection removed
+    if key.len() > graph.file.key_cap && !graph.file.key_arena_has_room(key.len()) {
+        return Err(InsertError::KeyArenaFull);
+    }
     let (bytes, scale, inv_mag) = quantize_int8(vector);
     let id = graph.file.allocate_id();
     if id == NO_ID {
         return Err(InsertError::Full);
     }
+    // `slot_upper` is the entry the published slot names (freed with it); a fresh one is freed here
+    let abandon = |published: bool, upper: u32, slot_upper: u32| {
+        if published {
+            let _ = graph.delete_node(id);
+            if upper != slot_upper {
+                graph.file.free_upper(upper);
+            }
+        } else {
+            graph.file.free_upper(upper);
+            graph.file.free_id(id);
+        }
+    };
     let level = level_for(id, params.ml);
     let query = Query::new(vector.to_vec());
     let layer0_cap = graph.file.layer0_cap;
@@ -187,7 +229,10 @@ pub fn insert(
         }
         *published_upper =
             if level > 0 { graph.write_upper(&vec![Vec::new(); level as usize]).unwrap_or(NO_UPPER) } else { NO_UPPER };
-        graph.write_node(id, level, &bytes, scale, inv_mag, &[], *published_upper).map_err(|_| InsertError::Wedged)?;
+        if let Err(error) = graph.write_node(id, level, &bytes, scale, inv_mag, &[], *published_upper, Some(key)) {
+            abandon(false, *published_upper, NO_UPPER);
+            return Err(write_error(error));
+        }
         *published = true;
         Ok(())
     };
@@ -221,11 +266,9 @@ pub fn insert(
     // An unresolvable entry point is an error the host retries: Ok here would report success
     // for a node no search can reach.
     let Some((entry_id, entry_level, entry_dist)) = joined else {
-        if published {
-            // the edgeless node a failed claim left behind is a live-reading slot with no
-            // in-edges: a later re-election or repair probe could root the graph at it
-            let _ = graph.delete_node(id);
-        }
+        // the edgeless node a failed claim left behind is a live-reading slot with no
+        // in-edges: a later re-election or repair probe could root the graph at it
+        abandon(published, NO_UPPER, published_upper);
         return Err(InsertError::Wedged);
     };
     let top = level.min(entry_level as u8);
@@ -330,7 +373,10 @@ pub fn insert(
     };
     let mut l0: Vec<u32> = connections[0].iter().map(|&(nid, _)| nid).collect();
     l0.truncate(layer0_cap);
-    graph.write_node(id, level, &bytes, scale, inv_mag, &l0, upper_idx).map_err(|_| InsertError::Wedged)?;
+    if let Err(error) = graph.write_node(id, level, &bytes, scale, inv_mag, &l0, upper_idx, Some(key)) {
+        abandon(published, upper_idx, published_upper);
+        return Err(write_error(error));
+    }
 
     // Reverse edges.
     for (l, conns) in connections.iter().enumerate() {

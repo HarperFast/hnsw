@@ -53,9 +53,11 @@ macOS and Windows are functional (no lock takeover — bounded degradation inste
 ```js
 const { Plane } = require('@harperfast/hnsw');
 
-const plane = Plane.create('/data/vectors.hnsw', 768, 128, 10_000_000);
-const id = plane.insert(myFloat32Vector);
-const hits = await plane.search(queryVector, 10, 512); // [{ id, distance }, ...]
+// keyCap 40 (min 8): each slot carries up to 40 bytes of the host's key inline (longer keys overflow)
+const plane = Plane.create('/data/vectors.hnsw', 768, 128, 10_000_000, 40);
+const id = plane.insert(myFloat32Vector, Buffer.from(myRecordKey));
+// parallel typed arrays, ascending by distance; hit i's key is keys.subarray(keyEnds[i-1] ?? 0, keyEnds[i])
+const { ids, distances, keys, keyEnds } = await plane.search(queryVector, 10, 512);
 
 // filtered: allow-bitset over node ids
 const allowed = new Uint8Array(Math.ceil(plane.idHighWater() / 8));
@@ -88,7 +90,7 @@ equal recall.
 
 ## Status
 
-Extracted from the Harper vector-index engine; the format (v7) and API are young and may
+Extracted from the Harper vector-index engine; the format (v8) and API are young and may
 change with a version bump + reindex (an older format version fails to open; rebuild). Roadmap: prebuilds, binary-quantized slot format
 (~4× smaller traversal plane), Matryoshka dimension truncation, mremap growth, index
 slicing with native top-k merge.
