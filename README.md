@@ -8,7 +8,7 @@ pressure) or wrap an in-memory C++ index with no durable incremental persistence
 built around a different contract:
 
 - **The file is the index.** One memory-mapped file per index: fixed-size node slots
-  (int8-quantized vector + neighbor ids, page-grouped so slots never straddle page
+  (quantized vector + neighbor ids, page-grouped so slots never straddle page
   boundaries), an in-file upper-layer region, an id freelist, and a durability watermark.
   Reopen is instant — no rebuild, no sidecars.
 - **Search never touches the JS event loop.** Queries run on the libuv thread pool with one
@@ -55,6 +55,8 @@ const { Plane } = require('@harperfast/hnsw');
 
 // keyCap 40 (min 8): each slot carries up to 40 bytes of the host's key inline (longer keys overflow)
 const plane = Plane.create('/data/vectors.hnsw', 768, 128, 10_000_000, 40);
+// ... or with the finer storage precision (see below):
+// const plane = Plane.create('/data/vectors.hnsw', 128, 128, 10_000_000, 40, undefined, 'int16');
 const id = plane.insert(myFloat32Vector, Buffer.from(myRecordKey));
 // parallel typed arrays, ascending by distance; hit i's key is keys.subarray(keyEnds[i-1] ?? 0, keyEnds[i])
 const { ids, distances, keys, keyEnds } = await plane.search(queryVector, 10, 512);
@@ -70,6 +72,20 @@ const predicated = await plane.searchWithPredicate(queryVector, 10, 512, (ids) =
 );
 ```
 
+### Storage precision
+
+Vectors are stored quantized with a per-vector symmetric scale. The default, `'int8'`, maps
+each component to `max|c|/127` — about 0.8% of the vector's largest component per element,
+which is usually close enough to *rank* candidates but not to *score* them, so callers
+typically rerank the returned hits against exact vectors. `'int16'` maps to `max|c|/32767`
+instead: ~256× finer, about 0.003% per element, precise enough to skip that rerank. It costs
+one more byte per dimension per slot — +18% at 128 dims (704 → 832 B), +73% at 1536
+(2112 → 3648 B) — so it suits small-to-mid dimensionality, while int8 stays the right choice
+for wide embeddings, where doubling the bytes each traversal scans pushes search into the
+memory-bound regime. The choice is fixed at create and cannot be changed without a rebuild.
+Int16 planes carry a newer format version, so an older build of this package refuses to open
+one rather than misreading its slot layout; `plane.precision` reports an open plane's codec.
+
 A plane is derived state; when the host must stop maintaining one and cannot delete the file
 (Windows sharing violations while another process maps it), `invalidatePlane(path)` — or
 `plane.invalidateFile()` through a handle the host already holds — durably marks it
@@ -83,14 +99,17 @@ Full API in [index.d.ts](index.d.ts).
 
 `cargo run --release --bin bench -- 1000000 768 100 512 /tmp/bench.hnsw 128 8` builds a 1M ×
 768-d graph on a calibrated Gaussian-mixture corpus, reports p50/p95/p99, per-visit cost,
-brute-force recall\@10, and a concurrent-throughput pass. Numbers from the design work
+brute-force recall\@10, and a concurrent-throughput pass. A ninth argument selects the
+storage precision (`int8`, `int16`, or `both` to build and measure one plane of each), and
+every run prints a kernel microbenchmark first. Numbers from the design work
 (Linux, single box): p50 0.75 ms, 0.33 µs/visit, recall\@10 0.999 — ~9× the wall-clock and
 ~13× the per-visit cost of a well-optimized pure-JS implementation of the same graph at
 equal recall.
 
 ## Status
 
-Extracted from the Harper vector-index engine; the format (v8) and API are young and may
+Extracted from the Harper vector-index engine; the format (v8 for int8 planes, v9 for int16)
+and API are young and may
 change with a version bump + reindex (an older format version fails to open; rebuild). Roadmap: prebuilds, binary-quantized slot format
 (~4× smaller traversal plane), Matryoshka dimension truncation, mremap growth, index
 slicing with native top-k merge.

@@ -66,7 +66,7 @@ fn concurrent_insert_search() {
                 let mut scratch = SearchScratch::new();
                 let mut q = 0u32;
                 while !done.load(Ordering::Relaxed) {
-                    let query = Query::new(vector_for(q % 1000, dims));
+                    let query = graph.query(vector_for(q % 1000, dims));
                     let (results, _) = search(&graph, &query, 10, 64, &mut scratch);
                     // once anything is inserted, results must be non-empty and finite
                     for (_, d) in &results {
@@ -96,7 +96,7 @@ fn concurrent_insert_search() {
     let mut scratch = SearchScratch::new();
     let mut misses = 0;
     for &(index, id) in inserted.iter().step_by(97) {
-        let query = Query::new(vector_for(index, dims));
+        let query = graph.query(vector_for(index, dims));
         let (results, _) = search(&graph, &query, 10, 256, &mut scratch);
         // by ID, not by distance: this corpus is clustered near-duplicates, so a hit at
         // distance ~0 is routinely a DIFFERENT node and would mask an orphaned one
@@ -164,7 +164,7 @@ fn racing_first_inserts_all_stay_reachable() {
 
         let mut scratch = SearchScratch::new();
         for (w, id) in &ids {
-            let (results, _) = search(&graph, &Query::new(axis_vector(*w, dims)), 8, 64, &mut scratch);
+            let (results, _) = search(&graph, &graph.query(axis_vector(*w, dims)), 8, 64, &mut scratch);
             assert!(
                 results.iter().any(|&(rid, _)| rid == *id),
                 "round {round}: writer {w}'s node {id} is unreachable from the entry point (found {results:?})"
@@ -216,7 +216,7 @@ fn a_descent_that_traps_at_a_local_minimum_still_reaches_the_true_neighborhood()
 
         let mut misses = Vec::new();
         for &(index, id) in &inserted {
-            let query = Query::new(vector_for(index, dims));
+            let query = graph.query(vector_for(index, dims));
             let (results, _) = search(&graph, &query, 10, 256, &mut scratch);
             if !results.iter().any(|&(rid, _)| rid == id) {
                 misses.push((index, id));
@@ -302,7 +302,7 @@ fn descent_width_sweep() {
         let misses = inserted
             .iter()
             .filter(|&&(index, id)| {
-                let q = Query::new(vector_for(index, dims));
+                let q = graph.query(vector_for(index, dims));
                 let results = search_at_descent_width(&graph, &q, 10, 256, read_ef, &mut scratch);
                 !results.iter().any(|&(rid, _)| rid == id)
             })
@@ -319,4 +319,66 @@ fn descent_width_sweep() {
         "descent width sweep (build {DESCENT_EF} / read {read_ef}): {total} misses over {seeds} \
 builds of {n}, {bad} builds affected"
     );
+}
+
+/// The same writers-while-readers shape on an int16 plane. Element width is under the seqlock,
+/// not beside it, so a torn 2-byte element must be as discardable as a torn 1-byte one —
+/// smaller than the torture above because the point is the codec, not the scale.
+#[test]
+fn concurrent_insert_search_on_an_int16_plane() {
+    use hnsw_plane::format::Quant;
+    let dims = 64;
+    let path = std::env::temp_dir().join(format!("hnsw-torture16-{}.hnsw", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let file = PlaneFile::create_with_options(&path, dims, 32, 12_000, 0, 0, Quant::Int16).expect("create");
+    let graph = Arc::new(Graph::new(file));
+    let done = Arc::new(AtomicBool::new(false));
+    let (writers, per_writer) = (3u32, 1_000u32);
+
+    let inserted: Vec<(u32, u32)> = std::thread::scope(|s| {
+        let writers_done: Vec<_> = (0..writers)
+            .map(|w| {
+                let graph = graph.clone();
+                s.spawn(move || {
+                    let params = InsertParams::default();
+                    let mut scratch = SearchScratch::new();
+                    (0..per_writer)
+                        .map(|i| {
+                            let index = w * per_writer + i;
+                            (index, insert(&graph, &vector_for(index, dims), &params, &mut scratch).expect("insert"))
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let reader = {
+            let graph = graph.clone();
+            let done = done.clone();
+            s.spawn(move || {
+                let mut scratch = SearchScratch::new();
+                let mut searches = 0u32;
+                while !done.load(Ordering::Relaxed) {
+                    let (hits, _) = search(&graph, &graph.query(vector_for(searches % 500, dims)), 5, 64, &mut scratch);
+                    assert!(hits.iter().all(|(_, d)| d.is_finite()), "a concurrent read produced a non-finite distance");
+                    searches += 1;
+                }
+                searches
+            })
+        };
+        let all: Vec<(u32, u32)> = writers_done.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        done.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+        all
+    });
+
+    let mut scratch = SearchScratch::new();
+    let mut misses = 0;
+    for &(index, id) in inserted.iter().step_by(37) {
+        let (hits, _) = search(&graph, &graph.query(vector_for(index, dims)), 5, 96, &mut scratch);
+        if !hits.iter().any(|&(hid, _)| hid == id) {
+            misses += 1;
+        }
+    }
+    assert_eq!(misses, 0, "every int16-stored vector must be findable as its own nearest neighbor");
+    let _ = std::fs::remove_file(&path);
 }

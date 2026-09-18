@@ -52,7 +52,7 @@ fn dead_writer_lock_is_taken_over_and_slot_sanitized() {
     assert_eq!(graph.file.seq_atomic(7).load(Ordering::SeqCst) >> 31, 0, "takeover unlocks the slot");
     // the graph still searches (node 7 is just missing), and rewriting the slot heals it
     let mut scratch = SearchScratch::new();
-    let (hits, _) = search(&graph, &Query::new(vector_for(3, dims)), 5, 64, &mut scratch);
+    let (hits, _) = search(&graph, &graph.query(vector_for(3, dims)), 5, 64, &mut scratch);
     assert!(!hits.is_empty());
     let q = hnsw_plane::distance::quantize_int8(&vector_for(7, dims));
     graph.write_node_raw(7, 0, &q.0, q.1, q.2, &[3, 4], &[]).unwrap();
@@ -135,11 +135,11 @@ fn deleting_the_entry_point_reelects_and_recovers() {
     let _ = graph.delete_node(entry);
     let (new_entry, _) = graph.file.entry_point();
     assert_ne!(new_entry, entry, "a new entry point must be elected");
-    let (hits, _) = search(&graph, &Query::new(vector_for(3, dims)), 5, 64, &mut scratch);
+    let (hits, _) = search(&graph, &graph.query(vector_for(3, dims)), 5, 64, &mut scratch);
     assert!(!hits.is_empty(), "search must survive entry-point deletion");
     // subsequent inserts must not orphan themselves against the dead entry
     let id = insert(&graph, &vector_for(500, dims), &params, &mut scratch).unwrap();
-    let (hits, _) = search(&graph, &Query::new(vector_for(500, dims)), 5, 128, &mut scratch);
+    let (hits, _) = search(&graph, &graph.query(vector_for(500, dims)), 5, 128, &mut scratch);
     assert!(hits.iter().any(|&(hid, d)| hid == id && d < 1e-3), "post-deletion insert must be reachable");
     let _ = std::fs::remove_file(&path);
 }
@@ -460,7 +460,7 @@ fn a_wedged_upper_cleanup_still_reelects_the_entry_point() {
 
     assert_eq!(graph.file.entry_point().0, 1, "the entry point must be re-elected before the fallible cleanup");
     let mut scratch = SearchScratch::new();
-    let (hits, _) = search(&graph, &Query::new(vector_for(1, dims)), 5, 64, &mut scratch);
+    let (hits, _) = search(&graph, &graph.query(vector_for(1, dims)), 5, 64, &mut scratch);
     assert!(!hits.is_empty(), "searches must keep working after a wedged delete of the entry point");
     let _ = std::fs::remove_file(&path);
 }
@@ -487,7 +487,7 @@ fn search_repairs_an_entry_point_no_writer_will() {
     let (entry, _) = graph.file.entry_point();
     graph.clear_node(entry).expect("tombstone the entry slot");
 
-    let (hits, _) = search(&graph, &Query::new(vector_for(7, dims)), 5, 64, &mut scratch);
+    let (hits, _) = search(&graph, &graph.query(vector_for(7, dims)), 5, 64, &mut scratch);
     assert!(!hits.is_empty(), "a search must self-heal past a dead entry point instead of returning empty");
     assert_ne!(graph.file.entry_point().0, entry, "the repair must be published, not repeated per search");
     let _ = std::fs::remove_file(&path);
@@ -544,7 +544,7 @@ fn search_repairs_an_entry_point_whose_hint_is_dead_too() {
     graph.clear_node(hint).expect("tombstone the hint slot");
     graph.clear_node(entry).expect("tombstone the entry slot");
 
-    let (hits, _) = search(&graph, &Query::new(vector_for(7, dims)), 5, 64, &mut scratch);
+    let (hits, _) = search(&graph, &graph.query(vector_for(7, dims)), 5, 64, &mut scratch);
     assert!(!hits.is_empty(), "a dead hint must fall back to the bounded probe, not return empty forever");
     let repaired = graph.file.entry_point().0;
     assert_ne!(repaired, entry, "the repair must be published");
@@ -577,7 +577,7 @@ fn search_repairs_an_entry_point_in_a_churned_graph_whose_low_ids_are_all_dead()
         let _ = graph.clear_node(hint);
     }
 
-    let (hits, _) = search(&graph, &Query::new(vector_for(1_150, dims)), 5, 64, &mut scratch);
+    let (hits, _) = search(&graph, &graph.query(vector_for(1_150, dims)), 5, 64, &mut scratch);
     assert!(!hits.is_empty(), "the probe must reach the live tail, not only a dead low prefix");
     let repaired = graph.file.entry_point().0;
     assert!(graph.read_node(repaired).is_some(), "the repair must publish a live node");
@@ -614,7 +614,7 @@ fn a_repair_probe_rotates_so_no_live_node_stays_between_its_samples() {
 
     let mut found = false;
     for _ in 0..stride {
-        let (hits, _) = search(&graph, &Query::new(vector_for(survivor, dims)), 5, 64, &mut scratch);
+        let (hits, _) = search(&graph, &graph.query(vector_for(survivor, dims)), 5, 64, &mut scratch);
         if !hits.is_empty() {
             found = true;
             break;
@@ -657,7 +657,7 @@ fn a_repair_probe_reaches_the_low_ids_a_floored_stride_would_never_sample() {
 
     let mut found = false;
     for _ in 0..hw.div_ceil(limit) {
-        let (hits, _) = search(&graph, &Query::new(vector_for(survivor, dims)), 5, 64, &mut scratch);
+        let (hits, _) = search(&graph, &graph.query(vector_for(survivor, dims)), 5, 64, &mut scratch);
         if !hits.is_empty() {
             found = true;
             break;
@@ -706,7 +706,7 @@ fn repair_probe_rotation_is_per_plane_not_per_process() {
     let mut found = [false; 2];
     for _ in 0..stride {
         for (which, (graph, _)) in graphs.iter().enumerate() {
-            let (hits, _) = search(graph, &Query::new(vector_for(survivors[which], dims)), 5, 64, &mut scratch);
+            let (hits, _) = search(graph, &graph.query(vector_for(survivors[which], dims)), 5, 64, &mut scratch);
             if !hits.is_empty() {
                 found[which] = true;
             }

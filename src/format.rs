@@ -9,13 +9,79 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 pub const MAGIC: u32 = 0x484e_5357; // "HNSW"
 pub const VERSION: u32 = 8; // v8: per-slot host keys + overflow arena; v7: sticky invalidation latch (older files: reindex)
+/// int16 planes. A released v8 reader ignores H_QUANT and validates only the ROUNDED slot size,
+/// which collides between the widths (dims 16 / cap 16 is 128 B either way), so it would accept
+/// an int16 file and write neighbors over its vector. The version is the gate; H_QUANT is the
+/// codec inside it. Exactly two pairs are produced and exactly two are accepted.
+pub const VERSION_INT16: u32 = 9;
 pub const HEADER_SIZE: usize = 4096;
+
+/// Stored element codec. The header byte is the on-disk encoding; 1 stays reserved for the
+/// f32 mode the format has always documented and never implemented.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Quant {
+    Int8,
+    Int16,
+}
+
+impl Quant {
+    #[inline]
+    pub const fn elem_size(self) -> usize {
+        match self {
+            Quant::Int8 => 1,
+            Quant::Int16 => 2,
+        }
+    }
+
+    #[inline]
+    const fn header_byte(self) -> u8 {
+        match self {
+            Quant::Int8 => 0,
+            Quant::Int16 => 2,
+        }
+    }
+
+    #[inline]
+    const fn version(self) -> u32 {
+        match self {
+            Quant::Int8 => VERSION,
+            Quant::Int16 => VERSION_INT16,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Quant::Int8 => "int8",
+            Quant::Int16 => "int16",
+        }
+    }
+
+    /// The only two (version, codec) pairs any writer produces. A file carrying anything else —
+    /// including v9/int8, which nothing emits — is refused rather than guessed at.
+    fn from_header(version: u32, quant_byte: u8) -> Option<Self> {
+        match (version, quant_byte) {
+            (VERSION, 0) => Some(Quant::Int8),
+            (VERSION_INT16, 2) => Some(Quant::Int16),
+            _ => None,
+        }
+    }
+
+    /// Largest magnitude a stored element may carry. -32768 is excluded: `_mm256_madd_epi16`
+    /// sums two i16 products into one i32 lane, and 2 x 32768^2 overflows it by one, inside the
+    /// instruction and before any accumulator width can help.
+    pub const fn max_abs(self) -> i32 {
+        match self {
+            Quant::Int8 => 127,
+            Quant::Int16 => 32767,
+        }
+    }
+}
 
 // Header field byte offsets.
 const H_MAGIC: usize = 0;
 const H_VERSION: usize = 4;
 const H_DIMS: usize = 8; // u16
-const H_QUANT: usize = 10; // u8: 0 = int8, 1 = f32
+const H_QUANT: usize = 10; // u8: 0 = int8, 1 = reserved (f32, unimplemented), 2 = int16
 const H_LAYER0_CAP: usize = 12; // u16
 const H_SLOT_SIZE: usize = 16; // u32
 const H_ENTRY: usize = 24; // u64 atomic: (level << 32) | id, one word so readers never see a torn pair
@@ -67,7 +133,7 @@ pub const S_DEGREE: usize = 6; // u16
 pub const S_SCALE: usize = 8; // f32
 pub const S_INV_MAG: usize = 12; // f32
 pub const S_UPPER_IDX: usize = 16; // u32 index into the upper region; NO_UPPER = none
-pub const S_VECTOR: usize = 20; // dims bytes (int8) or dims*4 (f32)
+pub const S_VECTOR: usize = 20; // dims * quant.elem_size() bytes
                                 // neighbors: u32 * layer0_cap, follows the 4-padded vector
                                 // key (key_cap > 0): u16 len, u16 pad, then key_cap bytes at a
                                 // 4-aligned offset — the key inline when len <= key_cap, else
@@ -89,19 +155,20 @@ pub const fn key_class(len: usize) -> usize {
 }
 pub const MAX_KEY_LEN: usize = u16::MAX as usize;
 
-/// Byte offset of a slot's neighbor array. The vector is padded to a 4-byte boundary so this
-/// is 4-aligned for every dims: the search hot path then reads each neighbor as one aligned
-/// volatile u32 instead of four byte loads plus shifts.
+/// Byte offset of a slot's neighbor array, from the vector's BYTE length (`dims * elem_size`,
+/// not `dims`). The vector is padded to a 4-byte boundary so this is 4-aligned for every dims:
+/// the search hot path then reads each neighbor as one aligned volatile u32 instead of four
+/// byte loads plus shifts.
 #[inline]
-pub const fn neighbor_offset(dims: usize) -> usize {
-    S_VECTOR + (dims + 3) / 4 * 4
+pub const fn neighbor_offset(vector_bytes: usize) -> usize {
+    S_VECTOR + (vector_bytes + 3) / 4 * 4
 }
 
 /// Byte offset of a slot's key field (the u16 length), after the neighbor array; 4-aligned,
 /// so the payload at `+ KEY_PAYLOAD` is too and the overflow offset reads as aligned u32s.
 #[inline]
-pub const fn key_offset(dims: usize, layer0_cap: usize) -> usize {
-    neighbor_offset(dims) + layer0_cap * 4
+pub const fn key_offset(vector_bytes: usize, layer0_cap: usize) -> usize {
+    neighbor_offset(vector_bytes) + layer0_cap * 4
 }
 pub const KEY_PAYLOAD: usize = 4;
 
@@ -121,6 +188,11 @@ pub struct PlaneFile {
     pub self_tag: u32,
     pub map: MmapMut,
     pub dims: usize,
+    /// Stored element codec, fixed at create and validated at open against the file version.
+    pub quant: Quant,
+    /// `dims * quant.elem_size()`: the real byte length of a slot's vector. Every slot offset
+    /// derives from this, never from `dims`.
+    pub vector_bytes: usize,
     pub layer0_cap: usize,
     pub slot_size: usize,
     pub max_nodes: u64,
@@ -169,13 +241,15 @@ fn invalidated_error(path: &Path) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("{} was invalidated: delete it and its .stale sidecar, then rebuild the index", path.display()))
 }
 
-fn slot_size_for(dims: usize, layer0_cap: usize, key_cap: usize) -> usize {
-    let raw = key_offset(dims, layer0_cap) + if key_cap > 0 { KEY_PAYLOAD + key_cap } else { 0 };
+fn slot_size_for(vector_bytes: usize, layer0_cap: usize, key_cap: usize) -> usize {
+    let raw = key_offset(vector_bytes, layer0_cap) + if key_cap > 0 { KEY_PAYLOAD + key_cap } else { 0 };
     raw.next_multiple_of(64) // cache-line align
 }
 
 fn key_arena_len_for(max_nodes: u64, key_cap: usize, per_node: u32) -> u64 {
-    if key_cap > 0 { max_nodes * per_node as u64 } else { 0 }
+    // saturating, not wrapping: the caller's checked length arithmetic then rejects the
+    // geometry instead of reserving an arena that silently wrapped to something small
+    if key_cap > 0 { max_nodes.saturating_mul(per_node as u64) } else { 0 }
 }
 
 fn upper_entry_size() -> usize {
@@ -216,27 +290,57 @@ impl PlaneFile {
     /// `create_with_keys` with an explicit overflow arena reservation per node (bytes; a
     /// host whose keys mostly exceed `key_cap` sizes this to their length rounded to 64).
     pub fn create_with_key_arena(path: &Path, dims: usize, layer0_cap: usize, max_nodes: u64, key_cap: usize, arena_per_node: u32) -> io::Result<Self> {
+        Self::create_with_options(path, dims, layer0_cap, max_nodes, key_cap, arena_per_node, Quant::Int8)
+    }
+
+    /// Full create: `quant` fixes the stored element codec for the life of the file. int8 keeps
+    /// writing a v8 header, so every released reader still opens planes created today.
+    pub fn create_with_options(
+        path: &Path,
+        dims: usize,
+        layer0_cap: usize,
+        max_nodes: u64,
+        key_cap: usize,
+        arena_per_node: u32,
+        quant: Quant,
+    ) -> io::Result<Self> {
         if max_nodes >= NO_ID as u64 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "maxNodes must be below 2^32-1"));
         }
         if key_cap != 0 && !(KEY_CAP_MIN..=MAX_KEY_LEN).contains(&key_cap) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "keyCap must be 0 or between 8 and 65535"));
         }
+        // Header fields are u16; an out-of-range value used to narrow silently and leave a live
+        // handle over a file whose recorded dims were 0 and which no later open could accept.
+        if dims == 0 || dims > u16::MAX as usize {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("dims must be between 1 and {}", u16::MAX)));
+        }
+        if layer0_cap == 0 || layer0_cap > u16::MAX as usize {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("layer0Cap must be between 1 and {}", u16::MAX)));
+        }
+        let vector_bytes = dims * quant.elem_size();
+        if key_cap > 0 && arena_per_node < 64 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "keyArenaBytesPerNode must be at least 64"));
+        }
         if stale_sidecar_present(path) {
             // a leftover sidecar would make the new file unopenable forever; the host must
             // clear it deliberately
             return Err(io::Error::other(format!("{} has a stale sidecar: remove {} before creating", path.display(), crate::invalidate::stale_path_for(path).display())));
         }
-        let slot_size = slot_size_for(dims, layer0_cap, key_cap);
+        let slot_size = slot_size_for(vector_bytes, layer0_cap, key_cap);
         let slots_per_page = slots_per_page_for(slot_size);
         let data_len = slot_region_len(max_nodes, slot_size, slots_per_page);
         let upper_capacity = max_nodes / 8 + 64;
-        if key_cap > 0 && arena_per_node < 64 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "keyArenaBytesPerNode must be at least 64"));
-        }
         let arena_per_node = if key_cap > 0 { arena_per_node } else { 0 };
         let key_arena_len = key_arena_len_for(max_nodes, key_cap, arena_per_node);
-        let len = HEADER_SIZE as u64 + data_len + upper_capacity * upper_entry_size() as u64 + key_arena_len;
+        // every length is checked BEFORE the truncating open: an unsatisfiable geometry must
+        // not destroy a file that already exists at this path
+        let overflow = || io::Error::new(io::ErrorKind::InvalidInput, "plane geometry overflows a 64-bit file length");
+        let len = (HEADER_SIZE as u64)
+            .checked_add(data_len)
+            .and_then(|l| l.checked_add(upper_capacity.checked_mul(upper_entry_size() as u64)?))
+            .and_then(|l| l.checked_add(key_arena_len))
+            .ok_or_else(overflow)?;
         let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path)?;
         file.set_len(len)?;
         let mut map = unsafe { MmapMut::map_mut(&file)? };
@@ -245,7 +349,7 @@ impl PlaneFile {
         // in the create window sees an invalid header (retryable) rather than adopting a
         // half-initialized plane with max_nodes = 0
         map[H_DIMS..H_DIMS + 2].copy_from_slice(&(dims as u16).to_le_bytes());
-        map[H_QUANT] = 0;
+        map[H_QUANT] = quant.header_byte();
         map[H_LAYER0_CAP..H_LAYER0_CAP + 2].copy_from_slice(&(layer0_cap as u16).to_le_bytes());
         map[H_SLOT_SIZE..H_SLOT_SIZE + 4].copy_from_slice(&(slot_size as u32).to_le_bytes());
         map[H_SLOTS_PER_PAGE..H_SLOTS_PER_PAGE + 2].copy_from_slice(&(slots_per_page as u16).to_le_bytes());
@@ -259,7 +363,7 @@ impl PlaneFile {
         // zero would read as "node 0 was the previous entry point" and hand every re-election
         // and search-side repair a candidate that was never an entry point
         map[H_ENTRY_PREV..H_ENTRY_PREV + 8].copy_from_slice(&(NO_ID as u64).to_le_bytes());
-        map[H_VERSION..H_VERSION + 4].copy_from_slice(&VERSION.to_le_bytes());
+        map[H_VERSION..H_VERSION + 4].copy_from_slice(&quant.version().to_le_bytes());
         std::sync::atomic::fence(Ordering::Release);
         map[H_MAGIC..H_MAGIC + 4].copy_from_slice(&MAGIC.to_le_bytes());
         let upper_offset = HEADER_SIZE + slot_region_len(max_nodes, slot_size, slots_per_page) as usize;
@@ -270,6 +374,8 @@ impl PlaneFile {
             self_tag: 0,
             map,
             dims,
+            quant,
+            vector_bytes,
             layer0_cap,
             slot_size,
             max_nodes,
@@ -322,9 +428,20 @@ impl PlaneFile {
         advise_random(&map);
         let magic = u32::from_le_bytes(map[H_MAGIC..H_MAGIC + 4].try_into().unwrap());
         let version = u32::from_le_bytes(map[H_VERSION..H_VERSION + 4].try_into().unwrap());
-        if magic != MAGIC || version != VERSION {
+        if magic != MAGIC {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "format mismatch: reindex required"));
         }
+        // the codec is parsed from the (version, H_QUANT) pair before ANY geometry arithmetic,
+        // because a wrong element width silently relocates the neighbor and key regions
+        let quant_byte = map[H_QUANT];
+        let Some(quant) = Quant::from_header(version, quant_byte) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported plane format: version {version}, quantization byte {quant_byte} (this build writes v{VERSION}/0 for int8 and v{VERSION_INT16}/2 for int16): reindex required"
+                ),
+            ));
+        };
         let dims = u16::from_le_bytes(map[H_DIMS..H_DIMS + 2].try_into().unwrap()) as usize;
         let layer0_cap = u16::from_le_bytes(map[H_LAYER0_CAP..H_LAYER0_CAP + 2].try_into().unwrap()) as usize;
         let slot_size = u32::from_le_bytes(map[H_SLOT_SIZE..H_SLOT_SIZE + 4].try_into().unwrap()) as usize;
@@ -334,7 +451,8 @@ impl PlaneFile {
         if key_cap != 0 && key_cap < KEY_CAP_MIN {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "plane header geometry is inconsistent: recreate the index"));
         }
-        if dims == 0 || slot_size == 0 || slot_size != slot_size_for(dims, layer0_cap, key_cap) {
+        let vector_bytes = dims * quant.elem_size();
+        if dims == 0 || slot_size == 0 || slot_size != slot_size_for(vector_bytes, layer0_cap, key_cap) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "plane header geometry is inconsistent: recreate the index"));
         }
         if max_nodes > NO_ID as u64 || slots_per_page != slots_per_page_for(slot_size) {
@@ -367,6 +485,8 @@ impl PlaneFile {
             self_tag: 0,
             map,
             dims,
+            quant,
+            vector_bytes,
             layer0_cap,
             slot_size,
             max_nodes,
@@ -388,6 +508,17 @@ impl PlaneFile {
         // mapping and, with another process still mapping the file, could force a LIVE
         // writer's lock. The clean-shutdown byte remains advisory metadata only.
         Ok(plane)
+    }
+
+    /// Offsets as methods so no call site can pass `dims` where vector BYTES are meant.
+    #[inline]
+    pub fn neighbor_offset(&self) -> usize {
+        neighbor_offset(self.vector_bytes)
+    }
+
+    #[inline]
+    pub fn key_offset(&self) -> usize {
+        key_offset(self.vector_bytes, self.layer0_cap)
     }
 
     #[inline]

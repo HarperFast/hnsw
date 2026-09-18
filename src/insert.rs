@@ -4,7 +4,7 @@
 //! replaced by the new direct route. Stored per-edge distances were dropped from the file
 //! format, so neighbor↔neighbor distances are recomputed (int8×int8) on id-match hits only.
 
-use crate::distance::{quantize_int8, Query};
+use crate::distance::{quantize, Query};
 use crate::format::{NO_ID, NO_UPPER};
 use crate::graph::{Graph, KeyError, WriteError};
 use crate::search::{beam_descend, search_layer, SearchScratch, SearchStats, DESCENT_EF};
@@ -166,6 +166,8 @@ fn write_error(error: WriteError) -> InsertError {
     match error {
         WriteError::Wedged => InsertError::Wedged,
         WriteError::KeyArenaFull => InsertError::KeyArenaFull,
+        // insert quantizes the vector itself, so the raw-write gate cannot reject it
+        WriteError::BadVector(reason) => unreachable!("insert produced an unstorable vector: {reason}"),
     }
 }
 
@@ -195,7 +197,8 @@ pub fn insert_with_key(
     if key.len() > graph.file.key_cap && !graph.file.key_arena_has_room(key.len()) {
         return Err(InsertError::KeyArenaFull);
     }
-    let (bytes, scale, inv_mag) = quantize_int8(vector);
+    let stored = quantize(vector, graph.file.quant);
+    let (bytes, scale, inv_mag) = (&stored.bytes, stored.scale, stored.inv_mag);
     let id = graph.file.allocate_id();
     if id == NO_ID {
         return Err(InsertError::Full);
@@ -213,7 +216,8 @@ pub fn insert_with_key(
         }
     };
     let level = level_for(id, params.ml);
-    let query = Query::new(vector.to_vec());
+    // the stored encoding IS the int16 query encoding; reusing it saves a second O(dims) pass
+    let query = Query::for_plane_reusing(&graph.file, vector.to_vec(), &stored);
     let layer0_cap = graph.file.layer0_cap;
     let m = params.m;
 
@@ -229,7 +233,7 @@ pub fn insert_with_key(
         }
         *published_upper =
             if level > 0 { graph.write_upper(&vec![Vec::new(); level as usize]).unwrap_or(NO_UPPER) } else { NO_UPPER };
-        if let Err(error) = graph.write_node(id, level, &bytes, scale, inv_mag, &[], *published_upper, Some(key)) {
+        if let Err(error) = graph.write_node(id, level, bytes, scale, inv_mag, &[], *published_upper, Some(key)) {
             abandon(false, *published_upper, NO_UPPER);
             return Err(write_error(error));
         }
@@ -373,7 +377,7 @@ pub fn insert_with_key(
     };
     let mut l0: Vec<u32> = connections[0].iter().map(|&(nid, _)| nid).collect();
     l0.truncate(layer0_cap);
-    if let Err(error) = graph.write_node(id, level, &bytes, scale, inv_mag, &l0, upper_idx, Some(key)) {
+    if let Err(error) = graph.write_node(id, level, bytes, scale, inv_mag, &l0, upper_idx, Some(key)) {
         abandon(published, upper_idx, published_upper);
         return Err(write_error(error));
     }
@@ -416,7 +420,7 @@ mod reverse_edge_tests {
         let _ = std::fs::remove_file(&path);
         let graph = Graph::new(PlaneFile::create(&path, dims, cap, 4_096).expect("create"));
 
-        let vector = vec![0i8; dims];
+        let vector = vec![0u8; dims];
         let full: Vec<u32> = (1..=cap as u32).collect();
         graph.write_node_raw(0, 0, &vector, 1.0, 1.0, &full, &[]).expect("seed the full list");
         for &nid in &full {
