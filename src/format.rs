@@ -12,7 +12,7 @@ pub const VERSION: u32 = 8; // v8: per-slot host keys + overflow arena; v7: stic
 /// int16 planes. A released v8 reader ignores H_QUANT and validates only the ROUNDED slot size,
 /// which collides between the widths (dims 16 / cap 16 is 128 B either way), so it would accept
 /// an int16 file and write neighbors over its vector. The version is the gate; H_QUANT is the
-/// codec inside it. Exactly two pairs are produced and exactly two are accepted.
+/// codec inside it.
 pub const VERSION_INT16: u32 = 9;
 pub const HEADER_SIZE: usize = 4096;
 

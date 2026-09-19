@@ -38,7 +38,17 @@ function loadLocal() {
 // wants the prebuild. HNSW_PREFER_LOCAL_BUILD inverts that for a checkout testing its own
 // build: without it, `npm install` in this repo installs the prebuild and every later
 // require gets the RELEASED binding rather than what the tree just compiled.
-let native0 = process.env.HNSW_PREFER_LOCAL_BUILD ? loadLocal() : undefined;
+let native0;
+if (process.env.HNSW_PREFER_LOCAL_BUILD) {
+	native0 = loadLocal();
+	// no fallback: falling through to the prebuild is exactly the false pass the caller set
+	// this variable to avoid, and it would look like a working local build
+	if (!native0) {
+		throw new Error(
+			`HNSW_PREFER_LOCAL_BUILD is set but the local build could not be loaded. ${failures.join('; ') || `${local} does not exist; run \`node build.mjs\``}`
+		);
+	}
+}
 if (!native0) {
 	try {
 		native0 = require(`@harperfast/hnsw-${process.platform}-${process.arch}${libcSuffix()}`);

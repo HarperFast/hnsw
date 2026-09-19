@@ -54,7 +54,6 @@ impl Query {
     pub(crate) fn for_plane_reusing(file: &PlaneFile, vector: &[f32], stored: &Quantized) -> Self {
         assert_eq!(stored.bytes.len(), file.vector_bytes(), "reused encoding is not this plane's");
         match file.quant() {
-            // int16 needs only the length, so the f32 vector is never copied for it
             Quant::Int8 => Self::int8_with(vector.to_vec(), stored.inv_mag),
             Quant::Int16 => Self::int16(vector.len(), stored.bytes.clone(), stored.scale, stored.inv_mag),
         }
