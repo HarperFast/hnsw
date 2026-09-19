@@ -331,11 +331,12 @@ fn a_plane_from_the_released_build_opens_and_searches_identically() {
         let (hits, _) = search(&graph, &graph.query(vector_for(qi.parse().unwrap(), 32)), 10, 64, &mut scratch);
         let got_ids: Vec<String> = hits.iter().map(|(id, _)| id.to_string()).collect();
         let want_ids: Vec<&str> = want.split(',').map(|e| e.split_once(':').expect("fixture hit").0).collect();
-        // Ids and their order are the compatibility property. Distances are compared with a
-        // tolerance, not bit-for-bit: the expected file was produced by the AVX2 kernel, and a
-        // platform on the scalar path sums in a different order — that is f32 rounding, not a
-        // format disagreement. The fixture's own gaps are ~3e-5 and up, so a reordering here
-        // would be a real regression rather than a tie flipping.
+        // Ids and their order are the compatibility property, and they are asserted exactly.
+        // Distances are compared with a tolerance rather than bit-for-bit: the expected file
+        // was produced by the AVX2 kernel, and a platform on the scalar path sums in a
+        // different order — f32 rounding, not a format disagreement. The tolerance is NOT what
+        // catches a reordering (the fixture's smallest adjacent gap, 2.8e-6 on query 3, is
+        // inside it); the id assertion below is.
         assert_eq!(got_ids, want_ids, "query {qi} no longer returns what the released build returned");
         for (hit, entry) in hits.iter().zip(want.split(',')) {
             let expected_distance: f32 = entry.split_once(':').unwrap().1.parse().expect("fixture distance");
