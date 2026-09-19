@@ -48,7 +48,7 @@ fn inline_and_overflow_keys_round_trip_and_survive_reopen() {
         }
         // every hit carries its node's key, through the same path searches use (the corpus has
         // near-duplicates, so the top hit is not necessarily the query's own node)
-        let (hits, _) = search(&graph, &Query::new(vector_for(30, dims)), 20, 64, &mut scratch);
+        let (hits, _) = search(&graph, &graph.query(vector_for(30, dims)), 20, 64, &mut scratch);
         let hit_ids: Vec<u32> = hits.iter().map(|&(id, _)| id).collect();
         let (keys, ends) = gather_keys(&graph, &hit_ids);
         let mut start = 0usize;

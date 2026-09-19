@@ -56,9 +56,9 @@ fn allocations_per_search(graph: &Graph, dims: usize, scratch: &mut SearchScratc
         (0..dims).map(|d| ((i as f32 * 0.11 + d as f32) * 0.9).sin()).collect()
     };
     for i in 0..8 {
-        let _ = search(graph, &Query::new(vector(i)), 10, 64, scratch);
+        let _ = search(graph, &graph.query(vector(i)), 10, 64, scratch);
     }
-    let queries_prepared: Vec<Query> = (0..queries).map(|i| Query::new(vector(i + 100))).collect();
+    let queries_prepared: Vec<Query> = (0..queries).map(|i| graph.query(vector(i + 100))).collect();
 
     ALLOCATIONS.store(0, Ordering::Relaxed);
     COUNTING.with(|c| c.set(true));
@@ -122,4 +122,33 @@ should be the only one"
     drop(tall);
     let _ = std::fs::remove_file(&shallow_path);
     let _ = std::fs::remove_file(&tall_path);
+}
+
+/// Query construction is outside the counted window in the test above, so a per-query
+/// allocation added there would not show up. An int8 query must allocate nothing beyond the
+/// f32 vector it is handed: it is the default path, and adding the int16 encoding to every
+/// query would tax planes that never use it.
+#[test]
+fn building_an_int8_query_allocates_nothing_beyond_its_vector() {
+    let dims = 1_536;
+    let path = std::env::temp_dir().join(format!("hnsw-alloc-query-{}.hnsw", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let int8 = Graph::new(PlaneFile::create(&path, dims, 16, 1_024).expect("create"));
+    let vector: Vec<f32> = (0..dims).map(|d| (d as f32 * 0.37).sin()).collect();
+
+    // warm: the first construction resolves the kernel through is_x86_feature_detected
+    std::hint::black_box(int8.query(vector.clone()));
+
+    ALLOCATIONS.store(0, Ordering::Relaxed);
+    COUNTING.with(|c| c.set(true));
+    for _ in 0..64 {
+        std::hint::black_box(int8.query(vector.clone()));
+    }
+    COUNTING.with(|c| c.set(false));
+    let per_query = ALLOCATIONS.load(Ordering::Relaxed) as f64 / 64.0;
+    assert!(
+        per_query <= 1.0,
+        "an int8 query allocated {per_query} times, not just the clone of its own vector"
+    );
+    let _ = std::fs::remove_file(&path);
 }

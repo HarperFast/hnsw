@@ -2,14 +2,17 @@
 //! per-visit cost — the number that decides whether the native plane hits its 0.25–0.4 µs
 //! budget (JS baseline: 4.34 µs/visit at 5M/ef 512).
 //!
-//! Usage: bench [n=100000] [dims=768] [queries=200] [ef=512] [path=/tmp/bench.hnsw] [cap=128] [threads=0]
+//! Usage: bench [n=100000] [dims=768] [queries=200] [ef=512] [path=/tmp/bench.hnsw] [cap=128] [threads=0] [precision=int8|int16|both]
 //! Env: HNSW_BENCH_FVECS=<dir> reads SIFT-style `sift_base.fvecs` / `sift_query.fvecs` from that
 //! directory (its dims must match the argument; n rows from base, queries from query) instead of the synthetic
 //! corpus, so a run matches the Harper-vs-pgvector benchmark's data. `ef` may be a comma list.
 //! threads > 0 adds a concurrent-throughput pass: T searcher threads (queries each) + one
 //! background writer inserting throughout, reporting aggregate QPS and per-thread p50/p99.
+//! `precision=both` builds and measures an int8 and an int16 plane over the same corpus.
+//! HNSW_BENCH_KERNELS=1 runs the kernel microbenchmark alone (no graph build).
 
-use hnsw_plane::distance::Query;
+use hnsw_plane::distance::{quantize, Query};
+use hnsw_plane::format::Quant;
 use hnsw_plane::insert::{insert, insert_with_key, InsertParams};
 use hnsw_plane::search::{search, SearchScratch};
 use hnsw_plane::{Graph, PlaneFile};
@@ -122,6 +125,10 @@ impl Source {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if std::env::var("HNSW_BENCH_KERNELS").is_ok() {
+        kernel_bench();
+        return;
+    }
     let n: u64 = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(100_000);
     let dims: usize = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(768);
     let queries: usize = args.get(3).and_then(|a| a.parse().ok()).unwrap_or(200);
@@ -131,26 +138,48 @@ fn main() {
         .unwrap_or_else(|| vec![512]);
     let path: PathBuf = args.get(5).map(Into::into).unwrap_or_else(|| "/tmp/bench.hnsw".into());
     let layer0_cap: usize = args.get(6).and_then(|a| a.parse().ok()).unwrap_or(128);
+    let threads: usize = args.get(7).and_then(|a| a.parse().ok()).unwrap_or(0);
+    let quants: Vec<Quant> = match args.get(8).map(String::as_str).unwrap_or("int8") {
+        "int8" => vec![Quant::Int8],
+        "int16" => vec![Quant::Int16],
+        "both" => vec![Quant::Int8, Quant::Int16],
+        other => panic!("precision must be int8, int16 or both (got {other})"),
+    };
+    kernel_bench();
+    for quant in quants {
+        // per-precision path so `both` does not rebuild over the other width's file
+        let plane_path = PathBuf::from(format!("{}.{}", path.display(), quant.name()));
+        run(n, dims, queries, &efs, &plane_path, layer0_cap, threads, quant);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run(n: u64, dims: usize, queries: usize, efs: &[usize], path: &std::path::Path, layer0_cap: usize, threads: usize, quant: Quant) {
+    let path = path.to_path_buf();
+    println!("\n=== precision {} ===", quant.name());
 
     // Reuse an existing plane file when it holds exactly n nodes at the same geometry from the
     // same corpus (a sidecar names the corpus): ef sweeps without rebuilding.
     let corpus_id = std::env::var("HNSW_BENCH_FVECS").map(|d| format!("fvecs:{d}")).unwrap_or_else(|_| "synthetic".into());
+    let corpus_id = format!("{corpus_id}:{}", quant.name());
     let sidecar = path.with_extension("hnsw.corpus");
     let reuse = PlaneFile::open(&path)
         .ok()
-        .filter(|f| f.id_high_water() == n && f.layer0_cap == layer0_cap && f.dims == dims)
+        .filter(|f| f.id_high_water() == n && f.layer0_cap == layer0_cap && f.dims() == dims && f.quant() == quant)
         .is_some()
         && std::fs::read_to_string(&sidecar).map(|c| c == corpus_id).unwrap_or(false);
     let file = if reuse {
         println!("reusing existing plane at {}", path.display());
         PlaneFile::open(&path).expect("open")
     } else {
-        PlaneFile::create_with_keys(&path, dims, layer0_cap, n + 1024, 40).expect("create")
+        PlaneFile::create_with_options(&path, dims, layer0_cap, n + 1024, 40, hnsw_plane::format::default_key_arena_per_node(40), quant)
+            .expect("create")
     };
     println!(
-        "plane: {} nodes x {} dims, slot {} B, file {:.1} GB (sparse)",
+        "plane: {} nodes x {} dims {}, slot {} B, file {:.1} GB (sparse)",
         n,
         dims,
+        quant.name(),
         file.slot_size,
         (n * file.slot_size as u64) as f64 / 1e9
     );
@@ -196,7 +225,7 @@ fn main() {
 
     // Query with held-out vectors; measure latency and set-recall@10 vs brute-force truth
     // (same asymmetric metric, so recall isolates graph quality, not quantization).
-    let qs: Vec<Query> = (0..queries).map(|i| Query::new(corpus.query_row(i, &mut rng))).collect();
+    let qs: Vec<Query> = (0..queries).map(|i| Query::for_plane(&graph.file, corpus.query_row(i, &mut rng))).collect();
     let truths: Vec<Vec<u32>> = qs
         .iter()
         .map(|q| {
@@ -208,7 +237,7 @@ fn main() {
         })
         .collect();
     let mut ef = efs[0];
-    for &ef_i in &efs {
+    for &ef_i in efs {
         ef = ef_i;
         let mut latencies = Vec::with_capacity(queries);
         let mut total_visits = 0u64;
@@ -246,7 +275,6 @@ fn main() {
         );
     }
 
-    let threads: usize = args.get(7).and_then(|a| a.parse().ok()).unwrap_or(0);
     if threads > 0 {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
@@ -264,7 +292,7 @@ fn main() {
                 let mut rng = Rng(0x9e37_79b9 ^ (t as u64 + 1) * 0x1234_5677);
                 let mut lat: Vec<std::time::Duration> = Vec::with_capacity(per_thread);
                 for i in 0..per_thread {
-                    let q = Query::new(corpus.query_row(i, &mut rng));
+                    let q = Query::for_plane(&graph.file, corpus.query_row(i, &mut rng));
                     let s = Instant::now();
                     let (r, _) = search(&graph, &q, 10, ef, &mut scratch);
                     lat.push(s.elapsed());
@@ -317,4 +345,81 @@ fn main() {
             inserted as f64 / wall.as_secs_f64()
         );
     }
+}
+
+/// Kernel microbenchmark: the measurement that chooses the int16 accumulator, and the
+/// int8-vs-int16 comparison the option's rationale rests on. Dot products only — no graph, no
+/// cache misses — so it isolates the kernel from the traversal it sits inside.
+///
+/// The row that matters for search is `search kernel`: the asymmetric f32-query x int8-stored
+/// path against the int16 query x int16-stored one. The symmetric row is the construction-time
+/// neighbour-pruning kernel.
+fn kernel_bench() {
+    let mut rng = Rng(0x51ed_270b_a5c8_1f3d);
+    let dir = std::env::temp_dir().join(format!("hnsw-kernelbench-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    println!("kernel microbenchmark (ns per dot product, hot cache):");
+    for &dims in &[128usize, 768, 1536, 4096] {
+        let a: Vec<f32> = (0..dims).map(|_| rng.next_gauss()).collect();
+        let b: Vec<f32> = (0..dims).map(|_| rng.next_gauss()).collect();
+        let a8 = quantize(&a, Quant::Int8);
+        let b8 = quantize(&b, Quant::Int8);
+        let a16 = quantize(&a, Quant::Int16);
+        let b16 = quantize(&b, Quant::Int16);
+        let iters = (2_000_000 / dims).max(2_000);
+
+        let plane8 = PlaneFile::create_with_options(&dir.join(format!("q8-{dims}.hnsw")), dims, 8, 16, 0, 0, Quant::Int8)
+            .expect("bench plane");
+        let plane16 = PlaneFile::create_with_options(&dir.join(format!("q16-{dims}.hnsw")), dims, 8, 16, 0, 0, Quant::Int16)
+            .expect("bench plane");
+        let q8 = Query::for_plane(&plane8, a.clone());
+        let q16 = Query::for_plane(&plane16, a.clone());
+
+        let time = |f: &dyn Fn()| {
+            let t = Instant::now();
+            for _ in 0..iters {
+                f();
+            }
+            t.elapsed().as_secs_f64() * 1e9 / iters as f64
+        };
+
+        let search8 = time(&|| {
+            std::hint::black_box(unsafe { hnsw_plane::distance::cosine_raw(&q8, b8.bytes.as_ptr(), b8.scale, b8.inv_mag) });
+        });
+        let search16 = time(&|| {
+            std::hint::black_box(unsafe { hnsw_plane::distance::cosine_raw(&q16, b16.bytes.as_ptr(), b16.scale, b16.inv_mag) });
+        });
+        let sym8 = time(&|| {
+            std::hint::black_box(unsafe {
+                hnsw_plane::distance::cosine_stored_raw(
+                    Quant::Int8, a8.bytes.as_ptr(), a8.scale, a8.inv_mag, b8.bytes.as_ptr(), b8.scale, b8.inv_mag, dims,
+                )
+            });
+        });
+        let sym16 = time(&|| {
+            std::hint::black_box(unsafe {
+                hnsw_plane::distance::cosine_stored_raw(
+                    Quant::Int16, a16.bytes.as_ptr(), a16.scale, a16.inv_mag, b16.bytes.as_ptr(), b16.scale, b16.inv_mag, dims,
+                )
+            });
+        });
+        #[cfg(target_arch = "x86_64")]
+        let acc_f32 = if std::arch::is_x86_feature_detected!("avx2") {
+            time(&|| {
+                std::hint::black_box(unsafe {
+                    hnsw_plane::distance::dot_i16_i16_avx2_f32acc(a16.bytes.as_ptr(), b16.bytes.as_ptr(), dims)
+                });
+            })
+        } else {
+            f64::NAN
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let acc_f32 = f64::NAN;
+
+        println!(
+            "  dims {:>4}  search kernel: f32xi8 {:>7.1} ns  i16xi16 {:>7.1} ns ({:.2}x)  |  symmetric: i8 {:>7.1} ns  i16 {:>7.1} ns  |  i16 accumulator: i64 {:>7.1} ns  f32 {:>7.1} ns",
+            dims, search8, search16, search16 / search8, sym8, sym16, sym16, acc_f32
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

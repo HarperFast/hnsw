@@ -89,7 +89,7 @@ One file per index (per slice, once C2 lands): `<index-path>.hnsw`.
 | Field                             | Type       | Notes                                                        |
 | --------------------------------- | ---------- | ------------------------------------------------------------ |
 | magic + format version            | u32 + u32  | rebuild required on version mismatch (accepted contract)     |
-| dims, quantization mode           | u16 + u8   | v1: int8 asymmetric; f32 supported for `quantization:"none"` |
+| dims, quantization mode           | u16 + u8   | 0 = int8, 2 = int16; 1 reserved for the unimplemented f32 mode |
 | slot_size, layer0_cap, upper_cap  | u16 ×3     | derived from M/optimizeRouting at creation                   |
 | entry_point_id, entry_point_level | u32 + u8   | atomically updated                                           |
 | id_high_water                     | u64 atomic | replaces the shared Atomics BigInt64Array incrementer        |
@@ -107,7 +107,7 @@ One file per index (per slice, once C2 lands): `<index-path>.hnsw`.
 | flags (valid/deleted) + level   | 2 B                                 |
 | scale (f32) + invMag (f32)      | 8 B                                 |
 | degree                          | 2 B                                 |
-| vector (int8 × 768)             | 768 B (padded to a 4-byte boundary) |
+| vector (dims × elem_size)       | 768 B int8 / 1,536 B int16 (padded to a 4-byte boundary) |
 | neighbor ids (u32 × layer0_cap) | 256 B                               |
 | **total, padded**               | **1,040 B → 1 KB-aligned 1,088 B**  |
 
@@ -115,7 +115,18 @@ The vector's trailing pad keeps the neighbor array 4-aligned for every `dims`, s
 hot path reads each neighbor id as one aligned volatile `u32`. Upper-layer id lists are padded
 the same way (`degree u16 + pad u16 + ids`).
 
-At 100M nodes: ~109 GB (int8). A binary-code v2 slot (96 B codes + ids) is ~384 B → ~38 GB.
+**The codec is carried by the file version, not by the header byte alone.** Released readers
+ignore `H_QUANT` and validate geometry only against the *rounded* slot size, which collides
+between the widths — at dims 16 / cap 16 both round to 128 B. So an int8 plane writes a v8
+header and an int16 plane writes v9, and `open` accepts exactly `(v8, int8)` and
+`(v9, int16)`; every other pair, the reserved f32 byte included, is a descriptive refusal.
+That way an older binary is turned away at the version check instead of opening an int16 file
+and writing neighbor ids over its vector. `PlaneFile` carries the parsed codec and a derived
+`vector_bytes`, and exposes `neighbor_offset()` / `key_offset()` as methods — every slot
+offset comes from the byte length, and no call site can pass `dims` where bytes are meant.
+
+At 100M nodes: ~109 GB (int8); int16 adds one byte per dimension per slot, +18% at 128 dims
+and +73% at 1536, which is why it is a per-index choice and not the default. A binary-code v2 slot (96 B codes + ids) is ~384 B → ~38 GB.
 For comparison, today's encoding averages 1,425 B/node _plus_ RocksDB overhead — so v1 is
 already ~25% smaller while being fixed-offset addressable, because per-edge cached float64
 distances are dropped (recomputing a distance costs ~50 ns native; storing it costs 8 B and
@@ -379,12 +390,30 @@ Open:
   otherwise licenses. That is not the same as being race-free under Rust's memory model: only
   making those fields `AtomicU8`/`AtomicU16`/`AtomicU32` in the slot layout would be, and that
   is a format change deferred past phase 1. The stored vector stays an ordinary load on
-  purpose — `cosine_int8_raw` must keep autovectorizing, and a torn vector only perturbs a
-  distance the generation check discards.
+  purpose — `cosine_raw` must keep autovectorizing, and a torn vector only perturbs a
+  distance the generation check discards. Element width does not change that: a torn 2-byte
+  element is as discardable as a torn 1-byte one.
 - **msync cadence default** — bounded-lag durability window vs write amplification; needs a
   workload measurement, not a guess.
-- **f32 (quantization:"none") slot variant** — 3,072 B vectors → 3.4 KB slots; supported by the
-  format (dims × mode in header) but int8 is the default and the optimization target.
+- **f32 (quantization:"none") slot variant** — 3,072 B vectors → 3.4 KB slots; `H_QUANT = 1` is
+  reserved for it, but nothing implements it and `open` refuses the byte.
+- **int16 storage precision** — done. `Plane.create(..., precision)` fixes the codec for the
+  life of the file; int8 stays the default. int16 exists for accuracy, not speed: at
+  `max|c|/32767` the quantization error is ~0.003% of the largest component against int8's
+  ~0.8%. Whether that clears a host's bar for ranking on plane distances instead of reranking
+  against exact vectors is that host's call against its own corpus; what this repo measures is
+  a 128-d ordering test (`tests/precision.rs`), not a production embedding set. The kernel is `_mm256_madd_epi16` over an i16-quantized query, and the
+  operand domain is ±32767 — **-32768 is refused at every writer**, because a single pair of
+  them sums to exactly 2^31 inside one madd lane, before any accumulator width can help.
+  Above the madd, each result is widened to i64 before accumulating (the safe i32 interval is
+  one iteration, not several), which also makes the AVX2 kernel bit-identical to the scalar
+  reference. Measured on a 12th-gen i7-12700H: the int16 search kernel is 0.76–0.92x the cost
+  of the f32 x int8 one, but an int16 plane still searches ~6–11% slower end to end, because
+  the extra byte per dimension costs more in scan bandwidth than the kernel saves. The
+  f32-accumulating kernel variant is 1.5–1.7x faster than the i64 one and stays in
+  `distance.rs` for the benchmark that measured it; it was not shipped because it is accurate
+  only to ~1e-5 relative, and exactness is worth more than a fraction of a kernel that is
+  under 3% of process CPU.
 - ~~Upper-layer region persistence~~ — done (format v2): fixed-entry region in the same file,
   per-entry seqlocks, reserved for max_nodes/8. Upper entries leak on delete (bounded by the
   2x-headroom reserve); an upper freelist is the remaining nicety.

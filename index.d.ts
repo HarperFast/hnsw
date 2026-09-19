@@ -13,8 +13,8 @@ export interface SearchHits {
 /**
  * A persistent HNSW graph over a memory-mapped fixed-slot file. One file per index; searches
  * run on the libuv thread pool (one N-API crossing per query) and never block the JS event
- * loop. Vectors are int8-quantized with asymmetric (float query × int8 stored) cosine
- * distance. See DESIGN.md for the file format, concurrency model, and durability contract.
+ * loop. Vectors are quantized to int8 (default) or int16 with a per-vector symmetric scale.
+ * See DESIGN.md for the file format, concurrency model, and durability contract.
  */
 export declare class Plane {
 	/**
@@ -23,6 +23,15 @@ export declare class Plane {
 	 * key passed to `insert`; longer keys spill to an overflow arena of `keyArenaBytesPerNode` bytes
 	 * per node (default max(128, 4 × keyCap), at least 64; sparse, so size it for the keys that will
 	 * spill). Searches return the keys, so a hit resolves without a lookup by node id.
+	 *
+	 * `precision` fixes the stored element width for the life of the file. 'int8' (the default)
+	 * quantizes each component to max|c|/127; 'int16' to max|c|/32767 — ~256× finer, at one more
+	 * byte per dimension per slot (+18% at 128 dims, +73% at 1536). Whether that is close
+	 * enough to rank without reranking hits against exact distances depends on your corpus and
+	 * accuracy budget — validate it against your own data. int8 stays the right choice for wide
+	 * embeddings, where the doubled scan bandwidth makes traversal memory-bound.
+	 * Int16 planes are written in a newer format version, so an older build of this package
+	 * refuses to open one rather than misreading its slot layout.
 	 */
 	static create(
 		path: string,
@@ -30,7 +39,8 @@ export declare class Plane {
 		layer0Cap: number,
 		maxNodes: number,
 		keyCap?: number,
-		keyArenaBytesPerNode?: number
+		keyArenaBytesPerNode?: number,
+		precision?: 'int8' | 'int16'
 	): Plane;
 	/**
 	 * Open an existing plane file. Throws on a format-version mismatch and on an invalidated
@@ -39,6 +49,8 @@ export declare class Plane {
 	static open(path: string): Plane;
 
 	readonly dims: number;
+	/** The stored element codec fixed at create: 'int8' or 'int16'. */
+	readonly precision: 'int8' | 'int16';
 	readonly layer0Cap: number;
 	/** Inline key bytes per slot (0 = the plane stores no keys). */
 	readonly keyCap: number;
@@ -76,9 +88,14 @@ export declare class Plane {
 
 	/**
 	 * Mirror a host-maintained node into the plane (dual-write mode): full node state per
-	 * call, HOST-allocated id (the plane allocator is bypassed), int8 vector bin plus
-	 * quantization scale and cached 1/|v|, layer-0 neighbor ids, and per-upper-level
-	 * neighbor id arrays (level 1 first). An existing upper entry is rewritten in place.
+	 * call, HOST-allocated id (the plane allocator is bypassed), the quantized vector plus its
+	 * scale and cached 1/|v|, layer-0 neighbor ids, and per-upper-level neighbor id arrays
+	 * (level 1 first). An existing upper entry is rewritten in place.
+	 *
+	 * `vector` is raw stored bytes in the plane's own codec: `dims` bytes on an int8 plane,
+	 * and `dims` little-endian int16s — `dims × 2` bytes — on an int16 one. Int16 components
+	 * must stay within ±32767; -32768 is rejected, because a pair of them overflows the SIMD
+	 * kernel's accumulator lane.
 	 */
 	writeNodeRaw(
 		id: number,

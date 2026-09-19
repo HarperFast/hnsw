@@ -1,6 +1,9 @@
 // End-to-end smoke test: `npm run build && node smoke.mjs` (also the CI path).
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
+// this file is the gate on the build in this tree, so it must not be served the published
+// platform package `npm install` leaves in node_modules
+process.env.HNSW_PREFER_LOCAL_BUILD = '1';
 const { Plane, invalidatePlane, invalidatePlaneAsync, stalePathFor } = require('./index.js');
 
 const dims = 64;
@@ -142,4 +145,85 @@ try {
 }
 if (!threw || !/in-band:.*sidecar:/.test(threw.message)) throw new Error(`double failure must throw naming both causes, got ${threw}`);
 rmSync(stalePathFor(bogus), { recursive: true });
-console.log('invalidatePlane OK. smoke PASSED');
+console.log('invalidatePlane OK');
+
+const p16 = join(tmpdir(), `smoke16-${process.pid}.hnsw`);
+const plane16 = Plane.create(p16, dims, 32, 10_000, 16, undefined, 'int16');
+if (plane16.precision !== 'int16') throw new Error(`precision getter reported ${plane16.precision}`);
+if (Plane.create(join(tmpdir(), `smoke8-${process.pid}.hnsw`), dims, 32, 64).precision !== 'int8')
+	throw new Error('int8 must stay the default');
+let badPrecision;
+try {
+	Plane.create(join(tmpdir(), `smokebad-${process.pid}.hnsw`), dims, 32, 64, 0, undefined, 'float16');
+} catch (error) {
+	badPrecision = error;
+}
+if (!badPrecision || !/unknown precision/.test(badPrecision.message))
+	throw new Error(`an unknown precision must throw, got ${badPrecision}`);
+
+const ids16 = [];
+for (let i = 0; i < 2000; i++) ids16.push(plane16.insert(vec(i), Buffer.from(keyFor(i))));
+const h16 = await plane16.search(vec(42), 5, 128);
+if (h16.distances[0] > 1e-4) throw new Error(`int16 self-query failed: ${h16.distances[0]}`);
+// the corpus holds near-duplicates, so the hit is checked against ITS OWN key, not vec(42)'s
+for (let i = 0; i < h16.ids.length; i++)
+	if (keyAt(h16, i) !== keyFor(ids16.indexOf(h16.ids[i])))
+		throw new Error(`int16 hit ${h16.ids[i]} carried the wrong key: ${keyAt(h16, i)}`);
+const bits16 = new Uint8Array(Math.ceil(plane16.idHighWater() / 8));
+for (const id of ids16) if (id % 2 === 0) bits16[id >> 3] |= 1 << (id & 7);
+for (const id of (await plane16.search(vec(43), 5, 128, bits16)).ids)
+	if (id % 2 !== 0) throw new Error(`int16 filter leak: id ${id}`);
+const pred16 = await plane16.searchWithPredicate(vec(44), 5, 128, (batchIds) =>
+	Uint8Array.from(batchIds, (id) => (id % 3 === 0 ? 1 : 0))
+);
+for (const id of pred16.ids) if (id % 3 !== 0) throw new Error(`int16 predicate leak: id ${id}`);
+if (pred16.ids.length === 0) throw new Error('int16 predicate search returned nothing');
+if (plane16.searchSync(vec(42), 5, 128).distances[0] > 1e-4) throw new Error('int16 sync self-query failed');
+
+// raw mirroring against the wider codec: dims x 2 little-endian int16s, clamped to +/-32767
+function quant16(v) {
+	let maxAbs = 0,
+		magSq = 0;
+	for (const x of v) {
+		maxAbs = Math.max(maxAbs, Math.abs(x));
+		magSq += x * x;
+	}
+	const scale = maxAbs === 0 ? 1 : maxAbs / 32767;
+	const bytes = Buffer.from(Int16Array.from(v, (x) => Math.max(-32767, Math.min(32767, Math.round(x / scale)))).buffer);
+	return { bytes, scale, invMag: 1 / Math.sqrt(magSq) };
+}
+const mirror16 = Plane.create(join(tmpdir(), `smoke16-mirror-${process.pid}.hnsw`), dims, 32, 10_000, 0, undefined, 'int16');
+const m42 = vec(42);
+const a16 = quant16(m42),
+	b16 = quant16(vec(43));
+mirror16.writeNodeRaw(10, 1, a16.bytes, a16.scale, a16.invMag, Uint32Array.from([20]), [Uint32Array.from([])]);
+if (!mirror16.writeNodeRawIfAbsent(20, 0, b16.bytes, b16.scale, b16.invMag, Uint32Array.from([10]), null))
+	throw new Error('writeNodeRawIfAbsent must write an untouched int16 slot');
+if (mirror16.writeNodeRawIfAbsent(20, 0, b16.bytes, b16.scale, b16.invMag, Uint32Array.from([10]), null))
+	throw new Error('writeNodeRawIfAbsent must refuse a touched slot');
+mirror16.setEntryPoint(10, 1);
+const mh16 = mirror16.searchSync(m42, 2, 16);
+if (mh16.ids[0] !== 10 || mh16.distances[0] > 1e-4)
+	throw new Error(`int16 mirror self-query failed: ${JSON.stringify([...mh16.ids])}`);
+
+// the two refusals the raw contract rests on: an int8-length buffer, and the one i16 the
+// SIMD kernel cannot multiply
+for (const [buffer, pattern] of [
+	[Buffer.alloc(dims), /bytes; plane is/],
+	[Buffer.from(Int16Array.from({ length: dims }, (_, i) => (i === 3 ? -32768 : 100)).buffer), /32767/],
+]) {
+	let rejected;
+	try {
+		mirror16.writeNodeRaw(30, 0, buffer, 1, 1, Uint32Array.from([]), null);
+	} catch (error) {
+		rejected = error;
+	}
+	if (!rejected || !pattern.test(rejected.message))
+		throw new Error(`raw int16 write must be refused (${pattern}), got ${rejected}`);
+}
+
+plane16.flush();
+const reopened16 = Plane.open(p16);
+if (reopened16.precision !== 'int16') throw new Error('a reopened plane lost its precision');
+if (reopened16.searchSync(vec(42), 5, 128).distances[0] > 1e-4) throw new Error('int16 reopened self-query failed');
+console.log('int16 precision OK. smoke PASSED');

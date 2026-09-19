@@ -2,3 +2,5 @@ target/
 hnsw-plane.node
 node_modules/
 *.hnsw
+# the v8 compatibility fixture is a committed artifact of the released build
+!tests/fixtures/*.hnsw

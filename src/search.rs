@@ -611,7 +611,7 @@ mod descent_tests {
 
         let (entry_id, entry_level) = graph.file.entry_point();
         assert!(entry_level >= 1, "precondition: the graph has an upper level to descend");
-        let query = Query::new(vec![0.0f32; dims]);
+        let query = graph.query(vec![0.0f32; dims]);
         let entry_dist = graph.distance_to(entry_id, &query).expect("the entry point is live");
         assert_eq!(entry_dist, 1.0, "precondition: a zero query ties every stored vector at 1.0");
 
@@ -649,7 +649,7 @@ level 1 holds roughly {} nodes, and a beam that pushed tied candidates would wal
             insert(&graph, &v, &params, &mut scratch).expect("insert");
         }
 
-        let query = Query::new((0..dims).map(|d| ((97.0f32 * 0.31 + d as f32) * 0.7).sin()).collect());
+        let query = graph.query((0..dims).map(|d| ((97.0f32 * 0.31 + d as f32) * 0.7).sin()).collect());
         let (entry_id, entry_level) = graph.file.entry_point();
         let entry_dist = graph.distance_to(entry_id, &query).expect("the entry point is live");
         let mut descent = SearchStats { visits: 0 };
@@ -694,7 +694,7 @@ level 1 holds roughly {} nodes, and a beam that pushed tied candidates would wal
             insert(&graph, &v, &params, &mut scratch).expect("insert");
         }
 
-        let query = Query::new((0..dims).map(|d| ((7.0f32 * 0.31 + d as f32) * 0.7).sin()).collect());
+        let query = graph.query((0..dims).map(|d| ((7.0f32 * 0.31 + d as f32) * 0.7).sin()).collect());
         let (hits, _) = search(&graph, &query, 5, u32::MAX as usize, &mut scratch);
         assert_eq!(hits.len(), 5, "an absurd ef must still answer from a {n}-node plane");
         let _ = std::fs::remove_file(&path);
@@ -717,7 +717,7 @@ level 1 holds roughly {} nodes, and a beam that pushed tied candidates would wal
             insert(&graph, &v, &params, &mut scratch).expect("insert");
         }
 
-        let query = Query::new((0..dims).map(|d| ((97.0f32 * 0.31 + d as f32) * 0.7).sin()).collect());
+        let query = graph.query((0..dims).map(|d| ((97.0f32 * 0.31 + d as f32) * 0.7).sin()).collect());
         let (entry_id, entry_level) = graph.file.entry_point();
         let entry_dist = graph.distance_to(entry_id, &query).expect("the entry point is live");
         let mut descent = SearchStats { visits: 0 };
@@ -795,7 +795,7 @@ mod predicate_tests {
         };
         let q: Vec<f32> = (0..dims).map(|d| ((41.0f32 * 0.31 + d as f32) * 0.7).sin()).collect();
         let (hits, _) =
-            search_predicated(&graph, &Query::new(q), 10, 64, &mut pipe, 64 * 24, &mut scratch);
+            search_predicated(&graph, &graph.query(q), 10, 64, &mut pipe, 64 * 24, &mut scratch);
         let hits = hits.hits;
         assert!(!hits.is_empty());
         for (id, _) in &hits {
@@ -849,7 +849,7 @@ mod predicate_tests {
         for _ in 0..5 {
             let (hits, _) = search_predicated(
                 &graph,
-                &Query::new(q.clone()),
+                &graph.query(q.clone()),
                 10,
                 64,
                 &mut pipe,
@@ -893,7 +893,7 @@ mod predicate_tests {
         let q: Vec<f32> = (0..dims).map(|d| ((41.0f32 * 0.31 + d as f32) * 0.7).sin()).collect();
         let started = std::time::Instant::now();
         let (hits, _) =
-            search_predicated(&graph, &Query::new(q), 10, 64, &mut pipe, 64 * 24, &mut scratch);
+            search_predicated(&graph, &graph.query(q), 10, 64, &mut pipe, 64 * 24, &mut scratch);
         let elapsed = started.elapsed();
         drop(tx);
         assert!(hits.hits.is_empty(), "no verdict can arrive for a refused batch, so nothing may be admitted");

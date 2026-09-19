@@ -7,6 +7,7 @@ use crate::distance::Query;
 use crate::insert::{insert_with_key, InsertError, InsertParams};
 use crate::search::{gather_keys, search_filtered, search_predicated, PredicatePipe, PredicatedHits, SearchScratch};
 use crate::graph::{KeyError, WriteError};
+use crate::format::Quant;
 use crate::{Graph, PlaneFile};
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode};
@@ -129,6 +130,7 @@ fn write_error(error: WriteError) -> Error {
     match error {
         WriteError::Wedged => Error::from_reason("plane slot lock is wedged (unreclaimable holder); rebuild the index"),
         WriteError::KeyArenaFull => Error::from_reason("plane key arena is full; rebuild the index"),
+        WriteError::BadVector(reason) => Error::from_reason(reason),
     }
 }
 
@@ -174,7 +176,7 @@ impl Task for SearchTask {
 
     fn compute(&mut self) -> Result<Self::Output> {
         let mut scratch = self.pool.take();
-        let query = Query::new(std::mem::take(&mut self.query));
+        let query = Query::for_plane(&self.graph.file, std::mem::take(&mut self.query));
         let (hits, _stats) = search_filtered(
             &self.graph,
             &query,
@@ -233,7 +235,7 @@ impl Task for PredicateSearchTask {
             rx,
         };
         let mut scratch = self.pool.take();
-        let query = Query::new(std::mem::take(&mut self.query));
+        let query = Query::for_plane(&self.graph.file, std::mem::take(&mut self.query));
         let (PredicatedHits { hits, keys, key_ends }, _stats) =
             search_predicated(&self.graph, &query, self.k, self.ef, &mut pipe, self.visit_budget, &mut scratch);
         self.pool.put(scratch);
@@ -279,8 +281,11 @@ impl Plane {
     /// Create a new plane file. `maxNodes` bounds the sparse reservation (pages materialize
     /// on write). `keyCap` (default 0) is the inline key capacity per slot; longer keys spill
     /// to an overflow arena of `keyArenaBytesPerNode` bytes per node (default
-    /// max(128, 4 x keyCap); sparse, so size it for the keys that will spill).
+    /// max(128, 4 x keyCap); sparse, so size it for the keys that will spill). `precision`
+    /// fixes the stored element width for the life of the file: 'int8' (default) or 'int16',
+    /// which costs one more byte per dimension per slot and quantizes ~256x finer.
     #[napi(factory)]
+    #[allow(clippy::too_many_arguments)]
     pub fn create(
         path: String,
         dims: u32,
@@ -288,15 +293,22 @@ impl Plane {
         max_nodes: f64,
         key_cap: Option<u32>,
         key_arena_bytes_per_node: Option<u32>,
+        #[napi(ts_arg_type = "'int8' | 'int16'")] precision: Option<String>,
     ) -> Result<Plane> {
         let key_cap = key_cap.unwrap_or(0) as usize;
-        let file = PlaneFile::create_with_key_arena(
+        let quant = match precision.as_deref() {
+            None | Some("int8") => Quant::Int8,
+            Some("int16") => Quant::Int16,
+            Some(other) => return Err(Error::from_reason(format!("unknown precision {other:?}; expected 'int8' or 'int16'"))),
+        };
+        let file = PlaneFile::create_with_options(
             std::path::Path::new(&path),
             dims as usize,
             layer0_cap as usize,
             max_nodes as u64,
             key_cap,
             key_arena_bytes_per_node.unwrap_or_else(|| crate::format::default_key_arena_per_node(key_cap)),
+            quant,
         )
         .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(Self::wrap(file))
@@ -324,11 +336,11 @@ impl Plane {
     /// arena, or a key the plane cannot store.
     #[napi]
     pub fn insert(&self, vector: Float32Array, key: Option<Buffer>) -> Result<u32> {
-        if vector.len() != self.graph.file.dims {
+        if vector.len() != self.graph.file.dims() {
             return Err(Error::from_reason(format!(
                 "vector has {} dims; plane was created with {}",
                 vector.len(),
-                self.graph.file.dims
+                self.graph.file.dims()
             )));
         }
         for (i, v) in vector.iter().enumerate() {
@@ -344,6 +356,11 @@ impl Plane {
             InsertError::Full => Error::from_reason("plane is full (maxNodes reached)"),
             InsertError::Wedged => Error::from_reason("plane slot lock is wedged (unreclaimable holder); rebuild the index"),
             InsertError::KeyArenaFull => Error::from_reason("plane key arena is full; rebuild the index"),
+            InsertError::DimensionMismatch => Error::from_reason(format!(
+                "vector has {} dims; plane was created with {}",
+                vector.len(),
+                self.graph.file.dims()
+            )),
             InsertError::KeyUnstorable => Error::from_reason(format!(
                 "key of {} bytes cannot be stored (plane keyCap = {}, max 65535)",
                 key.len(),
@@ -362,10 +379,11 @@ impl Plane {
     }
 
     /// Mirror a host-maintained node into the plane (dual-write phase 1): full node state
-    /// per call, host-allocated id, int8 vector bin + quantization scale + cached 1/|v|,
-    /// layer-0 neighbor ids, and per-upper-level neighbor id arrays (level 1 first). An
-    /// existing upper entry is rewritten in place. Idempotent per (id, state). `key` is
-    /// the host's key bytes, as for `insert`; omitted, the stored key is kept.
+    /// per call, host-allocated id, the vector in the plane's storage codec + quantization
+    /// scale + cached 1/|v|, layer-0 neighbor ids, and per-upper-level neighbor id arrays
+    /// (level 1 first). An existing upper entry is rewritten in place. Idempotent per
+    /// (id, state). `key` is the host's key bytes, as for `insert`; omitted, the stored key
+    /// is kept.
     #[napi]
     #[allow(clippy::too_many_arguments)]
     pub fn write_node_raw(
@@ -379,13 +397,7 @@ impl Plane {
         upper: Option<Vec<Uint32Array>>,
         key: Option<Buffer>,
     ) -> Result<()> {
-        if vector.len() != self.graph.file.dims {
-            return Err(Error::from_reason(format!(
-                "vector is {} bytes; plane dims = {}",
-                vector.len(),
-                self.graph.file.dims
-            )));
-        }
+        self.check_raw_vector(&vector)?;
         // ensure_high_water + slot_ptr have no bounds check, so a host id past the fixed
         // reservation would address past the slot region (mmap overrun) — reject it here.
         if id as u64 >= self.graph.file.max_nodes {
@@ -397,7 +409,6 @@ impl Plane {
         if !(scale as f32).is_finite() || !(inv_mag as f32).is_finite() {
             return Err(Error::from_reason("scale/invMag must be finite"));
         }
-        let vec_i8 = unsafe { std::slice::from_raw_parts(vector.as_ptr() as *const i8, vector.len()) };
         let upper_levels: Vec<Vec<u32>> =
             upper.map(|ls| ls.iter().map(|l| l.to_vec()).collect()).unwrap_or_default();
         // reject out-of-range neighbor ids rather than letting them poison traversal
@@ -419,7 +430,7 @@ impl Plane {
         let key = key.as_deref();
         check_key(&self.graph, key.unwrap_or(&[]))?;
         self.graph
-            .write_node_raw_with_key(id, level, vec_i8, scale as f32, inv_mag as f32, &neighbors.to_vec(), &upper_levels, key)
+            .write_node_raw_with_key(id, level, &vector, scale as f32, inv_mag as f32, &neighbors.to_vec(), &upper_levels, key)
             .map_err(write_error)
     }
 
@@ -441,13 +452,7 @@ impl Plane {
         upper: Option<Vec<Uint32Array>>,
         key: Option<Buffer>,
     ) -> Result<bool> {
-        if vector.len() != self.graph.file.dims {
-            return Err(Error::from_reason(format!(
-                "vector is {} bytes; plane dims = {}",
-                vector.len(),
-                self.graph.file.dims
-            )));
-        }
+        self.check_raw_vector(&vector)?;
         if (id as u64) >= self.graph.file.max_nodes {
             return Err(Error::from_reason(format!("id {} exceeds plane capacity {}", id, self.graph.file.max_nodes)));
         }
@@ -469,7 +474,6 @@ impl Plane {
                 }
             }
         }
-        let vec_i8 = unsafe { std::slice::from_raw_parts(vector.as_ptr() as *const i8, vector.len()) };
         let mut l0 = neighbors.to_vec();
         l0.truncate(self.graph.file.layer0_cap);
         // the untouched check and the write share one seqlock acquisition inside the crate:
@@ -477,7 +481,7 @@ impl Plane {
         let key = key.as_deref();
         check_key(&self.graph, key.unwrap_or(&[]))?;
         self.graph
-            .write_node_if_untouched(id, level, vec_i8, scale as f32, inv_mag as f32, &l0, &upper_levels, key)
+            .write_node_if_untouched(id, level, &vector, scale as f32, inv_mag as f32, &l0, &upper_levels, key)
             .map_err(write_error)
     }
 
@@ -523,10 +527,10 @@ impl Plane {
     /// `query.len()` bytes from each slot's vector, so an oversized query would read past
     /// it into adjacent slot bytes (or off the mapping entirely).
     fn check_query_dims(&self, len: usize) -> Result<()> {
-        if len != self.graph.file.dims {
+        if len != self.graph.file.dims() {
             return Err(Error::from_reason(format!(
                 "query vector has {} dimensions; plane dims = {}",
-                len, self.graph.file.dims
+                len, self.graph.file.dims()
             )));
         }
         Ok(())
@@ -537,9 +541,33 @@ impl Plane {
         self.graph.file.key_cap as u32
     }
 
+    /// Raw mirror buffers are stored bytes in the plane's codec, so a dims-length int8 buffer
+    /// against an int16 plane is a mismatch, not a half-written vector.
+    fn check_raw_vector(&self, vector: &[u8]) -> Result<()> {
+        if vector.len() != self.graph.file.vector_bytes() {
+            return Err(Error::from_reason(format!(
+                "vector is {} bytes; plane is {} dims x {} ({} bytes)",
+                vector.len(),
+                self.graph.file.dims(),
+                self.graph.file.quant().name(),
+                self.graph.file.vector_bytes()
+            )));
+        }
+        if self.graph.file.quant() == Quant::Int16 && !crate::distance::int16_bytes_in_domain(vector) {
+            return Err(Error::from_reason("int16 vectors must stay within +/-32767; -32768 is not a storable value"));
+        }
+        Ok(())
+    }
+
     #[napi(getter)]
     pub fn dims(&self) -> u32 {
-        self.graph.file.dims as u32
+        self.graph.file.dims() as u32
+    }
+
+    /// The stored element codec fixed at create: 'int8' or 'int16'.
+    #[napi(getter)]
+    pub fn precision(&self) -> String {
+        self.graph.file.quant().name().to_string()
     }
 
     #[napi(getter)]
@@ -619,7 +647,7 @@ impl Plane {
     pub fn search_sync(&self, vector: Float32Array, k: u32, ef: u32) -> Result<SearchHits> {
         self.check_query_dims(vector.len())?;
         let mut scratch = self.pool.take();
-        let query = Query::new(vector.to_vec());
+        let query = Query::for_plane(&self.graph.file, vector.to_vec());
         let (hits, _) = search_filtered(&self.graph, &query, k as usize, ef as usize, None, 24, &mut scratch);
         self.pool.put(scratch);
         Ok(hits_to_js(with_keys(&self.graph, hits)))

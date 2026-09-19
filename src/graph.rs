@@ -4,9 +4,9 @@
 //! the same file (per-entry seqlocks), so the hierarchy persists with the graph and
 //! concurrent searches share nothing mutable.
 
-use crate::distance::{cosine_i8_i8_raw, cosine_int8_raw, Query};
+use crate::distance::{cosine_raw, cosine_stored_raw, int16_bytes_in_domain, Query};
 use crate::format::{
-    key_class, key_offset, neighbor_offset, PlaneFile, FLAG_DELETED, FLAG_VALID, KEY_PAYLOAD, MAX_KEY_LEN, MAX_UPPER_LEVELS, NO_UPPER,
+    key_class, PlaneFile, Quant, FLAG_DELETED, FLAG_VALID, KEY_PAYLOAD, MAX_KEY_LEN, MAX_UPPER_LEVELS, NO_UPPER,
     S_DEGREE, S_FLAGS, S_INV_MAG, S_LEVEL, S_SCALE, S_UPPER_IDX, S_VECTOR, UPPER_CAP, UPPER_LEVEL_STRIDE, UL_DEGREE,
     UL_IDS, U_LEVELS, U_LISTS,
 };
@@ -19,7 +19,7 @@ use crate::seqlock::Wedged;
 /// seqlock's validating fence, which would let a reader act on bytes the generation check
 /// never covered. It does NOT make the access race-free under Rust's memory model — only
 /// atomics would, and that is the format change DESIGN.md §10 records as
-/// follow-up. The vector is deliberately not read this way: `cosine_int8_raw` must stay
+/// follow-up. The vector is deliberately not read this way: the distance kernel must stay
 /// autovectorized, and a torn vector only perturbs a distance the generation check discards.
 /// Every field read here is naturally aligned (slots are 64-aligned; the neighbor and upper
 /// id arrays are 4-padded by format.rs), so these compile to single loads.
@@ -85,6 +85,9 @@ pub enum WriteError {
     Wedged,
     /// the key overflow arena is exhausted (only a rebuild recovers the space)
     KeyArenaFull,
+    /// the raw vector is not `file.vector_bytes` long, or holds an element outside the codec's
+    /// operand domain
+    BadVector(&'static str),
 }
 
 impl From<Wedged> for WriteError {
@@ -98,7 +101,8 @@ pub struct NodeRead {
     pub level: u8,
     pub scale: f32,
     pub inv_mag: f32,
-    pub vector: Vec<i8>,
+    /// Raw stored bytes in the plane's codec (`file.vector_bytes` long), not element values.
+    pub vector: Vec<u8>,
     pub neighbors: Vec<u32>,
 }
 
@@ -135,7 +139,7 @@ impl Graph {
             (p.add(S_UPPER_IDX) as *mut u32).write_unaligned(NO_UPPER);
             // and a half-written overflow record: a zero length is never reused
             if self.file.key_cap > 0 {
-                (p.add(key_offset(self.file.dims, self.file.layer0_cap)) as *mut u16).write_unaligned(0);
+                (p.add(self.file.key_offset()) as *mut u16).write_unaligned(0);
             }
             *p.add(S_FLAGS) = FLAG_DELETED;
         }
@@ -148,6 +152,24 @@ impl Graph {
     /// Sanitizer for an upper-entry lock taken over from a dead writer.
     fn upper_sanitizer(&self, idx: u32) -> impl Fn() + '_ {
         move || unsafe { *self.file.upper_ptr_mut(idx).add(U_LEVELS) = 0 }
+    }
+
+    /// A query in this plane's codec.
+    pub fn query(&self, vector: Vec<f32>) -> Query {
+        Query::for_plane(&self.file, vector)
+    }
+
+    /// Callers apply this before allocating an upper entry, so a rejected write leaks nothing.
+    /// -32768 is refused because two of them overflow one `_mm256_madd_epi16` lane, which no
+    /// accumulator width above the instruction can repair.
+    fn check_stored_vector(&self, vector: &[u8]) -> Result<(), WriteError> {
+        if vector.len() != self.file.vector_bytes() {
+            return Err(WriteError::BadVector("vector byte length does not match the plane's dims x element size"));
+        }
+        if self.file.quant() == Quant::Int16 && !int16_bytes_in_domain(vector) {
+            return Err(WriteError::BadVector("int16 vectors must stay within +/-32767; -32768 is not a storable value"));
+        }
+        Ok(())
     }
 
     /// Whether `key` can be stored on this plane at all (capacity is checked at write time).
@@ -177,7 +199,7 @@ impl Graph {
         if self.file.key_cap == 0 {
             return Ok(());
         }
-        let kp = p.add(key_offset(self.file.dims, self.file.layer0_cap));
+        let kp = p.add(self.file.key_offset());
         let payload = kp.add(KEY_PAYLOAD);
         if key.len() <= self.file.key_cap {
             (kp as *mut u16).write_unaligned((key.len() as u16).to_le());
@@ -218,7 +240,7 @@ impl Graph {
         if key_cap == 0 {
             return self.node_alive(id).then_some(());
         }
-        let koff = key_offset(self.file.dims, self.file.layer0_cap);
+        let koff = self.file.key_offset();
         let arena_len = self.file.key_arena_len;
         let seq = self.file.seq_atomic(id);
         seqlock::read_consistent(seq, self.file.self_tag, || {
@@ -261,7 +283,7 @@ impl Graph {
         let p = self.file.slot_ptr(id);
         // the header and first vector lines cover a 128-d slot entirely; wider vectors get
         // their leading lines, enough to overlap the miss without flooding L1 on hub nodes
-        let end = (S_VECTOR + self.file.dims).min(PREFETCH_BYTES);
+        let end = (S_VECTOR + self.file.vector_bytes()).min(PREFETCH_BYTES);
         let mut off = 0;
         while off < end {
             prefetch_line(unsafe { p.add(off) });
@@ -275,6 +297,11 @@ impl Graph {
         if !self.in_range(id) {
             return None;
         }
+        // A query built for another plane would stream the wrong number of bytes out of every
+        // slot — at a narrow layer-0 cap, past the slot and off the end of the mapping.
+        if query.quant() != self.file.quant() || query.dims() != self.file.dims() {
+            return None;
+        }
         let seq = self.file.seq_atomic(id);
         seqlock::read_consistent(seq, self.file.self_tag, || {
             let p = self.file.slot_ptr(id);
@@ -285,7 +312,7 @@ impl Graph {
                 }
                 let scale = vread(p.add(S_SCALE) as *const f32);
                 let inv_mag = vread(p.add(S_INV_MAG) as *const f32);
-                Some(cosine_int8_raw(query, p.add(S_VECTOR) as *const i8, scale, inv_mag))
+                Some(cosine_raw(query, p.add(S_VECTOR), scale, inv_mag))
             }
         }, self.slot_sanitizer(id), || None, self.owner_dead())
     }
@@ -296,7 +323,7 @@ impl Graph {
         if !self.in_range(a) || !self.in_range(b) {
             return None;
         }
-        let dims = self.file.dims;
+        let dims = self.file.dims();
         let pa = self.file.slot_ptr(a);
         let pb = self.file.slot_ptr(b);
         unsafe {
@@ -309,11 +336,12 @@ impl Graph {
             let inv_a = (pa.add(S_INV_MAG) as *const f32).read_unaligned();
             let scale_b = (pb.add(S_SCALE) as *const f32).read_unaligned();
             let inv_b = (pb.add(S_INV_MAG) as *const f32).read_unaligned();
-            Some(cosine_i8_i8_raw(
-                pa.add(S_VECTOR) as *const i8,
+            Some(cosine_stored_raw(
+                self.file.quant(),
+                pa.add(S_VECTOR),
                 scale_a,
                 inv_a,
-                pb.add(S_VECTOR) as *const i8,
+                pb.add(S_VECTOR),
                 scale_b,
                 inv_b,
                 dims,
@@ -331,7 +359,7 @@ impl Graph {
         }
         let seq = self.file.seq_atomic(id);
         let cap = self.file.layer0_cap;
-        let nbase = neighbor_offset(self.file.dims);
+        let nbase = self.file.neighbor_offset();
         seqlock::read_consistent(seq, self.file.self_tag, || {
             out.clear();
             let p = self.file.slot_ptr(id);
@@ -488,7 +516,7 @@ impl Graph {
         &self,
         id: u32,
         level: u8,
-        vector: &[i8],
+        vector: &[u8],
         scale: f32,
         inv_mag: f32,
         neighbors: &[u32],
@@ -504,13 +532,14 @@ impl Graph {
         &self,
         id: u32,
         level: u8,
-        vector: &[i8],
+        vector: &[u8],
         scale: f32,
         inv_mag: f32,
         neighbors: &[u32],
         upper_levels: &[Vec<u32>],
         key: Option<&[u8]>,
     ) -> Result<(), WriteError> {
+        self.check_stored_vector(vector)?;
         self.file.ensure_high_water(id);
         let existing = match self.upper_idx_locked(id)? {
             idx if idx != NO_UPPER && (idx as u64) >= self.file.upper_capacity => NO_UPPER, // corrupt stored index
@@ -604,9 +633,9 @@ impl Graph {
             return None;
         }
         let seq = self.file.seq_atomic(id);
-        let dims = self.file.dims;
+        let vector_bytes = self.file.vector_bytes();
         let cap = self.file.layer0_cap;
-        let nbase_off = neighbor_offset(dims);
+        let nbase_off = self.file.neighbor_offset();
         seqlock::read_consistent(seq, self.file.self_tag, || {
             let p = self.file.slot_ptr(id);
             unsafe {
@@ -618,7 +647,7 @@ impl Graph {
                 let degree = u16::from_le(vread(p.add(S_DEGREE) as *const u16)) as usize;
                 let scale = vread(p.add(S_SCALE) as *const f32);
                 let inv_mag = vread(p.add(S_INV_MAG) as *const f32);
-                let vector = std::slice::from_raw_parts(p.add(S_VECTOR) as *const i8, dims).to_vec();
+                let vector = std::slice::from_raw_parts(p.add(S_VECTOR), vector_bytes).to_vec();
                 let nbase = p.add(nbase_off) as *const u32;
                 let neighbors = (0..degree.min(cap)).map(|i| u32::from_le(vread(nbase.add(i)))).collect();
                 Some(NodeRead { level, scale, inv_mag, vector, neighbors })
@@ -631,13 +660,19 @@ impl Graph {
     /// the host's key bytes (`check_key` passed; ignored on a plane without key capacity), or
     /// None to keep the key the slot already holds.
     #[allow(clippy::too_many_arguments)]
-    pub fn write_node(&self, id: u32, level: u8, vector: &[i8], scale: f32, inv_mag: f32, neighbors: &[u32], upper_idx: u32, key: Option<&[u8]>) -> Result<(), WriteError> {
+    pub(crate) fn write_node(&self, id: u32, level: u8, vector: &[u8], scale: f32, inv_mag: f32, neighbors: &[u32], upper_idx: u32, key: Option<&[u8]>) -> Result<(), WriteError> {
         debug_assert!(neighbors.len() <= self.file.layer0_cap);
-        debug_assert_eq!(vector.len(), self.file.dims);
+        // the copy below is sized by this, so an over-long slice would write through the
+        // neighbor array into the following slot. The element-domain scan stays at the raw
+        // entry points, off the insert hot path.
+        if vector.len() != self.file.vector_bytes() {
+            return Err(WriteError::BadVector("vector byte length does not match the plane's dims x element size"));
+        }
+        debug_assert!(self.file.quant() != Quant::Int16 || int16_bytes_in_domain(vector));
         let seq = self.file.seq_atomic(id);
         let _guard = seqlock::write_lock(seq, self.file.self_tag, self.slot_sanitizer(id), self.owner_dead())?;
         let p = self.file.slot_ptr_mut(id);
-        let dims = self.file.dims;
+        let nbase = self.file.neighbor_offset();
         unsafe {
             // key first: an exhausted arena leaves the slot's previous state intact
             self.store_key_locked(p, key)?;
@@ -646,9 +681,9 @@ impl Graph {
             (p.add(S_SCALE) as *mut f32).write_unaligned(scale);
             (p.add(S_INV_MAG) as *mut f32).write_unaligned(inv_mag);
             (p.add(S_UPPER_IDX) as *mut u32).write_unaligned(upper_idx);
-            std::ptr::copy_nonoverlapping(vector.as_ptr() as *const u8, p.add(S_VECTOR), dims);
+            std::ptr::copy_nonoverlapping(vector.as_ptr(), p.add(S_VECTOR), vector.len());
             for (i, n) in neighbors.iter().enumerate() {
-                (p.add(neighbor_offset(dims) + i * 4) as *mut u32).write_unaligned(n.to_le());
+                (p.add(nbase + i * 4) as *mut u32).write_unaligned(n.to_le());
             }
             // valid last within the locked section; the seqlock release publishes it
             *p.add(S_FLAGS) = FLAG_VALID;
@@ -671,7 +706,6 @@ impl Graph {
         let seq = self.file.seq_atomic(id);
         let _guard = seqlock::write_lock(seq, self.file.self_tag, self.slot_sanitizer(id), self.owner_dead())?;
         let p = self.file.slot_ptr_mut(id);
-        let dims = self.file.dims;
         let cap = self.file.layer0_cap;
         unsafe {
             let flags = *p.add(S_FLAGS);
@@ -679,7 +713,7 @@ impl Graph {
                 return Ok(false);
             }
             let degree = u16::from_le((p.add(S_DEGREE) as *const u16).read_unaligned()) as usize;
-            let base = p.add(neighbor_offset(dims)) as *mut u32;
+            let base = p.add(self.file.neighbor_offset()) as *mut u32;
             let mut list: Vec<u32> = (0..degree.min(cap)).map(|i| u32::from_le(base.add(i).read_unaligned())).collect();
             f(&mut list);
             list.truncate(cap);
@@ -703,7 +737,6 @@ impl Graph {
         let seq = self.file.seq_atomic(id);
         let _guard = seqlock::write_lock(seq, self.file.self_tag, self.slot_sanitizer(id), self.owner_dead())?;
         let p = self.file.slot_ptr_mut(id);
-        let dims = self.file.dims;
         unsafe {
             if *p.add(S_FLAGS) != FLAG_VALID {
                 return Ok(false);
@@ -712,7 +745,7 @@ impl Graph {
             if degree != expected.len() {
                 return Ok(false);
             }
-            let base = p.add(neighbor_offset(dims)) as *mut u32;
+            let base = p.add(self.file.neighbor_offset()) as *mut u32;
             for (i, want) in expected.iter().enumerate() {
                 if u32::from_le(base.add(i).read_unaligned()) != *want {
                     return Ok(false);
@@ -732,11 +765,11 @@ impl Graph {
         let seq = self.file.seq_atomic(id);
         let _guard = seqlock::write_lock(seq, self.file.self_tag, self.slot_sanitizer(id), self.owner_dead())?;
         let p = self.file.slot_ptr_mut(id);
-        let dims = self.file.dims;
+        let nbase = self.file.neighbor_offset();
         unsafe {
             (p.add(S_DEGREE) as *mut u16).write_unaligned((neighbors.len() as u16).to_le());
             for (i, n) in neighbors.iter().enumerate() {
-                (p.add(neighbor_offset(dims) + i * 4) as *mut u32).write_unaligned(n.to_le());
+                (p.add(nbase + i * 4) as *mut u32).write_unaligned(n.to_le());
             }
         }
         Ok(())
@@ -929,7 +962,7 @@ impl Graph {
         &self,
         id: u32,
         level: u8,
-        vector: &[i8],
+        vector: &[u8],
         scale: f32,
         inv_mag: f32,
         neighbors: &[u32],
@@ -937,7 +970,7 @@ impl Graph {
         key: Option<&[u8]>,
     ) -> Result<bool, WriteError> {
         debug_assert!(neighbors.len() <= self.file.layer0_cap);
-        debug_assert_eq!(vector.len(), self.file.dims);
+        self.check_stored_vector(vector)?;
         self.file.ensure_high_water(id);
         // the upper entry is allocated before taking the slot lock (allocation is cheap); it is
         // unreachable from any slot until the write below lands, so every path that does not
@@ -954,7 +987,7 @@ impl Graph {
                 }
             };
             let p = self.file.slot_ptr_mut(id);
-            let dims = self.file.dims;
+            let nbase = self.file.neighbor_offset();
             unsafe {
                 if *p.add(S_FLAGS) != 0 {
                     false
@@ -968,9 +1001,9 @@ impl Graph {
                     (p.add(S_SCALE) as *mut f32).write_unaligned(scale);
                     (p.add(S_INV_MAG) as *mut f32).write_unaligned(inv_mag);
                     (p.add(S_UPPER_IDX) as *mut u32).write_unaligned(upper_idx);
-                    std::ptr::copy_nonoverlapping(vector.as_ptr() as *const u8, p.add(S_VECTOR), dims);
+                    std::ptr::copy_nonoverlapping(vector.as_ptr(), p.add(S_VECTOR), vector.len());
                     for (i, n) in neighbors.iter().enumerate() {
-                        (p.add(neighbor_offset(dims) + i * 4) as *mut u32).write_unaligned(n.to_le());
+                        (p.add(nbase + i * 4) as *mut u32).write_unaligned(n.to_le());
                     }
                     *p.add(S_FLAGS) = FLAG_VALID;
                     true
@@ -989,7 +1022,6 @@ impl Graph {
 #[cfg(test)]
 mod probe_tests {
     use super::*;
-    use crate::distance::Query;
     use crate::insert::{insert, InsertParams};
     use crate::search::{search, SearchScratch};
     use std::sync::atomic::Ordering::Relaxed;
@@ -1021,7 +1053,7 @@ mod probe_tests {
         }
         graph.file.clear_entry_point_if(entry);
 
-        let query = Query::new(vector_for(7, dims));
+        let query = graph.query(vector_for(7, dims));
         for _ in 0..stride {
             assert!(search(&graph, &query, 5, 64, &mut scratch).0.is_empty());
         }
@@ -1035,7 +1067,7 @@ mod probe_tests {
         let q = crate::distance::quantize_int8(&vector_for(revived, dims));
         let other = Graph::new(PlaneFile::open(&path).expect("a second handle"));
         other.write_node_raw(revived, 0, &q.0, q.1, q.2, &[], &[]).expect("revive");
-        let found = (0..stride).any(|_| !search(&graph, &Query::new(vector_for(revived, dims)), 5, 64, &mut scratch).0.is_empty());
+        let found = (0..stride).any(|_| !search(&graph, &graph.query(vector_for(revived, dims)), 5, 64, &mut scratch).0.is_empty());
         assert!(found, "a write must re-arm the probe");
         let _ = std::fs::remove_file(&path);
     }
