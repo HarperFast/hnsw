@@ -165,7 +165,7 @@ fn run(n: u64, dims: usize, queries: usize, efs: &[usize], path: &std::path::Pat
     let sidecar = path.with_extension("hnsw.corpus");
     let reuse = PlaneFile::open(&path)
         .ok()
-        .filter(|f| f.id_high_water() == n && f.layer0_cap == layer0_cap && f.dims == dims && f.quant == quant)
+        .filter(|f| f.id_high_water() == n && f.layer0_cap == layer0_cap && f.dims == dims && f.quant() == quant)
         .is_some()
         && std::fs::read_to_string(&sidecar).map(|c| c == corpus_id).unwrap_or(false);
     let file = if reuse {

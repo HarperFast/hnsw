@@ -374,10 +374,11 @@ impl Plane {
     }
 
     /// Mirror a host-maintained node into the plane (dual-write phase 1): full node state
-    /// per call, host-allocated id, int8 vector bin + quantization scale + cached 1/|v|,
-    /// layer-0 neighbor ids, and per-upper-level neighbor id arrays (level 1 first). An
-    /// existing upper entry is rewritten in place. Idempotent per (id, state). `key` is
-    /// the host's key bytes, as for `insert`; omitted, the stored key is kept.
+    /// per call, host-allocated id, the vector in the plane's storage codec + quantization
+    /// scale + cached 1/|v|, layer-0 neighbor ids, and per-upper-level neighbor id arrays
+    /// (level 1 first). An existing upper entry is rewritten in place. Idempotent per
+    /// (id, state). `key` is the host's key bytes, as for `insert`; omitted, the stored key
+    /// is kept.
     #[napi]
     #[allow(clippy::too_many_arguments)]
     pub fn write_node_raw(
@@ -535,22 +536,20 @@ impl Plane {
         self.graph.file.key_cap as u32
     }
 
-    /// Raw mirror buffers are stored bytes in the plane's codec, so their length is
-    /// `dims x elemSize` — a dims-length int8 buffer against an int16 plane is a mismatch, not
-    /// a half-written vector. The `-32768` refusal is the madd operand domain (see
-    /// `Quant::max_abs`) and is checked again in the graph writer, which is the funnel every
-    /// Rust caller passes through too.
+    /// Raw mirror buffers are stored bytes in the plane's codec, so a dims-length int8 buffer
+    /// against an int16 plane is a mismatch, not a half-written vector. This is the better
+    /// message; the binding refusal is in the graph writer.
     fn check_raw_vector(&self, vector: &[u8]) -> Result<()> {
-        if vector.len() != self.graph.file.vector_bytes {
+        if vector.len() != self.graph.file.vector_bytes() {
             return Err(Error::from_reason(format!(
                 "vector is {} bytes; plane is {} dims x {} ({} bytes)",
                 vector.len(),
                 self.graph.file.dims,
-                self.graph.file.quant.name(),
-                self.graph.file.vector_bytes
+                self.graph.file.quant().name(),
+                self.graph.file.vector_bytes()
             )));
         }
-        if self.graph.file.quant == Quant::Int16 && !crate::distance::int16_bytes_in_domain(vector) {
+        if self.graph.file.quant() == Quant::Int16 && !crate::distance::int16_bytes_in_domain(vector) {
             return Err(Error::from_reason("int16 vectors must stay within +/-32767; -32768 is not a storable value"));
         }
         Ok(())
@@ -564,7 +563,7 @@ impl Plane {
     /// The stored element codec fixed at create: 'int8' or 'int16'.
     #[napi(getter)]
     pub fn precision(&self) -> String {
-        self.graph.file.quant.name().to_string()
+        self.graph.file.quant().name().to_string()
     }
 
     #[napi(getter)]

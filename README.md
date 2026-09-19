@@ -78,7 +78,9 @@ Vectors are stored quantized with a per-vector symmetric scale. The default, `'i
 each component to `max|c|/127` — about 0.8% of the vector's largest component per element,
 which is usually close enough to *rank* candidates but not to *score* them, so callers
 typically rerank the returned hits against exact vectors. `'int16'` maps to `max|c|/32767`
-instead: ~256× finer, about 0.003% per element, precise enough to skip that rerank. It costs
+instead: ~256× finer, about 0.003% per element. Whether that is close enough to drop the
+rerank is a question about your corpus and your accuracy budget, and this package cannot
+answer it for you — validate it against your own data before turning a rerank off. It costs
 one more byte per dimension per slot — +18% at 128 dims (704 → 832 B), +73% at 1536
 (2112 → 3648 B) — so it suits small-to-mid dimensionality, while int8 stays the right choice
 for wide embeddings, where doubling the bytes each traversal scans pushes search into the

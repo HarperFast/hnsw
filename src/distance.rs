@@ -17,56 +17,70 @@ pub struct Quantized {
     pub inv_mag: f32,
 }
 
-/// Precomputed query state, built once per search and bound to one plane's codec.
+/// Precomputed query state, built once per search and bound to one plane's codec. Exactly one
+/// of `f32_vector` and `quantized` is populated — the operand the selected kernel reads.
 pub struct Query {
-    pub vector: Vec<f32>,
+    dims: usize,
     /// 1/|query|.
     pub inv_mag: f32,
     /// `inv_mag` with the query-side quantization scale already folded in, so the cosine
     /// expression costs the same multiply count for both codecs.
     norm: f32,
-    /// The query in the plane's codec: empty for int8 (the kernel reads `vector` directly),
-    /// little-endian i16 for int16.
+    /// int8 operand: the caller's own f32 vector, moved rather than copied.
+    f32_vector: Vec<f32>,
+    /// int16 operand: the query quantized to little-endian i16.
     quantized: Vec<u8>,
     pub quant: Quant,
     kernel: unsafe fn(&Query, *const u8) -> f32,
 }
 
 impl Query {
-    /// Build a query for `file`'s codec. This is the only constructor: a query carrying the
-    /// wrong element width would read the wrong number of bytes out of every slot.
+    /// Build a query for `file`'s codec. This is the only public constructor, because a query
+    /// carrying the wrong element width would read the wrong number of bytes out of every slot.
     pub fn for_plane(file: &PlaneFile, vector: Vec<f32>) -> Self {
-        match file.quant {
+        match file.quant() {
             Quant::Int8 => Self::int8(vector),
             Quant::Int16 => {
                 let (bytes, scale) = quantize_query_int16(&vector);
-                Self::int16(vector, bytes, scale)
+                Self::int16(&vector, bytes, scale)
             }
         }
     }
 
-    /// `for_plane` reusing an encoding the caller already computed for the same vector (the
-    /// insert path quantizes for storage first, and the query encoding is the same arithmetic).
-    pub fn for_plane_reusing(file: &PlaneFile, vector: Vec<f32>, stored: &Quantized) -> Self {
-        match file.quant {
+    /// `for_plane` reusing an encoding already computed for the same vector under the same
+    /// codec. Crate-internal: a shorter encoding would be read past its end.
+    pub(crate) fn for_plane_reusing(file: &PlaneFile, vector: Vec<f32>, stored: &Quantized) -> Self {
+        assert_eq!(stored.bytes.len(), file.vector_bytes(), "reused encoding is not this plane's");
+        match file.quant() {
             Quant::Int8 => Self::int8(vector),
-            Quant::Int16 => Self::int16(vector, stored.bytes.clone(), stored.scale),
+            Quant::Int16 => Self::int16(&vector, stored.bytes.clone(), stored.scale),
         }
     }
 
     fn int8(vector: Vec<f32>) -> Self {
         let inv_mag = inv_magnitude(&vector);
-        Query { vector, inv_mag, norm: inv_mag, quantized: Vec::new(), quant: Quant::Int8, kernel: select_dot_f32_i8() }
+        let dims = vector.len();
+        Query { dims, inv_mag, norm: inv_mag, f32_vector: vector, quantized: Vec::new(), quant: Quant::Int8, kernel: select_dot_f32_i8() }
     }
 
-    fn int16(vector: Vec<f32>, quantized: Vec<u8>, scale: f32) -> Self {
-        let inv_mag = inv_magnitude(&vector);
-        Query { vector, inv_mag, norm: inv_mag * scale, quantized, quant: Quant::Int16, kernel: select_dot_i16_i16() }
+    /// The f32 vector is dropped: the int16 kernel never reads it, and only the two scalars
+    /// derived from it survive.
+    fn int16(vector: &[f32], quantized: Vec<u8>, scale: f32) -> Self {
+        let inv_mag = inv_magnitude(vector);
+        Query {
+            dims: vector.len(),
+            inv_mag,
+            norm: inv_mag * scale,
+            f32_vector: Vec::new(),
+            quantized,
+            quant: Quant::Int16,
+            kernel: select_dot_i16_i16(),
+        }
     }
 
     #[inline]
     pub fn dims(&self) -> usize {
-        self.vector.len()
+        self.dims
     }
 }
 
@@ -100,7 +114,7 @@ fn select_dot_f32_i8() -> unsafe fn(&Query, *const u8) -> f32 {
 
 #[inline]
 unsafe fn dot_f32_i8_scalar(query: &Query, v: *const u8) -> f32 {
-    let q = &query.vector;
+    let q = &query.f32_vector;
     let v = v as *const i8;
     let mut acc = [0.0f32; 8];
     let chunks = q.len() / 8;
@@ -121,7 +135,7 @@ unsafe fn dot_f32_i8_scalar(query: &Query, v: *const u8) -> f32 {
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn dot_f32_i8_avx2(query: &Query, v: *const u8) -> f32 {
     use std::arch::x86_64::*;
-    let q = &query.vector;
+    let q = &query.f32_vector;
     let v = v as *const i8;
     let mut acc0 = _mm256_setzero_ps();
     let mut acc1 = _mm256_setzero_ps();
@@ -211,9 +225,10 @@ pub unsafe fn dot_i16_i16_avx2(a: *const u8, b: *const u8, len: usize) -> f32 {
     dot as f32
 }
 
-/// The f32-accumulating variant of the same kernel, kept for the benchmark that chooses
-/// between them: one `cvtepi32_ps` + `add_ps` per madd instead of two widenings and two adds,
-/// at ~1e-7 relative error instead of exact.
+/// The f32-accumulating variant, kept for the benchmark that chose between them: one
+/// `cvtepi32_ps` + `add_ps` per madd instead of two widenings and two adds, 1.5-1.7x faster,
+/// but accurate only to the accumulated f32 rounding — under 1e-5 relative across 4096 dims
+/// rather than exact, which is why the shipped kernel widens to i64.
 ///
 /// # Safety
 /// Same contract as [`dot_i16_i16_avx2`].

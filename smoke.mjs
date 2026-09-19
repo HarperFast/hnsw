@@ -144,8 +144,7 @@ if (!threw || !/in-band:.*sidecar:/.test(threw.message)) throw new Error(`double
 rmSync(stalePathFor(bogus), { recursive: true });
 console.log('invalidatePlane OK');
 
-// int16 precision: the whole N-API surface on the wider codec — create, insert, async,
-// filtered, predicate and sync search, both raw writers, flush, reopen.
+// int16 precision over the N-API surface.
 const p16 = join(tmpdir(), `smoke16-${process.pid}.hnsw`);
 const plane16 = Plane.create(p16, dims, 32, 10_000, 16, undefined, 'int16');
 if (plane16.precision !== 'int16') throw new Error(`precision getter reported ${plane16.precision}`);

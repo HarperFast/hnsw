@@ -19,7 +19,7 @@ use crate::seqlock::Wedged;
 /// seqlock's validating fence, which would let a reader act on bytes the generation check
 /// never covered. It does NOT make the access race-free under Rust's memory model — only
 /// atomics would, and that is the format change DESIGN.md §10 records as
-/// follow-up. The vector is deliberately not read this way: `cosine_raw` must stay
+/// follow-up. The vector is deliberately not read this way: the distance kernel must stay
 /// autovectorized, and a torn vector only perturbs a distance the generation check discards.
 /// Every field read here is naturally aligned (slots are 64-aligned; the neighbor and upper
 /// id arrays are 4-padded by format.rs), so these compile to single loads.
@@ -154,20 +154,19 @@ impl Graph {
         move || unsafe { *self.file.upper_ptr_mut(idx).add(U_LEVELS) = 0 }
     }
 
-    /// A query in this plane's codec. Queries are built from the plane precisely so a query
-    /// and the slots it scores can never disagree about element width.
+    /// A query in this plane's codec.
     pub fn query(&self, vector: Vec<f32>) -> Query {
         Query::for_plane(&self.file, vector)
     }
 
-    /// Gate on raw stored bytes, applied before any upper-entry allocation so a rejected write
-    /// leaks nothing. -32768 is refused because two of them overflow one `_mm256_madd_epi16`
-    /// lane, which no accumulator width above the instruction can repair.
+    /// Callers apply this before allocating an upper entry, so a rejected write leaks nothing.
+    /// -32768 is refused because two of them overflow one `_mm256_madd_epi16` lane, which no
+    /// accumulator width above the instruction can repair.
     fn check_stored_vector(&self, vector: &[u8]) -> Result<(), WriteError> {
-        if vector.len() != self.file.vector_bytes {
+        if vector.len() != self.file.vector_bytes() {
             return Err(WriteError::BadVector("vector byte length does not match the plane's dims x element size"));
         }
-        if self.file.quant == Quant::Int16 && !int16_bytes_in_domain(vector) {
+        if self.file.quant() == Quant::Int16 && !int16_bytes_in_domain(vector) {
             return Err(WriteError::BadVector("int16 vectors must stay within +/-32767; -32768 is not a storable value"));
         }
         Ok(())
@@ -284,7 +283,7 @@ impl Graph {
         let p = self.file.slot_ptr(id);
         // the header and first vector lines cover a 128-d slot entirely; wider vectors get
         // their leading lines, enough to overlap the miss without flooding L1 on hub nodes
-        let end = (S_VECTOR + self.file.vector_bytes).min(PREFETCH_BYTES);
+        let end = (S_VECTOR + self.file.vector_bytes()).min(PREFETCH_BYTES);
         let mut off = 0;
         while off < end {
             prefetch_line(unsafe { p.add(off) });
@@ -299,10 +298,8 @@ impl Graph {
             return None;
         }
         // A query built for another plane would stream the wrong number of bytes out of every
-        // slot — at a narrow layer-0 cap, past the slot and off the end of the mapping. There is
-        // one Query constructor and it takes the plane, so this is unreachable through the
-        // public API; it stays because the consequence of reaching it is a segfault.
-        if query.quant != self.file.quant || query.dims() != self.file.dims {
+        // slot — at a narrow layer-0 cap, past the slot and off the end of the mapping.
+        if query.quant != self.file.quant() || query.dims() != self.file.dims {
             return None;
         }
         let seq = self.file.seq_atomic(id);
@@ -340,7 +337,7 @@ impl Graph {
             let scale_b = (pb.add(S_SCALE) as *const f32).read_unaligned();
             let inv_b = (pb.add(S_INV_MAG) as *const f32).read_unaligned();
             Some(cosine_stored_raw(
-                self.file.quant,
+                self.file.quant(),
                 pa.add(S_VECTOR),
                 scale_a,
                 inv_a,
@@ -636,7 +633,7 @@ impl Graph {
             return None;
         }
         let seq = self.file.seq_atomic(id);
-        let vector_bytes = self.file.vector_bytes;
+        let vector_bytes = self.file.vector_bytes();
         let cap = self.file.layer0_cap;
         let nbase_off = self.file.neighbor_offset();
         seqlock::read_consistent(seq, self.file.self_tag, || {
@@ -663,10 +660,15 @@ impl Graph {
     /// the host's key bytes (`check_key` passed; ignored on a plane without key capacity), or
     /// None to keep the key the slot already holds.
     #[allow(clippy::too_many_arguments)]
-    pub fn write_node(&self, id: u32, level: u8, vector: &[u8], scale: f32, inv_mag: f32, neighbors: &[u32], upper_idx: u32, key: Option<&[u8]>) -> Result<(), WriteError> {
+    pub(crate) fn write_node(&self, id: u32, level: u8, vector: &[u8], scale: f32, inv_mag: f32, neighbors: &[u32], upper_idx: u32, key: Option<&[u8]>) -> Result<(), WriteError> {
         debug_assert!(neighbors.len() <= self.file.layer0_cap);
-        debug_assert_eq!(vector.len(), self.file.vector_bytes);
-        debug_assert!(self.file.quant != Quant::Int16 || int16_bytes_in_domain(vector));
+        // length is checked in every build, not just debug: the copy below is sized by it, so
+        // an over-long slice would write through the neighbor array into the following slot.
+        // The element-domain scan stays at the raw entry points, off the insert hot path.
+        if vector.len() != self.file.vector_bytes() {
+            return Err(WriteError::BadVector("vector byte length does not match the plane's dims x element size"));
+        }
+        debug_assert!(self.file.quant() != Quant::Int16 || int16_bytes_in_domain(vector));
         let seq = self.file.seq_atomic(id);
         let _guard = seqlock::write_lock(seq, self.file.self_tag, self.slot_sanitizer(id), self.owner_dead())?;
         let p = self.file.slot_ptr_mut(id);

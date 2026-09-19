@@ -91,10 +91,10 @@ export declare class Plane {
 	 * scale and cached 1/|v|, layer-0 neighbor ids, and per-upper-level neighbor id arrays
 	 * (level 1 first). An existing upper entry is rewritten in place.
 	 *
-	 * `vector` is raw stored bytes in the plane's own codec, so it is `dims` bytes on an int8
-	 * plane and `dims × 2` little-endian int16s on an int16 one. Int16 components must stay
-	 * within ±32767: -32768 is rejected, because a pair of them overflows the SIMD kernel's
-	 * accumulator lane.
+	 * `vector` is raw stored bytes in the plane's own codec: `dims` bytes on an int8 plane,
+	 * and `dims` little-endian int16s — `dims × 2` bytes — on an int16 one. Int16 components
+	 * must stay within ±32767; -32768 is rejected, because a pair of them overflows the SIMD
+	 * kernel's accumulator lane.
 	 */
 	writeNodeRaw(
 		id: number,

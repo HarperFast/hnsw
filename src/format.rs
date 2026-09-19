@@ -56,8 +56,7 @@ impl Quant {
         }
     }
 
-    /// The only two (version, codec) pairs any writer produces. A file carrying anything else —
-    /// including v9/int8, which nothing emits — is refused rather than guessed at.
+    /// A file whose (version, codec) pair no writer produces is refused rather than guessed at.
     fn from_header(version: u32, quant_byte: u8) -> Option<Self> {
         match (version, quant_byte) {
             (VERSION, 0) => Some(Quant::Int8),
@@ -189,10 +188,13 @@ pub struct PlaneFile {
     pub map: MmapMut,
     pub dims: usize,
     /// Stored element codec, fixed at create and validated at open against the file version.
-    pub quant: Quant,
+    /// Private with `vector_bytes`: the two derive from each other and from the mapped file's
+    /// recorded slot size, and a safe caller able to set one of them independently could
+    /// select a layout the file does not have.
+    quant: Quant,
     /// `dims * quant.elem_size()`: the real byte length of a slot's vector. Every slot offset
     /// derives from this, never from `dims`.
-    pub vector_bytes: usize,
+    vector_bytes: usize,
     pub layer0_cap: usize,
     pub slot_size: usize,
     pub max_nodes: u64,
@@ -508,6 +510,17 @@ impl PlaneFile {
         // mapping and, with another process still mapping the file, could force a LIVE
         // writer's lock. The clean-shutdown byte remains advisory metadata only.
         Ok(plane)
+    }
+
+    #[inline]
+    pub fn quant(&self) -> Quant {
+        self.quant
+    }
+
+    /// The real byte length of a slot's vector, `dims * quant.elem_size()`.
+    #[inline]
+    pub fn vector_bytes(&self) -> usize {
+        self.vector_bytes
     }
 
     /// Offsets as methods so no call site can pass `dims` where vector BYTES are meant.

@@ -197,7 +197,7 @@ pub fn insert_with_key(
     if key.len() > graph.file.key_cap && !graph.file.key_arena_has_room(key.len()) {
         return Err(InsertError::KeyArenaFull);
     }
-    let stored = quantize(vector, graph.file.quant);
+    let stored = quantize(vector, graph.file.quant());
     let (bytes, scale, inv_mag) = (&stored.bytes, stored.scale, stored.inv_mag);
     let id = graph.file.allocate_id();
     if id == NO_ID {

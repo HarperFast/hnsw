@@ -212,7 +212,7 @@ fn the_codec_is_carried_by_the_file_version_not_only_by_h_quant() {
         let bytes = std::fs::read(&path).expect("read header");
         assert_eq!(header_u32(&bytes, 4), version, "{} must be format v{version}", quant.name());
         assert_eq!(bytes[10], quant_byte, "{} H_QUANT", quant.name());
-        assert_eq!(PlaneFile::open(&path).expect("reopen").quant, quant);
+        assert_eq!(PlaneFile::open(&path).expect("reopen").quant(), quant);
         let _ = std::fs::remove_file(&path);
     }
 }
@@ -310,8 +310,8 @@ fn an_unsatisfiable_geometry_is_refused_without_touching_the_path() {
 
 // ---------------------------------------------------------------- behavior
 
-/// The v8 fixture is a plane built by the released build, committed rather than regenerated:
-/// a future layout change cannot quietly regenerate agreement with itself.
+/// The fixture is a plane built by the released build and committed, rather than regenerated
+/// at test time: a future layout change cannot quietly regenerate agreement with itself.
 #[test]
 fn a_plane_from_the_released_build_opens_and_searches_identically() {
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v8-int8.hnsw");
@@ -322,7 +322,7 @@ fn a_plane_from_the_released_build_opens_and_searches_identically() {
     std::fs::copy(&fixture, &path).expect("copy fixture");
 
     let file = PlaneFile::open(&path).expect("the released build's plane must still open");
-    assert_eq!(file.quant, Quant::Int8);
+    assert_eq!(file.quant(), Quant::Int8);
     assert_eq!(file.dims, 32);
     let graph = Graph::new(file);
     let mut scratch = SearchScratch::new();
@@ -358,16 +358,16 @@ fn an_int16_plane_round_trips_inserts_and_searches() {
     // and across a reopen, which is where a geometry the header disagreed with would show
     drop(graph);
     let reopened = PlaneFile::open(&path).expect("reopen");
-    assert_eq!(reopened.quant, Quant::Int16);
+    assert_eq!(reopened.quant(), Quant::Int16);
     let graph = Graph::new(reopened);
     let (hits, _) = search(&graph, &graph.query(vector_for(500, dims)), 5, 64, &mut scratch);
     assert_eq!(hits[0].0, 500, "the reopened plane must still find the same nearest neighbor");
     let _ = std::fs::remove_file(&path);
 }
 
-/// The accuracy claim, isolated from the graph: over one fixed candidate set, int16 reproduces
-/// the exact-f32 ordering that int8 gets wrong. This is what speaks to dropping a rerank;
-/// the recall test below conflates quantization with graph approximation.
+/// Quantization accuracy isolated from the graph: over one fixed candidate set, int16
+/// reproduces the exact-f32 top-10 ordering that int8 gets wrong. The recall test below
+/// conflates quantization error with graph approximation, so it cannot show this.
 #[test]
 fn int16_reproduces_exact_ordering_where_int8_does_not() {
     let (dims, candidates) = (128usize, 2000);
