@@ -26,9 +26,10 @@ export declare class Plane {
 	 *
 	 * `precision` fixes the stored element width for the life of the file. 'int8' (the default)
 	 * quantizes each component to max|c|/127; 'int16' to max|c|/32767 — ~256× finer, at one more
-	 * byte per dimension per slot (+18% at 128 dims, +73% at 1536). An int16 plane is precise
-	 * enough to rank without reranking hits against exact distances; int8 stays the right choice
-	 * for wide embeddings, where the doubled scan bandwidth makes traversal memory-bound.
+	 * byte per dimension per slot (+18% at 128 dims, +73% at 1536). Whether that is close
+	 * enough to rank without reranking hits against exact distances depends on your corpus and
+	 * accuracy budget — validate it against your own data. int8 stays the right choice for wide
+	 * embeddings, where the doubled scan bandwidth makes traversal memory-bound.
 	 * Int16 planes are written in a newer format version, so an older build of this package
 	 * refuses to open one rather than misreading its slot layout.
 	 */

@@ -56,7 +56,7 @@ impl Quant {
         }
     }
 
-    /// A file whose (version, codec) pair no writer produces is refused rather than guessed at.
+    /// A pair no writer produces is refused rather than guessed at.
     fn from_header(version: u32, quant_byte: u8) -> Option<Self> {
         match (version, quant_byte) {
             (VERSION, 0) => Some(Quant::Int8),
@@ -186,7 +186,9 @@ pub struct PlaneFile {
     /// reclaimed by others, and it never reclaims.
     pub self_tag: u32,
     pub map: MmapMut,
-    pub dims: usize,
+    /// Private with `quant` and `vector_bytes`: `Graph::distance_to` bounds the kernel's read
+    /// by this, so safe code able to change it could point the kernel past a slot.
+    dims: usize,
     /// Stored element codec, fixed at create and validated at open against the file version.
     /// Private with `vector_bytes`: the two derive from each other and from the mapped file's
     /// recorded slot size, and a safe caller able to set one of them independently could
@@ -510,6 +512,11 @@ impl PlaneFile {
         // mapping and, with another process still mapping the file, could force a LIVE
         // writer's lock. The clean-shutdown byte remains advisory metadata only.
         Ok(plane)
+    }
+
+    #[inline]
+    pub fn dims(&self) -> usize {
+        self.dims
     }
 
     #[inline]

@@ -400,8 +400,9 @@ Open:
 - **int16 storage precision** — done. `Plane.create(..., precision)` fixes the codec for the
   life of the file; int8 stays the default. int16 exists for accuracy, not speed: at
   `max|c|/32767` the quantization error is ~0.003% of the largest component against int8's
-  ~0.8%, which is what lets a host rank on plane distances instead of reranking hits against
-  exact vectors. The kernel is `_mm256_madd_epi16` over an i16-quantized query, and the
+  ~0.8%. Whether that clears a host's bar for ranking on plane distances instead of reranking
+  against exact vectors is that host's call against its own corpus; what this repo measures is
+  a 128-d ordering test (`tests/precision.rs`), not a production embedding set. The kernel is `_mm256_madd_epi16` over an i16-quantized query, and the
   operand domain is ±32767 — **-32768 is refused at every writer**, because a single pair of
   them sums to exactly 2^31 inside one madd lane, before any accumulator width can help.
   Above the madd, each result is widened to i64 before accumulating (the safe i32 interval is

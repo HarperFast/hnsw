@@ -3,7 +3,7 @@
 
 use hnsw_plane::distance::{cosine_stored_raw, quantize, Query};
 use hnsw_plane::format::{Quant, PlaneFile, VERSION, VERSION_INT16};
-use hnsw_plane::insert::{insert, insert_with_key, InsertParams};
+use hnsw_plane::insert::{insert, insert_with_key, InsertError, InsertParams};
 use hnsw_plane::search::{search, SearchScratch};
 use hnsw_plane::graph::WriteError;
 use hnsw_plane::Graph;
@@ -323,7 +323,7 @@ fn a_plane_from_the_released_build_opens_and_searches_identically() {
 
     let file = PlaneFile::open(&path).expect("the released build's plane must still open");
     assert_eq!(file.quant(), Quant::Int8);
-    assert_eq!(file.dims, 32);
+    assert_eq!(file.dims(), 32);
     let graph = Graph::new(file);
     let mut scratch = SearchScratch::new();
     for line in expected.trim().lines() {
@@ -460,5 +460,26 @@ fn int16_recall_at_ten_tracks_an_f32_brute_force_truth() {
     }
     let recall = hit as f64 / total as f64;
     assert!(recall >= 0.998, "int16 recall@10 without rerank was {recall:.4}, more than 0.2 points below an exact truth");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A wrong-dimension vector is refused at the boundary. It used to reach the slot copy; then
+/// it panicked inside query construction, after `allocate_id` had already run and past the
+/// cleanup path, leaking the id.
+#[test]
+fn a_wrong_dimension_insert_is_refused_without_consuming_an_id() {
+    let path = temp("insertdims");
+    let graph = Graph::new(PlaneFile::create_with_options(&path, 16, 8, 256, 0, 0, Quant::Int16).expect("create"));
+    let params = InsertParams::default();
+    let mut scratch = SearchScratch::new();
+    insert(&graph, &vector_for(0, 16), &params, &mut scratch).expect("a correctly sized insert");
+    let before = graph.file.id_high_water();
+    for wrong in [15usize, 17, 32] {
+        assert!(
+            matches!(insert(&graph, &vector_for(1, wrong), &params, &mut scratch), Err(InsertError::DimensionMismatch)),
+            "a {wrong}-dimension vector must be refused by a 16-dimension plane"
+        );
+    }
+    assert_eq!(graph.file.id_high_water(), before, "a refused insert must not consume an id");
     let _ = std::fs::remove_file(&path);
 }

@@ -336,11 +336,11 @@ impl Plane {
     /// arena, or a key the plane cannot store.
     #[napi]
     pub fn insert(&self, vector: Float32Array, key: Option<Buffer>) -> Result<u32> {
-        if vector.len() != self.graph.file.dims {
+        if vector.len() != self.graph.file.dims() {
             return Err(Error::from_reason(format!(
                 "vector has {} dims; plane was created with {}",
                 vector.len(),
-                self.graph.file.dims
+                self.graph.file.dims()
             )));
         }
         for (i, v) in vector.iter().enumerate() {
@@ -356,6 +356,11 @@ impl Plane {
             InsertError::Full => Error::from_reason("plane is full (maxNodes reached)"),
             InsertError::Wedged => Error::from_reason("plane slot lock is wedged (unreclaimable holder); rebuild the index"),
             InsertError::KeyArenaFull => Error::from_reason("plane key arena is full; rebuild the index"),
+            InsertError::DimensionMismatch => Error::from_reason(format!(
+                "vector has {} dims; plane was created with {}",
+                vector.len(),
+                self.graph.file.dims()
+            )),
             InsertError::KeyUnstorable => Error::from_reason(format!(
                 "key of {} bytes cannot be stored (plane keyCap = {}, max 65535)",
                 key.len(),
@@ -522,10 +527,10 @@ impl Plane {
     /// `query.len()` bytes from each slot's vector, so an oversized query would read past
     /// it into adjacent slot bytes (or off the mapping entirely).
     fn check_query_dims(&self, len: usize) -> Result<()> {
-        if len != self.graph.file.dims {
+        if len != self.graph.file.dims() {
             return Err(Error::from_reason(format!(
                 "query vector has {} dimensions; plane dims = {}",
-                len, self.graph.file.dims
+                len, self.graph.file.dims()
             )));
         }
         Ok(())
@@ -537,14 +542,13 @@ impl Plane {
     }
 
     /// Raw mirror buffers are stored bytes in the plane's codec, so a dims-length int8 buffer
-    /// against an int16 plane is a mismatch, not a half-written vector. This is the better
-    /// message; the binding refusal is in the graph writer.
+    /// against an int16 plane is a mismatch, not a half-written vector.
     fn check_raw_vector(&self, vector: &[u8]) -> Result<()> {
         if vector.len() != self.graph.file.vector_bytes() {
             return Err(Error::from_reason(format!(
                 "vector is {} bytes; plane is {} dims x {} ({} bytes)",
                 vector.len(),
-                self.graph.file.dims,
+                self.graph.file.dims(),
                 self.graph.file.quant().name(),
                 self.graph.file.vector_bytes()
             )));
@@ -557,7 +561,7 @@ impl Plane {
 
     #[napi(getter)]
     pub fn dims(&self) -> u32 {
-        self.graph.file.dims as u32
+        self.graph.file.dims() as u32
     }
 
     /// The stored element codec fixed at create: 'int8' or 'int16'.

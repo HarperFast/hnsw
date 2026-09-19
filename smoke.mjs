@@ -1,6 +1,19 @@
 // End-to-end smoke test: `npm run build && node smoke.mjs` (also the CI path).
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
+// index.js prefers a published platform package over the local artifact, so an installed
+// node_modules makes this file test the RELEASED binding and silently pass whatever the
+// working tree changed.
+const libc = process.platform === 'linux' ? '-glibc' : '';
+try {
+	require.resolve(`@harperfast/hnsw-${process.platform}-${process.arch}${libc}`);
+	throw new Error(
+		'a published @harperfast/hnsw platform package is installed; index.js would load it instead of the local ' +
+			'hnsw-plane.node, so this smoke test would not exercise your build. Remove node_modules and re-run.'
+	);
+} catch (error) {
+	if (error.code !== 'MODULE_NOT_FOUND') throw error;
+}
 const { Plane, invalidatePlane, invalidatePlaneAsync, stalePathFor } = require('./index.js');
 
 const dims = 64;
@@ -144,7 +157,6 @@ if (!threw || !/in-band:.*sidecar:/.test(threw.message)) throw new Error(`double
 rmSync(stalePathFor(bogus), { recursive: true });
 console.log('invalidatePlane OK');
 
-// int16 precision over the N-API surface.
 const p16 = join(tmpdir(), `smoke16-${process.pid}.hnsw`);
 const plane16 = Plane.create(p16, dims, 32, 10_000, 16, undefined, 'int16');
 if (plane16.precision !== 'int16') throw new Error(`precision getter reported ${plane16.precision}`);

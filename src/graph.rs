@@ -299,7 +299,7 @@ impl Graph {
         }
         // A query built for another plane would stream the wrong number of bytes out of every
         // slot — at a narrow layer-0 cap, past the slot and off the end of the mapping.
-        if query.quant != self.file.quant() || query.dims() != self.file.dims {
+        if query.quant() != self.file.quant() || query.dims() != self.file.dims() {
             return None;
         }
         let seq = self.file.seq_atomic(id);
@@ -323,7 +323,7 @@ impl Graph {
         if !self.in_range(a) || !self.in_range(b) {
             return None;
         }
-        let dims = self.file.dims;
+        let dims = self.file.dims();
         let pa = self.file.slot_ptr(a);
         let pb = self.file.slot_ptr(b);
         unsafe {
@@ -662,9 +662,9 @@ impl Graph {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn write_node(&self, id: u32, level: u8, vector: &[u8], scale: f32, inv_mag: f32, neighbors: &[u32], upper_idx: u32, key: Option<&[u8]>) -> Result<(), WriteError> {
         debug_assert!(neighbors.len() <= self.file.layer0_cap);
-        // length is checked in every build, not just debug: the copy below is sized by it, so
-        // an over-long slice would write through the neighbor array into the following slot.
-        // The element-domain scan stays at the raw entry points, off the insert hot path.
+        // the copy below is sized by this, so an over-long slice would write through the
+        // neighbor array into the following slot. The element-domain scan stays at the raw
+        // entry points, off the insert hot path.
         if vector.len() != self.file.vector_bytes() {
             return Err(WriteError::BadVector("vector byte length does not match the plane's dims x element size"));
         }

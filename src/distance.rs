@@ -30,7 +30,9 @@ pub struct Query {
     f32_vector: Vec<f32>,
     /// int16 operand: the query quantized to little-endian i16.
     quantized: Vec<u8>,
-    pub quant: Quant,
+    /// Private with `kernel` and the two operand buffers: `Graph::distance_to` trusts this to
+    /// decide how many bytes the kernel reads out of a slot.
+    quant: Quant,
     kernel: unsafe fn(&Query, *const u8) -> f32,
 }
 
@@ -41,8 +43,8 @@ impl Query {
         match file.quant() {
             Quant::Int8 => Self::int8(vector),
             Quant::Int16 => {
-                let (bytes, scale) = quantize_query_int16(&vector);
-                Self::int16(&vector, bytes, scale)
+                let (bytes, scale, inv_mag) = quantize_int16(&vector);
+                Self::int16(vector.len(), bytes, scale, inv_mag)
             }
         }
     }
@@ -53,7 +55,7 @@ impl Query {
         assert_eq!(stored.bytes.len(), file.vector_bytes(), "reused encoding is not this plane's");
         match file.quant() {
             Quant::Int8 => Self::int8(vector),
-            Quant::Int16 => Self::int16(&vector, stored.bytes.clone(), stored.scale),
+            Quant::Int16 => Self::int16(vector.len(), stored.bytes.clone(), stored.scale, stored.inv_mag),
         }
     }
 
@@ -65,10 +67,9 @@ impl Query {
 
     /// The f32 vector is dropped: the int16 kernel never reads it, and only the two scalars
     /// derived from it survive.
-    fn int16(vector: &[f32], quantized: Vec<u8>, scale: f32) -> Self {
-        let inv_mag = inv_magnitude(vector);
+    fn int16(dims: usize, quantized: Vec<u8>, scale: f32, inv_mag: f32) -> Self {
         Query {
-            dims: vector.len(),
+            dims,
             inv_mag,
             norm: inv_mag * scale,
             f32_vector: Vec::new(),
@@ -81,6 +82,11 @@ impl Query {
     #[inline]
     pub fn dims(&self) -> usize {
         self.dims
+    }
+
+    #[inline]
+    pub fn quant(&self) -> Quant {
+        self.quant
     }
 }
 
@@ -356,10 +362,6 @@ pub fn quantize_int16(vector: &[f32]) -> (Vec<u8>, f32, f32) {
     (q.bytes, q.scale, q.inv_mag)
 }
 
-fn quantize_query_int16(vector: &[f32]) -> (Vec<u8>, f32) {
-    let q = quantize(vector, Quant::Int16);
-    (q.bytes, q.scale)
-}
 
 /// Whether every element of a stored int16 buffer is within the kernel's operand domain.
 /// -32768 is the one representable value that is not: two of them overflow a madd lane.

@@ -160,6 +160,8 @@ pub enum InsertError {
     KeyArenaFull,
     /// the key exceeds the format's u16 length, or the plane has no key capacity
     KeyUnstorable,
+    /// the vector's length is not the plane's `dims`
+    DimensionMismatch,
 }
 
 fn write_error(error: WriteError) -> InsertError {
@@ -189,6 +191,10 @@ pub fn insert_with_key(
     params: &InsertParams,
     scratch: &mut SearchScratch,
 ) -> Result<u32, InsertError> {
+    if vector.len() != graph.file.dims() {
+        // before allocate_id, so a rejected insert leaks no id
+        return Err(InsertError::DimensionMismatch);
+    }
     graph.check_key(key).map_err(|e| match e {
         KeyError::NoKeys | KeyError::TooLong => InsertError::KeyUnstorable,
     })?;
