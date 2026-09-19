@@ -223,7 +223,7 @@ pub fn insert_with_key(
     };
     let level = level_for(id, params.ml);
     // the stored encoding IS the int16 query encoding; reusing it saves a second O(dims) pass
-    let query = Query::for_plane_reusing(&graph.file, vector.to_vec(), &stored);
+    let query = Query::for_plane_reusing(&graph.file, vector, &stored);
     let layer0_cap = graph.file.layer0_cap;
     let m = params.m;
 

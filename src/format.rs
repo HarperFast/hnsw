@@ -56,7 +56,6 @@ impl Quant {
         }
     }
 
-    /// A pair no writer produces is refused rather than guessed at.
     fn from_header(version: u32, quant_byte: u8) -> Option<Self> {
         match (version, quant_byte) {
             (VERSION, 0) => Some(Quant::Int8),

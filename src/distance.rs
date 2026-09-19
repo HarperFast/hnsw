@@ -51,16 +51,21 @@ impl Query {
 
     /// `for_plane` reusing an encoding already computed for the same vector under the same
     /// codec. Crate-internal: a shorter encoding would be read past its end.
-    pub(crate) fn for_plane_reusing(file: &PlaneFile, vector: Vec<f32>, stored: &Quantized) -> Self {
+    pub(crate) fn for_plane_reusing(file: &PlaneFile, vector: &[f32], stored: &Quantized) -> Self {
         assert_eq!(stored.bytes.len(), file.vector_bytes(), "reused encoding is not this plane's");
         match file.quant() {
-            Quant::Int8 => Self::int8(vector),
+            // int16 needs only the length, so the f32 vector is never copied for it
+            Quant::Int8 => Self::int8_with(vector.to_vec(), stored.inv_mag),
             Quant::Int16 => Self::int16(vector.len(), stored.bytes.clone(), stored.scale, stored.inv_mag),
         }
     }
 
     fn int8(vector: Vec<f32>) -> Self {
         let inv_mag = inv_magnitude(&vector);
+        Self::int8_with(vector, inv_mag)
+    }
+
+    fn int8_with(vector: Vec<f32>, inv_mag: f32) -> Self {
         let dims = vector.len();
         Query { dims, inv_mag, norm: inv_mag, f32_vector: vector, quantized: Vec::new(), quant: Quant::Int8, kernel: select_dot_f32_i8() }
     }

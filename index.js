@@ -25,23 +25,29 @@ function libcSuffix() {
 }
 
 const failures = [];
-let native0;
-// 1. platform package (published binding)
-try {
-	native0 = require(`@harperfast/hnsw-${process.platform}-${process.arch}${libcSuffix()}`);
-} catch (error) {
-	failures.push(`platform package: ${error.message}`);
-}
-// 2. local build (dev checkouts, source-build installs)
-if (!native0) {
-	const local = join(__dirname, 'hnsw-plane.node');
-	if (existsSync(local)) {
-		try {
-			native0 = require(local);
-		} catch (error) {
-			failures.push(`${local}: ${error.message}`);
-		}
+const local = join(__dirname, 'hnsw-plane.node');
+function loadLocal() {
+	if (!existsSync(local)) return undefined;
+	try {
+		return require(local);
+	} catch (error) {
+		failures.push(`${local}: ${error.message}`);
 	}
+}
+// A published platform package normally wins, because a consumer installing this package
+// wants the prebuild. HNSW_PREFER_LOCAL_BUILD inverts that for a checkout testing its own
+// build: without it, `npm install` in this repo installs the prebuild and every later
+// require gets the RELEASED binding rather than what the tree just compiled.
+let native0 = process.env.HNSW_PREFER_LOCAL_BUILD ? loadLocal() : undefined;
+if (!native0) {
+	try {
+		native0 = require(`@harperfast/hnsw-${process.platform}-${process.arch}${libcSuffix()}`);
+	} catch (error) {
+		failures.push(`platform package: ${error.message}`);
+	}
+}
+if (!native0) {
+	native0 = loadLocal();
 }
 if (!native0) {
 	throw new Error(

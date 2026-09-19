@@ -1,19 +1,9 @@
 // End-to-end smoke test: `npm run build && node smoke.mjs` (also the CI path).
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
-// index.js prefers a published platform package over the local artifact, so an installed
-// node_modules makes this file test the RELEASED binding and silently pass whatever the
-// working tree changed.
-const libc = process.platform === 'linux' ? '-glibc' : '';
-try {
-	require.resolve(`@harperfast/hnsw-${process.platform}-${process.arch}${libc}`);
-	throw new Error(
-		'a published @harperfast/hnsw platform package is installed; index.js would load it instead of the local ' +
-			'hnsw-plane.node, so this smoke test would not exercise your build. Remove node_modules and re-run.'
-	);
-} catch (error) {
-	if (error.code !== 'MODULE_NOT_FOUND') throw error;
-}
+// this file is the gate on the build in this tree, so it must not be served the published
+// platform package `npm install` leaves in node_modules
+process.env.HNSW_PREFER_LOCAL_BUILD = '1';
 const { Plane, invalidatePlane, invalidatePlaneAsync, stalePathFor } = require('./index.js');
 
 const dims = 64;

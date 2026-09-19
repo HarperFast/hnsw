@@ -463,9 +463,7 @@ fn int16_recall_at_ten_tracks_an_f32_brute_force_truth() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// A wrong-dimension vector is refused at the boundary. It used to reach the slot copy; then
-/// it panicked inside query construction, after `allocate_id` had already run and past the
-/// cleanup path, leaking the id.
+/// A wrong-dimension vector is refused before `allocate_id`, so a rejected insert leaks no id.
 #[test]
 fn a_wrong_dimension_insert_is_refused_without_consuming_an_id() {
     let path = temp("insertdims");
