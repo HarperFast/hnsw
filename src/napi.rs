@@ -20,8 +20,8 @@ use std::time::Duration;
 
 /// Pooled per-query scratch: never allocate per query. Retention is capped at 64 but a
 /// `take()` from an empty pool allocates, so live scratches equal in-flight searches. Each
-/// holds up to `9/8 * ceil(nodes / 64) * 8` bytes of visited bitmap plus a bounded journal (see
-/// `SearchScratch`): 200M nodes is 25-29 MB per scratch, ~7 GB across 256 in flight.
+/// holds `9/8 * ceil(nodes / 64) * 8` bytes of visited bitmap plus a bounded journal (see
+/// `SearchScratch`): 200M nodes is ~28 MB per scratch, ~7 GB across 256 in flight.
 struct ScratchPool(Mutex<Vec<SearchScratch>>);
 
 impl ScratchPool {
@@ -29,9 +29,11 @@ impl ScratchPool {
         self.0.lock().unwrap().pop().unwrap_or_default()
     }
     fn put(&self, mut s: SearchScratch) {
+        // outside the lock: a journal-overflow clear is a whole-bitmap fill, and every other
+        // search thread's take()/put() would queue behind it
+        s.finish();
         let mut pool = self.0.lock().unwrap();
         if pool.len() < 64 {
-            s.finish();
             pool.push(s);
         }
     }

@@ -422,12 +422,14 @@ fn run(
         let per_thread = queries.max(100);
         let anon_before = rss_anon_kb();
         let rendezvous = Arc::new(std::sync::Barrier::new(threads));
+        let writer_sized = Arc::new(AtomicBool::new(false));
         let start = Instant::now();
         let mut handles = Vec::new();
         for t in 0..threads {
             let graph = graph.clone();
             let corpus = source.clone();
             let rendezvous = rendezvous.clone();
+            let writer_sized = writer_sized.clone();
             handles.push(std::thread::spawn(move || {
                 let mut scratch = SearchScratch::new();
                 let mut rng = Rng(0x9e37_79b9 ^ (t as u64 + 1) * 0x1234_5677);
@@ -442,7 +444,14 @@ fn run(
                 }
                 lat.sort();
                 // a panic before the barrier would wedge the other searchers in wait()
-                let anon = if rendezvous.wait().is_leader() { rss_anon_kb() } else { 0 };
+                let anon = if rendezvous.wait().is_leader() {
+                    while !writer_sized.load(Ordering::Relaxed) {
+                        std::thread::yield_now();
+                    }
+                    rss_anon_kb()
+                } else {
+                    0
+                };
                 rendezvous.wait();
                 assert_eq!(empty, 0, "searcher {t}: {empty} empty result sets");
                 (lat[per_thread / 2], lat[(per_thread * 99 / 100).min(per_thread - 1)], anon)
@@ -453,6 +462,7 @@ fn run(
             let graph = graph.clone();
             let corpus = source.clone();
             let stop = stop.clone();
+            let writer_sized = writer_sized.clone();
             std::thread::spawn(move || {
                 let params = InsertParams::default();
                 let mut scratch = SearchScratch::new();
@@ -460,7 +470,9 @@ fn run(
                 let mut count = 0u64;
                 while !stop.load(Ordering::Relaxed) {
                     let v = corpus.base_row(count as usize % n as usize, &mut rng);
-                    if insert(&graph, &v, &params, &mut scratch).is_err() {
+                    let inserted = insert(&graph, &v, &params, &mut scratch);
+                    writer_sized.store(true, Ordering::Relaxed);
+                    if inserted.is_err() {
                         // plane full: keep the scratch alive until stop so the RSS sample counts it
                         while !stop.load(Ordering::Relaxed) {
                             std::thread::sleep(std::time::Duration::from_millis(1));
