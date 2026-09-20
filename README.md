@@ -64,7 +64,8 @@ const plane = Plane.create('/data/vectors.hnsw', 768, 128, 10_000_000, 40);
 const id = plane.insert(myFloat32Vector, Buffer.from(myRecordKey));
 // bulk load: one crossing per chunk, inserted in parallel off the event loop; `ids` is in input
 // order, keys are concatenated with SearchHits-style ends. Records the plane cannot hold come
-// back in `rejected` (index + code) with 0xFFFFFFFF in their slot; a full plane rejects the promise.
+// back in `rejected` (index + code) with 0xFFFFFFFF in their slot; a full plane rejects the
+// promise with an error that still carries `ids`.
 const { ids, rejected } = await plane.insertBatch(chunkVectors /* count × dims */, chunkKeys, chunkKeyEnds, 8 /* threads */);
 // parallel typed arrays, ascending by distance; hit i's key is keys.subarray(keyEnds[i-1] ?? 0, keyEnds[i])
 const { ids, distances, keys, keyEnds } = await plane.search(queryVector, 10, 512);

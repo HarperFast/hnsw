@@ -57,25 +57,35 @@ export declare class Plane {
 
 	/**
 	 * Insert a vector; returns the allocated node id (freed ids are reused). `key` is the host's
-	 * key bytes (needs a `keyCap` at create). Throws on a dimension mismatch, a full plane
-	 * (maxNodes reached), an exhausted key arena, or a key the plane cannot store.
+	 * key bytes (needs a `keyCap` at create). Throws on a dimension mismatch, a non-finite
+	 * component, a full plane (maxNodes reached), an exhausted key arena, or a key the plane
+	 * cannot store.
 	 */
 	insert(vector: Float32Array, key?: Buffer): number;
 	/**
 	 * Insert a chunk of records in one crossing, fanned out across `threads` worker threads
-	 * inside the native module (default: every hardware thread; clamped to 4× that and to the
-	 * record count) and off the event loop. `vectors` is `count × dims` row-major; `keys` and
-	 * `keyEnds` (both or neither) split the concatenated key bytes the way `SearchHits` does:
-	 * record i's key is `keys.subarray(keyEnds[i - 1] ?? 0, keyEnds[i])`.
+	 * inside the native module (default: the hardware thread count, at most 16; an explicit
+	 * value is clamped to 2× the hardware threads and to the record count) and off the event
+	 * loop. `vectors` is `count × dims` row-major; `keys` and `keyEnds` (both or neither) split
+	 * the concatenated key bytes the way `SearchHits` does: record i's key is
+	 * `keys.subarray(keyEnds[i - 1] ?? 0, keyEnds[i])`.
 	 *
 	 * Resolves with every record's node id in input order. A record the plane cannot hold (a
-	 * non-finite component, an over-long key) is listed in `rejected` with 0xFFFFFFFF in its
-	 * `ids` slot, and the rest of the batch lands. A plane fault — full, wedged, key arena
-	 * exhausted — rejects the promise once in-flight inserts have finished; the records that
-	 * landed before it stay in the plane, so treat a rejected batch as a failed `insert`
-	 * (the host's mapping decides what to do with the plane). Batches on one plane run one at a
-	 * time; a second call waits for the first. Records land in whatever order the threads reach
-	 * them, so two builds of the same input produce different, equally valid graphs.
+	 * non-finite component, an over-long key, a key on a plane without `keyCap`, an overflow
+	 * key once the key arena is exhausted) is listed in `rejected` with 0xFFFFFFFF in its `ids`
+	 * slot, and the rest of the batch lands — the same records a loop of `insert` would skip.
+	 * A plane fault — full or wedged — stops the batch once in-flight inserts have finished
+	 * and rejects with an `InsertBatchError`: its `ids` says which records landed (they stay
+	 * in the plane), and `index` is the lowest record that hit the fault, not a prefix
+	 * boundary, because threads claim records out of order. Malformed arguments reject too;
+	 * nothing throws synchronously.
+	 *
+	 * Batches on one plane run in order on one worker thread; a second call queues behind the
+	 * first, holding its copied inputs until it runs, so `await` each chunk rather than fanning
+	 * out an unbounded `Promise.all`. Other mutations (`insert`, `remove`, `writeNodeRaw`) may
+	 * run while a batch is in flight under the plane's per-slot rules. Records land in whatever
+	 * order the threads reach them, so two builds of the same input produce different, equally
+	 * valid graphs.
 	 *
 	 * Working memory: each thread's visited set is 4 bytes per allocated id, so a batch on an
 	 * 8M-node plane with 16 threads holds ~512 MB of scratch, retained in the plane's scratch
@@ -191,7 +201,7 @@ export declare class Plane {
 export interface BatchRejection {
 	/** Position in the batch. */
 	index: number;
-	/** Stable fault name: 'not-finite' | 'key-unstorable' | 'dimension-mismatch'. */
+	/** Stable fault name: 'not-finite' | 'key-unstorable' | 'key-arena-full' | 'dimension-mismatch'. */
 	code: string;
 	/** The message `insert` would have thrown for this record. */
 	reason: string;
@@ -201,6 +211,17 @@ export interface InsertBatchResult {
 	/** Node id per record, in input order; 0xFFFFFFFF where `rejected` names the record. */
 	ids: Uint32Array;
 	/** Ascending by index. */
+	rejected: Array<BatchRejection>;
+}
+
+/** The rejection of an `insertBatch` a plane fault stopped. */
+export interface InsertBatchError extends Error {
+	/** 'full' | 'wedged'. */
+	code: string;
+	/** The lowest record that hit the fault; not a prefix boundary — read `ids`. */
+	index: number;
+	/** As in `InsertBatchResult`: the records that landed before the batch stopped. */
+	ids: Uint32Array;
 	rejected: Array<BatchRejection>;
 }
 

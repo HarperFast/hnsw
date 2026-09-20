@@ -170,10 +170,11 @@ pub enum InsertError {
 }
 
 impl InsertError {
-    /// A record fault is the record's own (skip it and go on); anything else is the plane's,
-    /// and no later insert into it can succeed until the host acts.
+    /// A record fault is the record's own (skip it and go on). `KeyArenaFull` counts: only keys
+    /// past `key_cap` need the arena, so inline-key records keep landing after it fills. `Full`
+    /// and `Wedged` are the plane's, and no later insert can succeed until the host acts.
     pub fn is_record_fault(self) -> bool {
-        matches!(self, InsertError::KeyUnstorable | InsertError::DimensionMismatch | InsertError::NotFinite)
+        !matches!(self, InsertError::Full | InsertError::Wedged)
     }
 
     /// Stable machine-readable name, for hosts that dispatch on the fault rather than its text.
@@ -462,8 +463,10 @@ pub struct BatchOutcome {
     pub rejected: Vec<(usize, InsertError)>,
 }
 
-/// A plane fault stopped the batch at record `index`. Records already claimed by a worker
-/// finished before this was returned, and `outcome` reports them; nothing is left in flight.
+/// A plane fault stopped the batch. `index` is the lowest record that hit one — not a prefix
+/// boundary: workers claim records out of order, so `outcome.ids` is the only statement of
+/// which records landed. Every claimed record finished before this was returned; nothing is
+/// left in flight.
 #[derive(Debug)]
 pub struct BatchFailure {
     pub index: usize,
@@ -509,7 +512,7 @@ pub fn insert_batch(
                 Err(error) => {
                     faults[i].store(error.to_code(), Ordering::Relaxed);
                     if !error.is_record_fault() {
-                        let _ = failed.compare_exchange(NO_FAILURE, i, Ordering::AcqRel, Ordering::Acquire);
+                        failed.fetch_min(i, Ordering::AcqRel);
                         break;
                     }
                 }
@@ -522,8 +525,7 @@ pub fn insert_batch(
         let (first, rest) = scratches.split_first_mut().expect("non-empty");
         for scratch in rest.iter_mut().take(workers - 1) {
             let worker = &worker;
-            // a thread the OS refuses to start just means fewer workers; the calling thread
-            // always runs one
+            // a refused spawn only means fewer workers
             let _ = std::thread::Builder::new().name("hnsw-insert-batch".into()).spawn_scoped(scope, move || worker(scratch));
         }
         worker(first);

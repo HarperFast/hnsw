@@ -73,8 +73,7 @@ for (let i = 0; i < pred.ids.length; i++) {
 }
 console.log(`predicate top hit: id ${pred.ids[0]} (calls: ${predicateCalls})`);
 
-// batch insert: one crossing per chunk, fanned out across threads inside Rust; ids come back in
-// input order, record faults are reported by index, and every landed record is searchable
+// insertBatch
 {
 	const count = 500;
 	// per-record signature on top of the cluster spike, so a self-query has one right answer
@@ -115,8 +114,6 @@ console.log(`predicate top hit: id ${pred.ids[0]} (calls: ${predicateCalls})`);
 		if (at < 0) throw new Error(`batch record ${i} (id ${batch.ids[i]}) is not searchable`);
 		if (keyAt(found, at) !== `b${i}`) throw new Error(`batch record ${i} carries key ${keyAt(found, at)}`);
 	}
-	// the batch runs off the event loop: timers keep firing and searches keep answering while
-	// it is in flight, and two batches issued together both settle with disjoint ids
 	{
 		const big = 3000;
 		const more = new Float32Array(big * dims);
@@ -136,22 +133,32 @@ console.log(`predicate top hit: id ${pred.ids[0]} (calls: ${predicateCalls})`);
 		const empty = await plane.insertBatch(new Float32Array(0));
 		if (empty.ids.length !== 0 || empty.rejected.length !== 0) throw new Error('an empty batch must resolve empty');
 	}
-	let badShape;
-	try {
-		await plane.insertBatch(new Float32Array(dims + 1));
-	} catch (error) {
-		badShape = error;
-	}
-	if (!badShape || !/dims/.test(badShape.message)) throw new Error(`a misaligned batch must throw, got ${badShape}`);
+	// malformed arguments reject the promise; nothing throws synchronously
+	const badShape = plane.insertBatch(new Float32Array(dims + 1));
+	if (!(badShape instanceof Promise)) throw new Error('a misaligned batch must return a promise');
+	const shapeError = await badShape.then(
+		() => undefined,
+		(error) => error
+	);
+	if (!shapeError || !/dims/.test(shapeError.message)) throw new Error(`a misaligned batch must reject, got ${shapeError}`);
+	// keys on a keyless plane are per-record rejections, like insert() throwing per record
+	const keyless = Plane.create(join(tmpdir(), `smoke-batch-keyless-${process.pid}.hnsw`), dims, 32, 64);
+	const withKeys = await keyless.insertBatch(vectors.subarray(0, 3 * dims), Buffer.from('abc'), Uint32Array.from([1, 2, 3]), 2);
+	if (withKeys.rejected.length !== 3 || withKeys.rejected.some((r) => r.code !== 'key-unstorable'))
+		throw new Error(`keys on a keyless plane must reject per record: ${JSON.stringify(withKeys.rejected)}`);
+	if (keyless.idHighWater() !== 0) throw new Error('rejected records must not consume ids');
+	// a plane fault rejects with the ids that landed
 	const small = Plane.create(join(tmpdir(), `smoke-batch-full-${process.pid}.hnsw`), dims, 32, 64);
-	let full;
-	try {
-		await small.insertBatch(vectors, undefined, undefined, 4);
-	} catch (error) {
-		full = error;
-	}
-	if (!full || !/full/.test(full.message)) throw new Error(`a batch past maxNodes must reject, got ${full}`);
+	const full = await small.insertBatch(vectors, undefined, undefined, 4).then(
+		() => undefined,
+		(error) => error
+	);
+	if (!full || full.code !== 'full' || !/full/.test(full.message)) throw new Error(`a batch past maxNodes must reject, got ${full}`);
+	if (!(full.ids instanceof Uint32Array) || full.ids.length !== count) throw new Error('the rejection must carry ids');
+	const landed = [...full.ids].filter((id) => id !== 0xffffffff);
+	if (landed.length !== 64 || new Set(landed).size !== 64) throw new Error(`expected 64 landed ids, got ${landed.length}`);
 	if (small.idHighWater() !== 64) throw new Error(`the failed batch should have used every slot, highWater ${small.idHighWater()}`);
+	if (!(full.index >= 0 && full.index < count) || full.ids[full.index] !== 0xffffffff) throw new Error('failure.index must name an unlanded record');
 	console.log('batch insert OK, rejected', batch.rejected.length, 'highWater', plane.idHighWater());
 }
 
