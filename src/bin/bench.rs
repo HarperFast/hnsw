@@ -36,6 +36,17 @@ impl Rng {
     }
 }
 
+fn major_faults() -> i64 {
+    #[cfg(unix)]
+    unsafe {
+        let mut ru: libc::rusage = std::mem::zeroed();
+        libc::getrusage(libc::RUSAGE_SELF, &mut ru);
+        ru.ru_majflt as i64
+    }
+    #[cfg(not(unix))]
+    0
+}
+
 /// Gaussian-mixture corpus matching benchmarks/hnsw-scale.js: unit centroids, per-dim noise
 /// derived from an intra-cluster cosine target of 0.75 (uniform-random 768-d is a corpus
 /// "no ANN can index" per that benchmark's own calibration notes).
@@ -241,16 +252,19 @@ fn run(n: u64, dims: usize, queries: usize, efs: &[usize], path: &std::path::Pat
         ef = ef_i;
         let mut latencies = Vec::with_capacity(queries);
         let mut total_visits = 0u64;
+        let mut willneed_batches = 0u64;
         let mut recall_hits = 0usize;
         let mut recall_total = 0usize;
         for q in &qs {
             let _ = search(&graph, q, 10, ef, &mut scratch);
         }
+        let majflt_before = major_faults();
         for (q, truth) in qs.iter().zip(&truths) {
             let start = Instant::now();
             let (results, stats) = search(&graph, q, 10, ef, &mut scratch);
             latencies.push(start.elapsed());
             total_visits += stats.visits;
+            willneed_batches += stats.willneed_batches;
             assert!(!results.is_empty());
             recall_total += truth.len();
             recall_hits += truth.iter().filter(|tid| results.iter().any(|(rid, _)| rid == *tid)).count();
@@ -263,7 +277,7 @@ fn run(n: u64, dims: usize, queries: usize, efs: &[usize], path: &std::path::Pat
         let mean_us = latencies.iter().map(|d| d.as_secs_f64()).sum::<f64>() / queries as f64 * 1e6;
         let us_per_visit = mean_us / mean_visits;
         println!(
-            "search (ef {:>4}): p50 {:.3} ms  p95 {:.3} ms  p99 {:.3} ms  mean {:.1} us  visits/query {:.0}  ->  {:.3} us/visit  recall@10 {:.4}",
+            "search (ef {:>4}): p50 {:.3} ms  p95 {:.3} ms  p99 {:.3} ms  mean {:.1} us  visits/query {:.0}  ->  {:.3} us/visit  recall@10 {:.4}  willneed batches/query {:.1}  major faults/query {:.1}",
             ef,
             p50.as_secs_f64() * 1e3,
             p95.as_secs_f64() * 1e3,
@@ -271,7 +285,9 @@ fn run(n: u64, dims: usize, queries: usize, efs: &[usize], path: &std::path::Pat
             mean_us,
             mean_visits,
             us_per_visit,
-            recall_hits as f64 / recall_total as f64
+            recall_hits as f64 / recall_total as f64,
+            willneed_batches as f64 / queries as f64,
+            (major_faults() - majflt_before) as f64 / queries as f64
         );
     }
 

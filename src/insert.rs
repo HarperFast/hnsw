@@ -227,7 +227,7 @@ pub fn insert_with_key(
     let layer0_cap = graph.file.layer0_cap;
     let m = params.m;
 
-    let mut stats = SearchStats { visits: 0 };
+    let mut stats = SearchStats::default();
     // Upper entry a first-entry claim attempt already published for `id`. Its slot names the
     // index, so the join path must rewrite it in place — freeing an index a live slot names
     // would let another node adopt it mid-traversal.

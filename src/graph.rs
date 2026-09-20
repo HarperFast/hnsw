@@ -10,6 +10,7 @@ use crate::format::{
     S_DEGREE, S_FLAGS, S_INV_MAG, S_LEVEL, S_SCALE, S_UPPER_IDX, S_VECTOR, UPPER_CAP, UPPER_LEVEL_STRIDE, UL_DEGREE,
     UL_IDS, U_LEVELS, U_LISTS,
 };
+use crate::prefetch::PageRange;
 use crate::seqlock;
 use crate::seqlock::Wedged;
 
@@ -289,6 +290,14 @@ impl Graph {
             prefetch_line(unsafe { p.add(off) });
             off += 64;
         }
+    }
+
+    /// The pages holding what search reads from slot `id` — seqlock through adjacency, never
+    /// the key field, whose capacity can be tens of KiB that no distance read touches.
+    #[inline]
+    pub fn slot_read_span(&self, id: u32) -> PageRange {
+        let start = self.file.slot_ptr(id) as usize;
+        PageRange::covering(start, start + self.file.key_offset())
     }
 
     /// Zero-copy distance from `query` to the stored vector of `id`. None for absent/deleted.

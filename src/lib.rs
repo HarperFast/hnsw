@@ -9,6 +9,7 @@ pub mod insert;
 pub mod invalidate;
 #[cfg(feature = "napi")]
 mod napi;
+pub mod prefetch;
 pub mod search;
 pub mod seqlock;
 

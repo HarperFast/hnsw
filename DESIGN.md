@@ -313,6 +313,48 @@ ever relaxed.
 3. TSFN lifecycle: shutdown-while-query-in-flight is a first-class test (see rocksdb-js #665's
    TSFN teardown SIGSEGV). napi-rs `ThreadsafeFunction` + explicit abort on env teardown.
 
+**Prefetch has two tiers, and the kernel tier is gated** (`unvisited_prefetched` in
+`search.rs`, `prefetch.rs`). Each expansion gathers its unvisited neighbour ids and hints their
+slots before the distance loop. The CPU hint (`_mm_prefetch`) overlaps cache misses on resident
+pages but is dropped on a non-resident page — no fault, no I/O — so once the plane exceeds page
+cache every neighbour became a synchronous, queue-depth-1 major fault (issue #9: p95 5.6 → 68.8 ms
+and p99 7.0 → 161 ms from 4M to 8M with p50 flat, ~18k faults/s on the builder). The kernel tier
+issues one `process_madvise(MADV_WILLNEED)` over the batch's slot pages (vector and adjacency
+only, never the key field), so the k reads start together: measured on NVMe, 32 random pages
+cost 2,540 µs as serial faults and 420 µs (submit + touch) batched.
+
+It cannot be always on. The vectored call costs ~0.5 µs per range when the pages are already
+resident (1.8 µs per `madvise` on the per-range fallback), against a 0.13 µs resident visit at
+128-d, so at ef 1448 (~1,400 expansions) it would add ~20 ms to a ~5 ms in-cache query. And a
+static switch cannot be right either: one query walks a hot region near the entry point and a
+cold tail. So the gate is per expansion, from an in-process signal: one `Instant::now()` per
+expansion (vDSO, ~20 ns), and an expansion is fault-scale when the interval since the previous one
+exceeds `kept × (1 µs + vector_bytes ns) + 16 µs` — ~8–10× the resident visit at every supported
+width plus a term below one NVMe fault (~80 µs). A fault-scale expansion arms a hold of 16
+expansions; each fast one decrements it; the kernel prefetch is issued while the hold is armed.
+A prefetch-assisted expansion under pressure still waits one device round trip, so it stays
+fault-scale and the hold does not oscillate once the faults are parallel; page-cache-hit minor
+faults (~1 µs) do not trip it, correctly, since WILLNEED cannot help them. Cost accounting: a
+resident plane pays the clock read and no syscall (`SearchStats.willneed_batches` = 0); a
+spurious arm (a pre-empted thread) costs ≤ 16 × k × 0.5 µs ≈ 240 µs at k = 30, about one
+serial fault, which is also what the first, undetected expansion of a cold region costs.
+
+This does not conflict with `MADV_RANDOM` (§4, `format.rs`): that is about the readahead window
+around a random fault polluting co-tenants' page cache; the targeted advice fetches exactly the
+pages the next distance reads need.
+
+Backends are probed at first use, not by kernel version: Linux `process_madvise` (one syscall per
+batch; unprivileged self-advice needs Linux ≥ 6.13, so Ubuntu 24.04's 6.8 gets `EPERM`) → per-range
+`madvise(MADV_WILLNEED)` (older Linux, macOS; k syscalls, still asynchronous readahead) → off
+(Windows; `PrefetchVirtualMemory` is the vectored equivalent, not implemented). A backend that
+fails with a permanent error latches the next one down for the process. `HNSW_KERNEL_PREFETCH=0`
+forces off — a kill switch and A/B control, read once; there is no "on" value because the gate
+decides.
+
+Measured on a 4M × 128-d int8 plane (cap 32, 1.3 GB, NVMe), 200 queries, baseline vs this branch:
+
+<!-- PREFETCH-MEASUREMENTS -->
+
 ## 8. Write path phasing
 
 - **Phase 1 — dual-write, search cutover.** Insert/update/delete logic stays in JS
