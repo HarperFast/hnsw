@@ -614,3 +614,34 @@ optimizeRouting-parity insert (including the recomputed neighbor↔neighbor dist
 recall from 0.49 (placeholder insert) to JS parity. Uniform-random 768-d corpora produce
 meaningless recall numbers (the JS benchmark's own calibration note: a corpus "no ANN can
 index") — all comparisons use the mixture corpus.
+
+### Visited set: bitmap + journal vs the u32 epoch array (2026-09-19, issue #8)
+
+Same box, base and candidate binaries alternated over one immutable plane per size (a fresh
+sparse copy per run for the concurrent pass, whose writer mutates the plane); the box was shared
+with two other benchmark runs, so single-thread numbers are the median of per-run p50 over
+pinned (`taskset`) runs and the spread is noted. Per-query dumps (visit count, ordered hit ids
+and distances) were byte-identical between the two builds at every ef — the set semantics are
+unchanged, so traversal order is unchanged.
+
+| N, dims, cap | ef | epoch p50 median (min) | bitmap p50 median (min) | epoch anon RSS / scratch | bitmap anon RSS / scratch |
+| ------------------ | ---- | ---------------- | ---------------- | ------- | ------- |
+| 1M, 768, 128 | 64 | 0.417 ms (0.348) | 0.398 ms (0.345) | 7.7 MB | 0.37 MB |
+| 1M, 768, 128 | 512 | 0.838 ms (0.729) | 0.720 ms (0.693) | | |
+| 1M, 768, 128 | 1448 | 4.151 ms (3.684) | 3.803 ms (3.371) | | |
+| 8M, 128, 32 | 64 | 0.220 ms (0.204) | 0.191 ms (0.190) | 57.7 MB | 2.0 MB |
+| 8M, 128, 32 | 512 | 0.443 ms (0.398) | 0.425 ms (0.375) | | |
+| 8M, 128, 32 | 1448 | 1.650 ms (1.630) | 1.660 ms (1.460) | | |
+
+1M: 6 rounds x 300 queries, the plane on disk. 8M: 4 rounds x 200 queries, the plane on tmpfs
+(a 9 GB cap-128 build could not stay page-cache-resident on the shared box; cap 32 keeps the
+plane at 2.6 GB, and the visited-set term under test does not depend on cap or dims). The
+concurrent pass (8 searchers + 1 writer) ran unpinned and its QPS moved 2-3x between rounds of
+the same binary, so only its RSS column is reported, plus one back-to-back round after the box quieted: 8M, epoch 2,539 QPS (writer 1,625 inserts/s) vs bitmap 3,251 QPS (writer 2,081 inserts/s), one run each.
+
+The bitmap wins or ties because 125 KB (1M) and 1 MB (8M) stay in L2 while the epoch array
+(4 MB, 32 MB) lives in L3 or beyond it; the per-sweep journal clear (one store per touched word,
+all cache-resident) is far below that difference. The epoch RSS figures are roughly double the
+array: under a concurrent writer every `begin()` sees a higher high-water mark and `Vec::resize`
+grows by amortized doubling, so the 4 MB array becomes 8 MB and the 32 MB one 64 MB — the bitmap
+reserves exactly. Both figures also include the heaps and neighbor buffer.
