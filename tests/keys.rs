@@ -180,8 +180,6 @@ fn rewriting_a_node_reuses_its_arena_range() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// Upsert churn on an overflow key — insert, delete, reinsert into the recycled slot — reuses
-/// the slot's own arena range instead of reserving a fresh class each time.
 #[test]
 fn reinserting_an_overflow_key_into_a_recycled_slot_reuses_its_arena_range() {
     let dims = 16;

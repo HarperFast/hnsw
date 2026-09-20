@@ -335,7 +335,6 @@ fn run(
                     s.spawn(move || {
                         qs.iter()
                             .map(|q| {
-                                // bounded top-10 rather than an n-element scored list per thread
                                 let mut top: Vec<(u32, f32)> = Vec::with_capacity(11);
                                 for id in 0..n as u32 {
                                     let Some(d) = graph.distance_to(id, q) else { continue };
