@@ -327,17 +327,19 @@ It cannot be always on. The vectored call costs ~0.5 µs per range when the page
 resident (1.8 µs per `madvise` on the per-range fallback), against a 0.13 µs resident visit at
 128-d, so at ef 1448 (~1,400 expansions) it would add ~20 ms to a ~5 ms in-cache query. And a
 static switch cannot be right either: one query walks a hot region near the entry point and a
-cold tail. So the gate is per expansion, from an in-process signal: one `Instant::now()` per
-expansion (vDSO, ~20 ns), and an expansion is fault-scale when the interval since the previous one
-exceeds `kept × (1 µs + vector_bytes ns) + 16 µs` — ~8–10× the resident visit at every supported
-width plus a term below one NVMe fault (~80 µs). A fault-scale expansion arms a hold of 16
+cold tail. So the gate is per expansion, from an in-process signal: a cycle-counter read
+(`rdtsc` where the TSC is invariant, `cntvct_el0` on arm64, `Instant` otherwise; ~14 ns here,
+calibrated once at the backend probe) every 4th expansion while unarmed and every expansion while
+armed, and a window is fault-scale when it exceeds `kept × (1 µs + vector_bytes ns) + 16 µs` —
+~8–10× the resident visit at every supported width plus a term below one NVMe fault (~80 µs). A fault-scale expansion arms a hold of 16
 expansions; each fast one decrements it; the kernel prefetch is issued while the hold is armed.
 A prefetch-assisted expansion under pressure still waits one device round trip, so it stays
 fault-scale and the hold does not oscillate once the faults are parallel; page-cache-hit minor
 faults (~1 µs) do not trip it, correctly, since WILLNEED cannot help them. Cost accounting: a
-resident plane pays the clock read and no syscall (`SearchStats.willneed_batches` = 0); a
-spurious arm (a pre-empted thread) costs ≤ 16 × k × 0.5 µs ≈ 240 µs at k = 30, about one
-serial fault, which is also what the first, undetected expansion of a cold region costs.
+resident plane pays the clock read and no syscall (`SearchStats.willneed_batches` reads 0.0–0.1
+per query in the tables below, the pre-emption cases); a spurious arm costs ≤ 16 × k × 0.5 µs
+≈ 240 µs at k = 30, about one serial fault, which is also what the first, undetected expansion
+of a cold region costs.
 
 This does not conflict with `MADV_RANDOM` (§4, `format.rs`): that is about the readahead window
 around a random fault polluting co-tenants' page cache; the targeted advice fetches exactly the

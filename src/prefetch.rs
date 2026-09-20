@@ -27,7 +27,7 @@ impl PageRange {
     }
 }
 
-fn page_size() -> usize {
+pub fn page_size() -> usize {
     static PAGE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *PAGE.get_or_init(|| {
         #[cfg(unix)]
@@ -41,51 +41,97 @@ fn page_size() -> usize {
     })
 }
 
-/// The gate's clock: a raw cycle counter, because one `clock_gettime` (32 ns measured on a
-/// loaded Alder Lake host) per expansion was 3–5 % of an in-cache query at ef 512, where an
-/// expansion scores only a handful of unvisited slots.
+/// The gate's clock: a raw cycle counter where one is invariant (a `clock_gettime` per
+/// expansion measured 3–5 % of an in-cache query), `Instant` elsewhere.
 pub mod clock {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::OnceLock;
     use std::time::Instant;
 
-    #[cfg(target_arch = "x86_64")]
+    static RAW: AtomicBool = AtomicBool::new(false);
+
     #[inline(always)]
     pub fn ticks() -> u64 {
+        if RAW.load(Ordering::Relaxed) {
+            raw_ticks()
+        } else {
+            instant_ns()
+        }
+    }
+
+    fn instant_ns() -> u64 {
+        static EPOCH: OnceLock<Instant> = OnceLock::new();
+        EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    fn raw_ticks() -> u64 {
         unsafe { core::arch::x86_64::_rdtsc() }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn raw_available() -> bool {
+        // invariant TSC: CPUID.80000007H:EDX[8]
+        let max = unsafe { core::arch::x86_64::__cpuid(0x8000_0000) }.eax;
+        max >= 0x8000_0007 && unsafe { core::arch::x86_64::__cpuid(0x8000_0007) }.edx & (1 << 8) != 0
     }
 
     #[cfg(target_arch = "aarch64")]
     #[inline(always)]
-    pub fn ticks() -> u64 {
+    fn raw_ticks() -> u64 {
         let v: u64;
         unsafe { std::arch::asm!("mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack, preserves_flags)) };
         v
     }
 
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    #[inline(always)]
-    pub fn ticks() -> u64 {
-        static EPOCH: OnceLock<Instant> = OnceLock::new();
-        EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64
+    #[cfg(target_arch = "aarch64")]
+    fn raw_available() -> bool {
+        true
     }
 
-    /// Nanoseconds in `elapsed` ticks, from a one-time 200 µs calibration against `Instant`.
-    #[inline]
-    pub fn ns(elapsed: u64) -> u64 {
-        static NS_PER_TICK_Q32: OnceLock<u64> = OnceLock::new();
-        let q = *NS_PER_TICK_Q32.get_or_init(|| {
-            if cfg!(not(any(target_arch = "x86_64", target_arch = "aarch64"))) {
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    fn raw_ticks() -> u64 {
+        instant_ns()
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    fn raw_available() -> bool {
+        false
+    }
+
+    /// Nanoseconds per tick in Q32, from a 200 µs calibration against `Instant`.
+    fn ns_per_tick_q32() -> u64 {
+        static Q: OnceLock<u64> = OnceLock::new();
+        *Q.get_or_init(|| {
+            if !raw_available() {
                 return 1 << 32;
             }
-            let (t0, i0) = (ticks(), Instant::now());
+            let (t0, i0) = (raw_ticks(), Instant::now());
             while i0.elapsed().as_micros() < 200 {
                 std::hint::spin_loop();
             }
-            let (t1, i1) = (ticks(), Instant::now());
-            let elapsed = i1.duration_since(i0).as_nanos() as u64;
-            ((elapsed << 32) / t1.wrapping_sub(t0).max(1)).max(1)
-        });
-        ((elapsed as u128 * q as u128) >> 32) as u64
+            let (t1, i1) = (raw_ticks(), Instant::now());
+            let elapsed = i1.duration_since(i0).as_nanos() as u128;
+            let q = (elapsed << 32) / (t1.wrapping_sub(t0).max(1) as u128);
+            // a thread descheduled for seconds mid-calibration must not poison the process
+            if elapsed > 10_000_000 || q == 0 || q > u64::MAX as u128 {
+                return 1 << 32;
+            }
+            RAW.store(true, Ordering::Relaxed);
+            q as u64
+        })
+    }
+
+    /// Calibrates once; `mode()` runs it in its probe so no search window ever contains the
+    /// spin. Idempotent and cheap after the first call.
+    pub fn calibrate() {
+        ns_per_tick_q32();
+    }
+
+    #[inline]
+    pub fn ns(elapsed: u64) -> u64 {
+        ((elapsed as u128 * ns_per_tick_q32() as u128) >> 32) as u64
     }
 }
 
@@ -112,6 +158,9 @@ pub fn mode() -> Mode {
         UNPROBED => {
             let off = std::env::var_os("HNSW_KERNEL_PREFETCH").is_some_and(|v| v == "0");
             let m = if off { Mode::Off } else { sys::initial_mode() };
+            if m != Mode::Off {
+                clock::calibrate();
+            }
             MODE.store(m as u8, Ordering::Relaxed);
             m
         }

@@ -224,8 +224,8 @@ const H_SLOTS_PER_PAGE: usize = 20; // u16
 /// evict-and-refault is steady state; default readahead pulls ~16 unwanted pages per random
 /// re-fault, taxing every tenant's page cache. The plane has no sequential reader to protect
 /// (search is pointer-chasing, the builder writes, backfill scans read the host store).
-/// The one sanctioned exception is `prefetch.rs`: a targeted `MADV_WILLNEED` over exactly the
-/// slot pages an expansion is about to read, which is not a readahead window.
+/// `prefetch.rs`'s `MADV_WILLNEED` over exactly the slot pages an expansion is about to read
+/// is not a readahead window and coexists with this.
 fn advise_random(map: &MmapMut) {
     #[cfg(unix)]
     let _ = map.advise(memmap2::Advice::Random);

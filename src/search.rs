@@ -153,9 +153,8 @@ fn bit_allowed(filter: Option<&[u8]>, id: u32) -> bool {
 /// undetected expansion of a cold region.
 const WILLNEED_HOLD: u8 = 16;
 
-/// Unarmed, the gate samples the clock once per this many expansions (~14 ns of `rdtsc`
-/// amortised to ~3.5 ns per expansion); armed, every expansion, so the hold decays per
-/// expansion while the syscall it gates dwarfs the read.
+/// Unarmed, the gate samples the clock once per this many expansions; armed, every expansion,
+/// so the hold decays per expansion while the syscall it gates dwarfs the read.
 const GATE_WINDOW: u8 = 4;
 
 /// The hold after a window that scored `kept` slots in `elapsed_ns`. The allowance is ~8–10×
@@ -180,11 +179,11 @@ pub fn willneed_hold_after(hold: u8, elapsed_ns: u64, kept: u32, vector_bytes: u
 /// The kernel page prefetch (`prefetch.rs`) is added while the hold is armed, for batches of
 /// at least two pages (one page faults the same either way). The gate's window runs from the
 /// end of the previous armed call's advice, not its start, so the advice syscalls' own time
-/// never counts as fault latency (per-range advice would otherwise sustain its own arm).
+/// never counts as fault latency.
 #[inline]
 fn unvisited_prefetched(graph: &Graph, scratch: &mut SearchScratch, stats: &mut SearchStats, nbuf: &mut [u32]) -> usize {
     let enabled = prefetch::mode() != prefetch::Mode::Off;
-    let armed = scratch.willneed_hold > 0;
+    let armed = enabled && scratch.willneed_hold > 0;
     scratch.window_len = if armed { 0 } else { (scratch.window_len + 1) % GATE_WINDOW };
     if enabled && scratch.window_len == 0 {
         let now = clock::ticks();
@@ -196,7 +195,8 @@ fn unvisited_prefetched(graph: &Graph, scratch: &mut SearchScratch, stats: &mut 
         scratch.window_tick = now;
         scratch.window_kept = 0;
     }
-    let kernel = scratch.willneed_hold > 0;
+    let kernel = armed;
+    let mut range_bytes = 0;
     if kernel {
         scratch.ranges.clear();
     }
@@ -212,8 +212,14 @@ fn unvisited_prefetched(graph: &Graph, scratch: &mut SearchScratch, stats: &mut 
         if kernel && (nid as u64) < scratch.capacity {
             let span = graph.slot_read_span(nid);
             match scratch.ranges.last_mut() {
-                Some(last) if last.base == span.base => last.len = last.len.max(span.len),
-                _ => scratch.ranges.push(span),
+                Some(last) if last.base == span.base => {
+                    range_bytes += span.len.saturating_sub(last.len);
+                    last.len = last.len.max(span.len);
+                }
+                _ => {
+                    range_bytes += span.len;
+                    scratch.ranges.push(span);
+                }
             }
         }
         graph.prefetch_slot(nid);
@@ -221,7 +227,7 @@ fn unvisited_prefetched(graph: &Graph, scratch: &mut SearchScratch, stats: &mut 
         kept += 1;
     }
     if kernel {
-        if scratch.ranges.len() >= 2 && prefetch::willneed(&scratch.ranges) {
+        if range_bytes >= 2 * prefetch::page_size() && prefetch::willneed(&scratch.ranges) {
             stats.willneed_batches += 1;
         }
         scratch.window_tick = clock::ticks();
