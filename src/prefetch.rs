@@ -104,8 +104,9 @@ pub enum Mode {
 const UNPROBED: u8 = 0;
 static MODE: AtomicU8 = AtomicU8::new(UNPROBED);
 
-/// The process's backend, probed on first use. `HNSW_KERNEL_PREFETCH=0` forces `Off`; there is
-/// no "on" value because the gate decides per expansion.
+/// The process's backend, probed on first use. `HNSW_KERNEL_PREFETCH=0` forces `Off`, which
+/// also bypasses the gate's clock (a true kill switch); there is no "on" value because the
+/// gate decides per expansion.
 pub fn mode() -> Mode {
     match MODE.load(Ordering::Relaxed) {
         UNPROBED => {

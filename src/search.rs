@@ -183,9 +183,10 @@ pub fn willneed_hold_after(hold: u8, elapsed_ns: u64, kept: u32, vector_bytes: u
 /// never counts as fault latency (per-range advice would otherwise sustain its own arm).
 #[inline]
 fn unvisited_prefetched(graph: &Graph, scratch: &mut SearchScratch, stats: &mut SearchStats, nbuf: &mut [u32]) -> usize {
+    let enabled = prefetch::mode() != prefetch::Mode::Off;
     let armed = scratch.willneed_hold > 0;
     scratch.window_len = if armed { 0 } else { (scratch.window_len + 1) % GATE_WINDOW };
-    if scratch.window_len == 0 {
+    if enabled && scratch.window_len == 0 {
         let now = clock::ticks();
         if scratch.window_tick != 0 {
             let elapsed = clock::ns(now.wrapping_sub(scratch.window_tick));
@@ -195,7 +196,7 @@ fn unvisited_prefetched(graph: &Graph, scratch: &mut SearchScratch, stats: &mut 
         scratch.window_tick = now;
         scratch.window_kept = 0;
     }
-    let kernel = scratch.willneed_hold > 0 && prefetch::mode() != prefetch::Mode::Off;
+    let kernel = scratch.willneed_hold > 0;
     if kernel {
         scratch.ranges.clear();
     }
