@@ -227,20 +227,23 @@ mod sys {
     /// mid-call on it, and it is close-on-exec).
     fn pidfd() -> Option<i32> {
         let pid = unsafe { libc::getpid() } as u32;
-        let seen = PIDFD.load(Ordering::Acquire);
-        if seen != 0 && (seen >> 32) as u32 == pid {
-            return Some(seen as i32);
-        }
-        let opened = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::c_long, 0 as libc::c_long) };
-        if opened < 0 {
-            return None;
-        }
-        let word = (pid as u64) << 32 | opened as u32 as u64;
-        match PIDFD.compare_exchange(seen, word, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => Some(opened as i32),
-            Err(current) => {
-                unsafe { libc::close(opened as i32) };
-                Some(current as i32)
+        let mut seen = PIDFD.load(Ordering::Acquire);
+        loop {
+            if seen != 0 && (seen >> 32) as u32 == pid {
+                return Some(seen as i32);
+            }
+            let opened = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::c_long, 0 as libc::c_long) };
+            if opened < 0 {
+                return None;
+            }
+            let word = (pid as u64) << 32 | opened as u32 as u64;
+            match PIDFD.compare_exchange(seen, word, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(opened as i32),
+                // another thread replaced or invalidated the word meanwhile: use what it left
+                Err(current) => {
+                    unsafe { libc::close(opened as i32) };
+                    seen = current;
+                }
             }
         }
     }
