@@ -41,8 +41,7 @@ pub fn page_size() -> usize {
     })
 }
 
-/// The gate's clock: a raw cycle counter where one is invariant (a `clock_gettime` per
-/// expansion measured 3–5 % of an in-cache query), `Instant` elsewhere.
+/// The gate's clock: a raw cycle counter where one is invariant, `Instant` elsewhere.
 pub mod clock {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::OnceLock;
@@ -123,8 +122,8 @@ pub mod clock {
         })
     }
 
-    /// Calibrates once; `mode()` runs it in its probe so no search window ever contains the
-    /// spin. Idempotent and cheap after the first call.
+    /// Calibrates once; `Graph::new` and the backend probe run it, so no search window
+    /// contains the spin.
     pub fn calibrate() {
         ns_per_tick_q32();
     }

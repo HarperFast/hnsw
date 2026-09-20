@@ -60,8 +60,7 @@ pub struct SearchScratch {
     /// Expansions left in the kernel-prefetch hold; per layer sweep, so one cold query never
     /// arms the next query that draws this scratch from the pool.
     willneed_hold: u8,
-    /// Tick at which the current gate window opened (0 = none), how many slots it has scored,
-    /// and the expansion count within it.
+    /// Gate window: opening tick (0 = none), slots scored, expansions elapsed.
     window_tick: u64,
     window_kept: u32,
     window_len: u8,
@@ -153,8 +152,8 @@ fn bit_allowed(filter: Option<&[u8]>, id: u32) -> bool {
 /// undetected expansion of a cold region.
 const WILLNEED_HOLD: u8 = 16;
 
-/// Unarmed, the gate samples the clock once per this many expansions; armed, every expansion,
-/// so the hold decays per expansion while the syscall it gates dwarfs the read.
+/// Expansions per clock sample while unarmed; armed, every expansion so the hold decays per
+/// expansion.
 const GATE_WINDOW: u8 = 4;
 
 /// The hold after a window that scored `kept` slots in `elapsed_ns`. The allowance is ~8–10×
@@ -195,7 +194,7 @@ fn unvisited_prefetched(graph: &Graph, scratch: &mut SearchScratch, stats: &mut 
         scratch.window_tick = now;
         scratch.window_kept = 0;
     }
-    let kernel = armed;
+    let kernel = enabled && scratch.willneed_hold > 0;
     let mut range_bytes = 0;
     if kernel {
         scratch.ranges.clear();

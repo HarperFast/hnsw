@@ -1,4 +1,3 @@
-//! Kernel page prefetch.
 
 use hnsw_plane::format::PlaneFile;
 use hnsw_plane::insert::{insert, InsertParams};

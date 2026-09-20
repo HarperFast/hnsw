@@ -109,6 +109,8 @@ pub struct NodeRead {
 
 impl Graph {
     pub fn new(file: PlaneFile) -> Self {
+        // probe the kernel-prefetch backend (and calibrate its clock) here, not on a search
+        crate::prefetch::mode();
         Graph {
             file,
             probe_rotation: std::sync::atomic::AtomicU32::new(0),
