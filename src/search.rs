@@ -58,11 +58,11 @@ const GROW_SLACK_WORDS: usize = 1024;
 /// Reusable per-thread search scratch.
 ///
 /// The visited set is one bit per node id plus a journal of the bitmap words a sweep set, so
-/// `begin()` clears only what the last sweep touched. Per scratch: `9/8 * 8 * ceil(ids / 64)`
-/// bytes of bitmap (ids = the largest high-water mark it was begun at, plus at most
-/// `GROW_SLACK_WORDS` words; the 1/8 is headroom) and at most `4 * TOUCHED_CAP` bytes of
+/// `begin()` clears only what the last sweep touched. Per scratch: `8 * ceil(ids / 64)` bytes
+/// of bitmap plus headroom of 1/8 of that or `8 * GROW_SLACK_WORDS`, whichever is larger (ids =
+/// the largest high-water mark it was begun at), and at most `4 * TOUCHED_CAP` bytes of
 /// journal — 200M nodes is under 29 MB. `begin()` sizes both buffers; `visit()` reallocates
-/// only for an id minted by a concurrent insert past both the sizing snapshot and the 1/8
+/// only for an id minted by a concurrent insert past both the sizing snapshot and the
 /// headroom, never past `max_nodes / 64` words.
 pub struct SearchScratch {
     visited: Vec<u64>,
@@ -136,11 +136,12 @@ impl SearchScratch {
         self.touched.clear();
     }
 
-    /// 1/8 headroom on every reservation rather than `Vec`'s doubling: a writer raising the
-    /// high-water mark by one word per 64 inserts, or a visit just past the snapshot, must not
-    /// reallocate, and the documented bound must stay tight.
+    /// Headroom on every reservation — 1/8, and never less than a visit's own growth request —
+    /// rather than `Vec`'s doubling: a writer raising the high-water mark by one word per 64
+    /// inserts, or a visit just past the snapshot, must not reallocate, and the documented
+    /// bound must stay tight.
     fn grow(&mut self, words: usize) {
-        let target = words + words / 8;
+        let target = words + (words / 8).max(GROW_SLACK_WORDS);
         if self.visited.capacity() < words {
             self.visited.reserve_exact(target - self.visited.len());
         }
@@ -757,6 +758,13 @@ mod visited_tests {
         let words = (nodes as usize).div_ceil(64);
         let bitmap = scratch.visited.capacity();
         assert!(bitmap >= words && bitmap <= words + words / 8 + page_words, "bitmap holds {bitmap} words for ceil(nodes / 64) = {words}");
+
+        // a small plane's headroom is at least a visit's own growth request
+        let mut small = SearchScratch::new();
+        small.begin(100_000);
+        let cap = small.visited.capacity();
+        assert!(small.visit(100_032));
+        assert_eq!(small.visited.capacity(), cap, "a visit just past a small snapshot reallocated");
         let journal = scratch.touched.capacity();
         assert!(journal >= words.min(TOUCHED_CAP) && journal <= TOUCHED_CAP + page_words * 2, "journal holds {journal} entries");
 

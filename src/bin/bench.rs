@@ -445,8 +445,12 @@ fn run(
                 lat.sort();
                 // a panic before the barrier would wedge the other searchers in wait()
                 let anon = if rendezvous.wait().is_leader() {
-                    while !writer_sized.load(Ordering::Relaxed) {
+                    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+                    while !writer_sized.load(Ordering::Relaxed) && Instant::now() < deadline {
                         std::thread::yield_now();
+                    }
+                    if !writer_sized.load(Ordering::Relaxed) {
+                        eprintln!("warning: the writer never sized its scratch; RSS sample excludes it");
                     }
                     rss_anon_kb()
                 } else {

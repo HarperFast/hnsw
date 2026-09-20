@@ -253,9 +253,10 @@ search(sliceHandles, queryVector: Float32Array, k, ef, filter?): Promise<{ids, d
   x86, NEON on ARM; `std::arch` intrinsics with a scalar fallback).
 - Visited set: one bit per node id plus a journal of the words a sweep set, cleared per sweep
   by walking the journal (one per pool thread, reused across queries — no allocation per
-  query). Per scratch: `9/8 × 8 × ceil(nodes / 64)` bytes of bitmap (the 1/8 is headroom so a
-  writer raising the high-water mark does not reallocate every scratch per word) plus at most
-  256 KB of journal — so 200M nodes is ~28 MB; worst
+  query). Per scratch: `8 × ceil(nodes / 64)` bytes of bitmap plus headroom of 1/8 of that or 8 KB,
+  whichever is larger (so a writer raising the high-water mark, or a visit just past the
+  snapshot, does not reallocate the scratch) plus at most 256 KB of journal — 200M nodes is
+  ~28 MB; worst
   case per process is `(in-flight searches + 1 insert scratch) × that`, and the pool retains at
   most 64 idle scratches. The u32 epoch stamp it replaced was
   4 B/node materialized per scratch — 800 MB at 200M, 205 GB across a 256-thread libuv pool
@@ -646,4 +647,5 @@ The bitmap wins or ties because 125 KB (1M) and 1 MB (8M) stay in L2 while the e
 all cache-resident) is far below that difference. The epoch RSS figures are roughly double the
 array: under a concurrent writer every `begin()` sees a higher high-water mark and `Vec::resize`
 grows by amortized doubling, so the 4 MB array becomes 8 MB and the 32 MB one 64 MB — the bitmap
-reserves exactly. Both figures also include the heaps and neighbor buffer.
+reserves with 1/8 headroom instead. Both figures also include the heaps and neighbor buffer;
+the bitmap figures predate the headroom, so live scratches are ~12.5% larger than shown.
