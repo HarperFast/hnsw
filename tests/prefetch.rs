@@ -61,12 +61,14 @@ fn slot_read_span_straddles_a_page_boundary_when_slots_are_packed() {
     assert_eq!(file.slots_per_page, 0, "expected packed layout for this geometry");
     let graph = Graph::new(file);
     let page = page();
-    let straddling = (0..100u32).filter(|&id| graph.slot_read_span(id).len == 2 * page).count();
-    let single = (0..100u32).filter(|&id| graph.slot_read_span(id).len == page).count();
+    // two pages of slots hold at least one straddler at any page size
+    let ids = 0..(2 * page / graph.file.slot_size + 2) as u32;
+    let straddling = ids.clone().filter(|&id| graph.slot_read_span(id).len == 2 * page).count();
+    let single = ids.clone().filter(|&id| graph.slot_read_span(id).len == page).count();
     assert!(straddling > 0 && single > 0, "straddling {straddling}, single {single}");
     // the batch dedup must keep the longer of two same-base spans: the first straddling slot
-    // shares its base page with the single-page slot before it (id 12 at 4 KiB pages, 51 at 16)
-    let straddler = (1..200u32).find(|&id| graph.slot_read_span(id).len == 2 * page).expect("a straddling slot");
+    // shares its base page with the single-page slot before it
+    let straddler = ids.clone().skip(1).find(|&id| graph.slot_read_span(id).len == 2 * page).expect("a straddling slot");
     let (sa, sb) = (graph.slot_read_span(straddler - 1), graph.slot_read_span(straddler));
     assert_eq!(sa.base, sb.base, "{sa:?} {sb:?}");
     assert!(sb.len > sa.len, "{sa:?} {sb:?}");
