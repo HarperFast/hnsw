@@ -28,7 +28,8 @@ impl ScratchPool {
     fn take(&self) -> SearchScratch {
         self.0.lock().unwrap().pop().unwrap_or_default()
     }
-    fn put(&self, s: SearchScratch) {
+    fn put(&self, mut s: SearchScratch) {
+        s.finish();
         let mut pool = self.0.lock().unwrap();
         if pool.len() < 64 {
             pool.push(s);

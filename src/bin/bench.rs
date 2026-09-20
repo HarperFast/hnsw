@@ -420,11 +420,14 @@ fn run(
         let stop = Arc::new(AtomicBool::new(false));
         let per_thread = queries.max(100);
         let anon_before = rss_anon_kb();
+        // the searchers rendezvous after their loops so one RSS sample sees every scratch alive
+        let rendezvous = Arc::new(std::sync::Barrier::new(threads));
         let start = Instant::now();
         let mut handles = Vec::new();
         for t in 0..threads {
             let graph = graph.clone();
             let corpus = source.clone();
+            let rendezvous = rendezvous.clone();
             handles.push(std::thread::spawn(move || {
                 let mut scratch = SearchScratch::new();
                 let mut rng = Rng(0x9e37_79b9 ^ (t as u64 + 1) * 0x1234_5677);
@@ -437,8 +440,9 @@ fn run(
                     assert!(!r.is_empty());
                 }
                 lat.sort();
-                // sampled while every searcher still holds its scratch, so the peak includes them
-                (lat[per_thread / 2], lat[(per_thread * 99 / 100).min(per_thread - 1)], rss_anon_kb())
+                let anon = if rendezvous.wait().is_leader() { rss_anon_kb() } else { 0 };
+                rendezvous.wait();
+                (lat[per_thread / 2], lat[(per_thread * 99 / 100).min(per_thread - 1)], anon)
             }));
         }
         // background writer: sustained inserts while searchers run
@@ -485,13 +489,14 @@ fn run(
             p99s[threads - 1].as_secs_f64() * 1e3,
             inserted as f64 / wall.as_secs_f64()
         );
+        let growth_mb = (anon_peak as f64 - anon_before as f64) / 1024.0;
         println!(
-            "anonymous RSS: {:.1} MB before the searchers, {:.1} MB peak with {} scratches live (+{:.1} MB, {:.2} MB per searcher)",
+            "anonymous RSS: {:.1} MB before the searchers, {:.1} MB peak with {} scratches live ({:+.1} MB, {:.2} MB per scratch)",
             anon_before as f64 / 1024.0,
             anon_peak as f64 / 1024.0,
             threads + 1,
-            (anon_peak - anon_before) as f64 / 1024.0,
-            (anon_peak - anon_before) as f64 / 1024.0 / (threads + 1) as f64
+            growth_mb,
+            growth_mb / (threads + 1) as f64
         );
     }
 }

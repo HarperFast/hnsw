@@ -51,23 +51,24 @@ impl PartialOrd for Result_ {
 /// clear it triggers is amortized against a traversal that already cost more than it.
 const TOUCHED_CAP: usize = 1 << 16;
 
-/// Words of headroom added when a visit lands past the bitmap, so a burst of ids minted by
-/// concurrent inserts grows it once rather than per id.
+/// Headroom when a visit lands past the bitmap, so a burst of ids minted by concurrent inserts
+/// grows it once rather than per id.
 const GROW_SLACK_WORDS: usize = 1024;
 
 /// Reusable per-thread search scratch.
 ///
 /// The visited set is one bit per node id plus a journal of the bitmap words a sweep set, so
-/// `begin()` clears only what the last sweep touched and the set never carries a per-node
-/// stamp. Per scratch it holds `8 * ceil(ids / 64)` bytes of bitmap (ids = the largest id
-/// high-water mark it was begun at, plus at most `GROW_SLACK_WORDS` words) and at most
-/// `4 * TOUCHED_CAP` bytes of journal, whatever the node count: 200M nodes is 25 MB + 256 KB.
-/// Both buffers are sized in `begin()` (or the rare growth path), never inside `visit()`.
+/// `begin()` clears only what the last sweep touched. Per scratch: `8 * ceil(ids / 64)` bytes
+/// of bitmap (ids = the largest high-water mark it was begun at, plus at most
+/// `GROW_SLACK_WORDS` words) and at most `4 * TOUCHED_CAP` bytes of journal — 200M nodes is
+/// 25 MB + 256 KB. `begin()` sizes both buffers; `visit()` allocates only for an id minted by
+/// a concurrent insert after the sizing snapshot, at most once per `GROW_SLACK_WORDS` words
+/// of growth and never past `max_nodes / 64` words.
 pub struct SearchScratch {
     visited: Vec<u64>,
-    /// Indexes of the words that went 0 -> nonzero since `begin()`.
+    /// Words that went 0 -> nonzero since `begin()`.
     touched: Vec<u32>,
-    /// The journal filled, so the next `begin()` must clear the whole bitmap instead.
+    /// The journal filled, so the next `begin()` clears the whole bitmap instead.
     touched_overflow: bool,
     neighbors: Vec<u32>,
     candidates: BinaryHeap<Candidate>,
@@ -116,6 +117,17 @@ impl SearchScratch {
         self.window_tick = 0;
         self.window_len = 0;
         self.willneed_hold = 0;
+        self.finish();
+        let words = (capacity as usize).div_ceil(64);
+        if self.visited.len() < words {
+            self.grow(words);
+        }
+    }
+
+    /// Clear the visited set. `begin()` does this itself; a pool calls it before handing the
+    /// scratch on so the clear — a whole-bitmap fill after a journal overflow — is paid by the
+    /// query that touched the words, not by whichever query takes the scratch next.
+    pub fn finish(&mut self) {
         if self.touched_overflow {
             self.visited.fill(0);
             self.touched_overflow = false;
@@ -125,14 +137,9 @@ impl SearchScratch {
             }
         }
         self.touched.clear();
-        let words = (capacity as usize).div_ceil(64);
-        if self.visited.len() < words {
-            self.grow(words);
-        }
     }
 
-    /// Exact reservations, so the bytes a scratch holds are the formula above and not an
-    /// amortized-doubling multiple of it.
+    /// Exact, so a scratch holds the documented bytes and not an amortized-doubling multiple.
     fn grow(&mut self, words: usize) {
         self.visited.reserve_exact(words - self.visited.len());
         self.visited.resize(words, 0);
@@ -737,29 +744,30 @@ mod visited_tests {
         }
     }
 
-    /// The bound the module documents, on allocated capacity rather than length: `Vec` growth by
-    /// amortized doubling would leave a scratch holding up to twice the formula.
+    /// On capacity rather than length: amortized-doubling growth would leave a scratch holding up
+    /// to twice the documented bytes. `reserve_exact` may be rounded up by the allocator, hence
+    /// the page of slack.
     #[test]
     fn a_scratch_holds_one_bit_per_node_plus_a_bounded_journal() {
+        let page_words = 4096 / 8;
         let mut scratch = SearchScratch::new();
         let nodes = 10_000_000u64;
         scratch.begin(nodes);
         let words = (nodes as usize).div_ceil(64);
-        assert_eq!(scratch.visited.capacity(), words, "bitmap capacity is not exactly ceil(nodes / 64) words");
-        assert_eq!(scratch.visited.capacity() * 8, 1_250_000);
-        assert_eq!(scratch.touched.capacity(), words.min(TOUCHED_CAP));
-        assert!(scratch.touched.capacity() * 4 <= 4 * TOUCHED_CAP);
+        let bitmap = scratch.visited.capacity();
+        assert!(bitmap >= words && bitmap <= words + page_words, "bitmap holds {bitmap} words for ceil(nodes / 64) = {words}");
+        let journal = scratch.touched.capacity();
+        assert!(journal >= words.min(TOUCHED_CAP) && journal <= TOUCHED_CAP + page_words * 2, "journal holds {journal} entries");
 
         // a smaller sweep neither shrinks nor grows either buffer
         scratch.begin(1_000);
-        assert_eq!(scratch.visited.capacity(), words);
-        assert_eq!(scratch.touched.capacity(), words.min(TOUCHED_CAP));
+        assert_eq!(scratch.visited.capacity(), bitmap);
+        assert_eq!(scratch.touched.capacity(), journal);
     }
 
-    /// The set must agree with a `HashSet` across sweeps of varied capacity — duplicates,
-    /// ids sharing a word, ids past the sizing snapshot, and a shrinking snapshot — because a
-    /// stale bit surviving a `begin()` reads as "already visited" and silently drops a neighbor,
-    /// on the write path as much as the read path.
+    /// A stale bit surviving a `begin()` reads as "already visited" and silently drops a
+    /// neighbor, on the write path as much as the read path — so: duplicates, ids sharing a
+    /// word, ids past the sizing snapshot, and a shrinking snapshot, against a `HashSet`.
     #[test]
     fn visit_matches_a_hash_set_across_sweeps() {
         let mut rng = Rng(0x2545_f491_4f6c_dd1d);
@@ -785,7 +793,6 @@ mod visited_tests {
         }
     }
 
-    /// `visit()` must not allocate: every buffer it writes was reserved by `begin()`.
     #[test]
     fn visits_within_the_snapshot_never_allocate() {
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
@@ -803,8 +810,6 @@ mod visited_tests {
         }
     }
 
-    /// A sweep that sets more distinct words than the journal holds must still leave the next
-    /// sweep clean: the fallback is a whole-bitmap clear, not a partial one.
     #[test]
     fn a_journal_overflow_clears_the_whole_bitmap_on_the_next_sweep() {
         let mut scratch = SearchScratch::new();
