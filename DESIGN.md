@@ -368,10 +368,10 @@ throughout (a serial fault cost 80 µs on the idle device and ~250 µs during th
 
 Run-to-run spread on this host was ±15 %, wider than the effect, so the resident cost was also
 measured as retired user instructions (`perf stat -e instructions:u`, exact under contention):
-gate on vs `HNSW_KERNEL_PREFETCH=0` in the same binary differs by 7.8 M instructions over the
-1,200 queries of a run, 6.5 k per query or 0.3 % of the query phase, and by −1.8 M against the
-`main` binary (noise). With `rdtsc` at 14 ns on this CPU and one sample per 4 expansions, the
-gate's time is 0.4–0.8 % of a query at every ef. An earlier build that read `clock_gettime`
+gate on vs `HNSW_KERNEL_PREFETCH=0` in the same binary differs by 13.8 M instructions over the
+1,200 queries of a run (two "on" runs agree to 11 k), 11.5 k per query or 0.5 % of the query
+phase, and the `main` binary sits within 2 M of either (noise). With `rdtsc` at 14 ns on this
+CPU and one sample per 4 expansions, the gate's time is 0.4–0.8 % of a query at every ef. An earlier build that read `clock_gettime`
 (32 ns) on every expansion measured 3–8 % on the same runs, which is what set the window and the
 counter: a high-ef expansion scores only ~3–9 unvisited slots, so per-expansion overhead is paid
 ~700 times in a 400 µs query.
