@@ -58,9 +58,10 @@ pub struct SearchScratch {
     /// `id_high_water` at `begin()`: ids past it are rejected by `distance_to`, so they are
     /// never handed to the kernel either (a corrupt neighbor id must not read reserved slots).
     capacity: u64,
-    /// Expansions left in the kernel-prefetch hold; see `unvisited_prefetched`.
+    /// Expansions left in the kernel-prefetch hold; per layer sweep, so one cold query never
+    /// arms the next query that draws this scratch from the pool.
     willneed_hold: u8,
-    /// When the previous expansion started, and how many slots it went on to score.
+    /// When the previous expansion's distance loop began, and how many slots it scored.
     batch_clock: Option<Instant>,
     batch_kept: u32,
     ranges: Vec<PageRange>,
@@ -94,6 +95,7 @@ impl SearchScratch {
         }
         self.capacity = capacity;
         self.batch_clock = None;
+        self.willneed_hold = 0;
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 {
             self.visited.fill(0);
@@ -168,9 +170,10 @@ pub fn willneed_hold_after(hold: u8, elapsed_ns: u64, kept: u32, vector_bytes: u
 /// at a time. Returns the compacted length.
 ///
 /// The kernel page prefetch (`prefetch.rs`) is added while the hold is armed. Its gate reads
-/// the clock once per expansion: the interval since the previous call covers that expansion's
-/// distance loop, the pop and the parent's adjacency read, so a resident plane pays ~20 ns
-/// here and no syscall.
+/// the clock once per expansion on a resident plane: the interval since the previous call
+/// covers that expansion's distance loop, the pop and the parent's adjacency read. An armed
+/// expansion re-reads it after the advice call so the syscalls' own time never counts as
+/// fault latency (per-range advice would otherwise sustain its own arm).
 #[inline]
 fn unvisited_prefetched(graph: &Graph, scratch: &mut SearchScratch, stats: &mut SearchStats, nbuf: &mut [u32]) -> usize {
     let now = Instant::now();
@@ -191,14 +194,20 @@ fn unvisited_prefetched(graph: &Graph, scratch: &mut SearchScratch, stats: &mut 
             continue;
         }
         if kernel && (nid as u64) < scratch.capacity {
-            scratch.ranges.push(graph.slot_read_span(nid));
+            let span = graph.slot_read_span(nid);
+            if scratch.ranges.last().map_or(true, |last| last.base != span.base) {
+                scratch.ranges.push(span);
+            }
         }
         graph.prefetch_slot(nid);
         nbuf[kept] = nid;
         kept += 1;
     }
-    if kernel && prefetch::willneed(&scratch.ranges) {
-        stats.willneed_batches += 1;
+    if kernel {
+        if prefetch::willneed(&scratch.ranges) {
+            stats.willneed_batches += 1;
+        }
+        scratch.batch_clock = Some(Instant::now());
     }
     scratch.batch_kept = kept as u32;
     kept

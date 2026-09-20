@@ -1,5 +1,5 @@
-//! Kernel page prefetch: the span handed to the kernel, the gate controller, and each backend
-//! on the host it runs on.
+//! Kernel page prefetch: the span handed to the kernel, the gate controller, each backend on
+//! the host it runs on, and the gate opening on a plane whose pages were reclaimed.
 
 use hnsw_plane::format::PlaneFile;
 use hnsw_plane::insert::{insert, InsertParams};
@@ -146,4 +146,44 @@ fn resident_search_issues_no_kernel_prefetch() {
     // a freshly written plane is resident; a pre-emption can arm the hold for 16 expansions,
     // so allow a handful of batches over 200 queries but nothing systematic
     assert!(batches < 64, "{batches} kernel prefetch batches on a resident plane");
+}
+
+/// Reclaim the plane's pages and confirm the gate arms and issues kernel prefetches. Skipped
+/// (with a message) where the host will not reclaim them: a tmpfs temp dir without swap.
+#[cfg(target_os = "linux")]
+#[test]
+fn reclaimed_plane_arms_the_gate() {
+    let path = temp("cold");
+    let dims = 128;
+    let n = 60_000u32;
+    let file = PlaneFile::create(&path, dims, 32, n as u64 + 16).expect("create");
+    let graph = Graph::new(file);
+    let params = InsertParams::default();
+    let mut scratch = SearchScratch::new();
+    for i in 0..n {
+        insert(&graph, &vector_for(i, dims), &params, &mut scratch).expect("insert");
+    }
+    graph.file.msync().expect("msync");
+    let base = graph.file.slot_ptr(0) as usize & !(page() - 1);
+    let end = graph.file.slot_ptr(n - 1) as usize + graph.file.slot_size;
+    let len = (end + page() - 1) / page() * page() - base;
+    let rc = unsafe { libc::madvise(base as *mut libc::c_void, len, libc::MADV_PAGEOUT) };
+    assert_eq!(rc, 0, "MADV_PAGEOUT: {}", std::io::Error::last_os_error());
+    let mut vec = vec![0u8; len / page()];
+    let rc = unsafe { libc::mincore(base as *mut libc::c_void, len, vec.as_mut_ptr()) };
+    assert_eq!(rc, 0);
+    let resident = vec.iter().filter(|b| **b & 1 != 0).count();
+    if resident * 2 > vec.len() {
+        eprintln!("skipping: {resident}/{} pages still resident after MADV_PAGEOUT", vec.len());
+        return;
+    }
+    let mut batches = 0;
+    for i in 0..300u32 {
+        let q = hnsw_plane::distance::Query::for_plane(&graph.file, vector_for(i * 97 + 5, dims));
+        let (hits, stats) = search(&graph, &q, 5, 128, &mut scratch);
+        assert!(!hits.is_empty());
+        batches += stats.willneed_batches;
+    }
+    eprintln!("{batches} kernel prefetch batches over 300 queries");
+    assert!(batches > 0, "no kernel prefetch batch over 300 queries on a reclaimed plane");
 }

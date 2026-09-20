@@ -1,18 +1,14 @@
-//! Kernel-level prefetch of slot pages. `Graph::prefetch_slot`'s CPU hint is dropped on a
-//! non-resident page, so once the plane exceeds page cache every unvisited neighbour of an
-//! expansion is a synchronous, queue-depth-1 major fault. `MADV_WILLNEED` over the batch of
-//! slots about to be read starts all their reads at once. It is issued only while the search
-//! gate in `search::unvisited_prefetched` sees fault-scale latency: measured on NVMe, the
-//! vectored call costs ~0.5 µs per range when the pages are already resident, against a
-//! ~0.13 µs resident visit, so always-on would dominate an in-cache query.
-//!
-//! The mapping stays `MADV_RANDOM`: this fetches exactly the pages the next distance reads
-//! need, never a readahead window around them.
+//! Kernel-level prefetch of slot pages: `MADV_WILLNEED` over the slots one expansion is about
+//! to read, so non-resident pages fault in parallel instead of one at a time. Issued only
+//! while the gate in `search::unvisited_prefetched` is armed; the cost model and the reason it
+//! cannot be always on are in DESIGN.md §7. The mapping stays `MADV_RANDOM`: this fetches
+//! exactly the pages the next distance reads need, never a readahead window around them.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
-/// A page-aligned span of the mapping. Same layout as `iovec` so a batch can be handed to
-/// `process_madvise` without copying; addresses are held as integers so the buffer stays `Send`.
+/// A page-aligned span of the mapping. `repr(C)` with the layout of `iovec`, which the
+/// vectored backend relies on to hand a batch to the kernel without copying; the address is an
+/// integer so the scratch buffer stays `Send`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageRange {
@@ -21,8 +17,8 @@ pub struct PageRange {
 }
 
 impl PageRange {
-    /// The pages covering `[start, end)`, aligned to the system page size (macOS arm64 pages
-    /// are 16 KiB, and `madvise` rejects a span not aligned to them).
+    /// The pages covering `[start, end)`, aligned to the system page size (16 KiB on macOS
+    /// arm64, where `madvise` rejects a 4 KiB alignment).
     pub fn covering(start: usize, end: usize) -> PageRange {
         let page = page_size();
         let base = start & !(page - 1);
@@ -60,9 +56,8 @@ pub enum Mode {
 const UNPROBED: u8 = 0;
 static MODE: AtomicU8 = AtomicU8::new(UNPROBED);
 
-/// The process's current backend, probed on first use. `HNSW_KERNEL_PREFETCH=0` is the kill
-/// switch for a kernel where the advice misbehaves, or an A/B control; there is no "on" value
-/// because the gate decides per expansion.
+/// The process's backend, probed on first use. `HNSW_KERNEL_PREFETCH=0` forces `Off`; there is
+/// no "on" value because the gate decides per expansion.
 pub fn mode() -> Mode {
     match MODE.load(Ordering::Relaxed) {
         UNPROBED => {
@@ -77,9 +72,9 @@ pub fn mode() -> Mode {
     }
 }
 
-/// Prefetch every range with the probed backend; a failure that means the backend is
-/// unusable in this process latches the next one down, so no expansion pays a failing
-/// syscall twice. Returns whether a kernel request was issued.
+/// Prefetch every range with the probed backend; a backend unusable in this process latches
+/// the next one down, so no expansion pays a failing syscall twice. Returns whether a kernel
+/// request was issued.
 pub fn willneed(ranges: &[PageRange]) -> bool {
     if ranges.is_empty() {
         return false;
@@ -130,8 +125,9 @@ mod sys {
         Mode::Vectored
     }
 
-    /// A pidfd for the calling process, opened on first use and reopened after a fork so a
-    /// child never advises its parent's address space.
+    /// A pidfd for the calling process, reopened after a fork so a child never advises its
+    /// parent's address space (the inherited descriptor is left open: another thread may be
+    /// mid-call on it, and it is close-on-exec).
     fn pidfd() -> Option<i32> {
         let pid = unsafe { libc::getpid() };
         let fd = PIDFD.load(Ordering::Acquire);
@@ -143,8 +139,6 @@ mod sys {
             return None;
         }
         let opened = opened as i32;
-        // a concurrent opener may have won; the pid store is ordered after the fd store so a
-        // reader that sees the new pid also sees the new fd
         match PIDFD.compare_exchange(fd, opened, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => {
                 PIDFD_PID.store(pid, Ordering::Release);
@@ -157,27 +151,41 @@ mod sys {
         }
     }
 
+    /// Every argument widened to `c_long`: `syscall` is variadic, and AAPCS64 leaves the upper
+    /// half of a 32-bit variadic argument unspecified.
+    fn process_madvise(fd: i32, chunk: &[PageRange]) -> libc::c_long {
+        let iov = chunk.as_ptr() as *const libc::iovec;
+        unsafe {
+            libc::syscall(
+                libc::SYS_process_madvise,
+                fd as libc::c_long,
+                iov as libc::c_long,
+                chunk.len() as libc::c_long,
+                libc::MADV_WILLNEED as libc::c_long,
+                0 as libc::c_long,
+            )
+        }
+    }
+
     pub fn vectored(ranges: &[PageRange]) -> Outcome {
         let Some(mut fd) = pidfd() else { return Outcome::Unusable };
         for chunk in ranges.chunks(libc::UIO_MAXIOV as usize) {
-            // PageRange is repr(C) { usize, usize }: the layout of iovec
-            let iov = chunk.as_ptr() as *const libc::iovec;
-            let mut r = unsafe { libc::syscall(libc::SYS_process_madvise, fd, iov, chunk.len(), libc::MADV_WILLNEED, 0u32) };
+            let mut r = process_madvise(fd, chunk);
             if r < 0 && matches!(errno(), libc::EBADF | libc::ESRCH) {
-                // stale descriptor (pidfd of a pre-fork process): reopen once
                 PIDFD_PID.store(0, Ordering::Release);
                 let Some(again) = pidfd() else { return Outcome::Unusable };
                 fd = again;
-                r = unsafe { libc::syscall(libc::SYS_process_madvise, fd, iov, chunk.len(), libc::MADV_WILLNEED, 0u32) };
+                r = process_madvise(fd, chunk);
             }
             if r < 0 {
                 return match errno() {
                     libc::ENOSYS | libc::EPERM | libc::EINVAL | libc::EBADF | libc::ESRCH => Outcome::Unusable,
-                    // transient (ENOMEM, EAGAIN): the reads that follow are correct without it
+                    // ENOMEM, EAGAIN: transient, and the reads that follow are correct without it
                     _ => Outcome::Issued,
                 };
             }
-            // a short byte count is advisory too: the kernel stopped at an unmapped hole
+            // a short byte count stopped at a range the kernel would not advise; the rest of
+            // the chunk faults as before
         }
         Outcome::Issued
     }
@@ -225,11 +233,19 @@ mod sys {
     }
 }
 
+/// `Unusable` only when every range is refused, so a sandbox that filters `madvise` latches
+/// off instead of paying `k` failing syscalls per armed expansion.
 #[cfg(unix)]
 fn unix_per_range(ranges: &[PageRange]) -> Outcome {
+    let mut refused = 0;
     for r in ranges {
-        // errors are ignored: the advice is a hint and the read that follows is correct either way
-        unsafe { libc::madvise(r.base as *mut libc::c_void, r.len, libc::MADV_WILLNEED) };
+        if unsafe { libc::madvise(r.base as *mut libc::c_void, r.len, libc::MADV_WILLNEED) } != 0 {
+            refused += 1;
+        }
     }
-    Outcome::Issued
+    if refused == ranges.len() {
+        Outcome::Unusable
+    } else {
+        Outcome::Issued
+    }
 }

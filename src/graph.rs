@@ -292,8 +292,8 @@ impl Graph {
         }
     }
 
-    /// The pages holding what search reads from slot `id` — seqlock through adjacency, never
-    /// the key field, whose capacity can be tens of KiB that no distance read touches.
+    /// The pages holding what search reads from slot `id`: seqlock through adjacency, never the
+    /// key field (up to 64 KiB that no distance read touches).
     #[inline]
     pub fn slot_read_span(&self, id: u32) -> PageRange {
         let start = self.file.slot_ptr(id) as usize;
