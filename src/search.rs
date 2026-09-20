@@ -1,6 +1,7 @@
 //! Beam search over the plane, zero-copy: per-visit cost is one seqlock-guarded distance
-//! against mmap bytes plus primitive heap/visited ops. Visited tracking is an epoch-stamped
-//! array; neighbor ids stream through a reusable scratch buffer.
+//! against mmap bytes plus primitive heap/visited ops. Visited tracking is a one-bit-per-node
+//! bitmap cleared through a journal of the words a sweep set; neighbor ids stream through a
+//! reusable scratch buffer.
 
 use crate::distance::Query;
 use crate::format::{MAX_UPPER_LEVELS, NO_ID};
@@ -45,10 +46,29 @@ impl PartialOrd for Result_ {
     }
 }
 
+/// Journal entries a sweep may record before `begin()` falls back to clearing the whole bitmap.
+/// A sweep that set this many distinct words made at least as many visits, so the O(nodes/64)
+/// clear it triggers is amortized against a traversal that already cost more than it.
+const TOUCHED_CAP: usize = 1 << 16;
+
+/// Words of headroom added when a visit lands past the bitmap, so a burst of ids minted by
+/// concurrent inserts grows it once rather than per id.
+const GROW_SLACK_WORDS: usize = 1024;
+
 /// Reusable per-thread search scratch.
+///
+/// The visited set is one bit per node id plus a journal of the bitmap words a sweep set, so
+/// `begin()` clears only what the last sweep touched and the set never carries a per-node
+/// stamp. Per scratch it holds `8 * ceil(ids / 64)` bytes of bitmap (ids = the largest id
+/// high-water mark it was begun at, plus at most `GROW_SLACK_WORDS` words) and at most
+/// `4 * TOUCHED_CAP` bytes of journal, whatever the node count: 200M nodes is 25 MB + 256 KB.
+/// Both buffers are sized in `begin()` (or the rare growth path), never inside `visit()`.
 pub struct SearchScratch {
-    visited: Vec<u32>,
-    epoch: u32,
+    visited: Vec<u64>,
+    /// Indexes of the words that went 0 -> nonzero since `begin()`.
+    touched: Vec<u32>,
+    /// The journal filled, so the next `begin()` must clear the whole bitmap instead.
+    touched_overflow: bool,
     neighbors: Vec<u32>,
     candidates: BinaryHeap<Candidate>,
     results: BinaryHeap<Result_>,
@@ -71,7 +91,8 @@ impl SearchScratch {
     pub fn new() -> Self {
         SearchScratch {
             visited: Vec::new(),
-            epoch: 0,
+            touched: Vec::new(),
+            touched_overflow: false,
             neighbors: Vec::new(),
             candidates: BinaryHeap::new(),
             results: BinaryHeap::new(),
@@ -91,34 +112,58 @@ impl SearchScratch {
     }
 
     fn begin(&mut self, capacity: u64) {
-        if self.visited.len() < capacity as usize {
-            self.visited.resize(capacity as usize, 0);
-        }
         self.capacity = capacity;
         self.window_tick = 0;
         self.window_len = 0;
         self.willneed_hold = 0;
-        self.epoch = self.epoch.wrapping_add(1);
-        if self.epoch == 0 {
+        if self.touched_overflow {
             self.visited.fill(0);
-            self.epoch = 1;
+            self.touched_overflow = false;
+        } else {
+            for &w in &self.touched {
+                self.visited[w as usize] = 0;
+            }
+        }
+        self.touched.clear();
+        let words = (capacity as usize).div_ceil(64);
+        if self.visited.len() < words {
+            self.grow(words);
+        }
+    }
+
+    /// Exact reservations, so the bytes a scratch holds are the formula above and not an
+    /// amortized-doubling multiple of it.
+    fn grow(&mut self, words: usize) {
+        self.visited.reserve_exact(words - self.visited.len());
+        self.visited.resize(words, 0);
+        let journal = words.min(TOUCHED_CAP);
+        if self.touched.capacity() < journal {
+            self.touched.reserve_exact(journal - self.touched.len());
         }
     }
 
     #[inline]
     fn visit(&mut self, id: u32) -> bool {
+        let w = (id >> 6) as usize;
         // ids minted by concurrent inserts after begin() can exceed the sizing snapshot;
         // growth is bounded by the id itself, which write paths bound by max_nodes
-        if id as usize >= self.visited.len() {
-            self.visited.resize(id as usize + 1024, 0);
+        if w >= self.visited.len() {
+            self.grow(w + GROW_SLACK_WORDS);
         }
-        let slot = &mut self.visited[id as usize];
-        if *slot == self.epoch {
-            false
-        } else {
-            *slot = self.epoch;
-            true
+        let mask = 1u64 << (id & 63);
+        let word = &mut self.visited[w];
+        if *word & mask != 0 {
+            return false;
         }
+        if *word == 0 {
+            if self.touched.len() < TOUCHED_CAP {
+                self.touched.push(w as u32);
+            } else {
+                self.touched_overflow = true;
+            }
+        }
+        *word |= mask;
+        true
     }
 }
 
@@ -322,9 +367,10 @@ pub const DESCENT_EF: usize = 16;
 
 /// Beam descent through upper layers from `from_level` down to `to_level` (exclusive), each level
 /// a width-`ef` beam seeded by the level above's best. Returns the entry for the caller's
-/// layer-`to_level` search, which the caller must `begin()` a fresh epoch for.
+/// layer-`to_level` search, which the caller must `begin()` a fresh visited set for.
 ///
-/// A node reachable at several levels must be expandable at each, so the epoch rolls per level.
+/// A node reachable at several levels must be expandable at each, so the visited set is
+/// cleared per level.
 pub fn beam_descend(
     graph: &Graph,
     query: &Query,
@@ -674,6 +720,109 @@ pub fn search_predicated(
     scratch.results = results;
     scratch.batch_keys = batch_keys;
     (PredicatedHits { hits: out, keys, key_ends }, stats)
+}
+
+#[cfg(test)]
+mod visited_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    /// The bound the module documents, on allocated capacity rather than length: `Vec` growth by
+    /// amortized doubling would leave a scratch holding up to twice the formula.
+    #[test]
+    fn a_scratch_holds_one_bit_per_node_plus_a_bounded_journal() {
+        let mut scratch = SearchScratch::new();
+        let nodes = 10_000_000u64;
+        scratch.begin(nodes);
+        let words = (nodes as usize).div_ceil(64);
+        assert_eq!(scratch.visited.capacity(), words, "bitmap capacity is not exactly ceil(nodes / 64) words");
+        assert_eq!(scratch.visited.capacity() * 8, 1_250_000);
+        assert_eq!(scratch.touched.capacity(), words.min(TOUCHED_CAP));
+        assert!(scratch.touched.capacity() * 4 <= 4 * TOUCHED_CAP);
+
+        // a smaller sweep neither shrinks nor grows either buffer
+        scratch.begin(1_000);
+        assert_eq!(scratch.visited.capacity(), words);
+        assert_eq!(scratch.touched.capacity(), words.min(TOUCHED_CAP));
+    }
+
+    /// The set must agree with a `HashSet` across sweeps of varied capacity — duplicates,
+    /// ids sharing a word, ids past the sizing snapshot, and a shrinking snapshot — because a
+    /// stale bit surviving a `begin()` reads as "already visited" and silently drops a neighbor,
+    /// on the write path as much as the read path.
+    #[test]
+    fn visit_matches_a_hash_set_across_sweeps() {
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let mut scratch = SearchScratch::new();
+        let mut expected: HashSet<u32> = HashSet::new();
+        let mut capacity = 0u64;
+        for step in 0..200_000u32 {
+            if step % 500 == 0 {
+                capacity = rng.next() % 300_000;
+                scratch.begin(capacity);
+                expected.clear();
+            }
+            let r = rng.next();
+            let id = match r % 8 {
+                // clustered within one word: adjacent ids share a bitmap word
+                0..=3 => ((r >> 8) % capacity.max(1)) as u32,
+                4..=5 => (((r >> 8) % capacity.max(1)) as u32 & !63) | ((r >> 40) as u32 & 63),
+                // past the sizing snapshot, as ids minted by a concurrent insert are
+                6 => (capacity + (r >> 8) % 5_000) as u32,
+                _ => (r >> 8) as u32 % 64,
+            };
+            assert_eq!(scratch.visit(id), expected.insert(id), "id {id} at step {step} (capacity {capacity})");
+        }
+    }
+
+    /// `visit()` must not allocate: every buffer it writes was reserved by `begin()`.
+    #[test]
+    fn visits_within_the_snapshot_never_allocate() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut scratch = SearchScratch::new();
+        let capacity = 500_000u64;
+        // the first sweep sizes the buffers; a second, cleared sweep is the steady state
+        for _ in 0..2 {
+            scratch.begin(capacity);
+            let (bits, journal) = (scratch.visited.capacity(), scratch.touched.capacity());
+            for _ in 0..50_000 {
+                scratch.visit((rng.next() % capacity) as u32);
+            }
+            assert_eq!(scratch.visited.capacity(), bits);
+            assert_eq!(scratch.touched.capacity(), journal);
+        }
+    }
+
+    /// A sweep that sets more distinct words than the journal holds must still leave the next
+    /// sweep clean: the fallback is a whole-bitmap clear, not a partial one.
+    #[test]
+    fn a_journal_overflow_clears_the_whole_bitmap_on_the_next_sweep() {
+        let mut scratch = SearchScratch::new();
+        let words = TOUCHED_CAP + 100;
+        scratch.begin(words as u64 * 64);
+        for w in 0..words as u32 {
+            assert!(scratch.visit(w * 64 + 5));
+        }
+        assert!(scratch.touched_overflow, "precondition: {words} distinct words must overflow the journal");
+        assert_eq!(scratch.touched.len(), TOUCHED_CAP);
+
+        scratch.begin(words as u64 * 64);
+        assert!(scratch.visited.iter().all(|&w| w == 0), "a set bit survived the overflow clear");
+        assert!(!scratch.touched_overflow);
+        for w in 0..words as u32 {
+            assert!(scratch.visit(w * 64 + 5), "word {w} still reads visited after begin()");
+        }
+    }
 }
 
 #[cfg(test)]

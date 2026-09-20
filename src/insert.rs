@@ -571,7 +571,7 @@ pub fn insert_batch(
 
 #[inline]
 fn scratch_begin(graph: &Graph, scratch: &mut SearchScratch) {
-    // search_layer assumes a fresh epoch per sweep; SearchScratch::begin is crate-private
+    // search_layer assumes a fresh visited set per sweep; SearchScratch::begin is crate-private
     // via this helper to keep the public surface small.
     scratch.begin_public(graph.file.id_high_water());
 }
