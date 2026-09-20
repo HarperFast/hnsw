@@ -20,7 +20,7 @@ built around a different contract:
 - **Index build scales with cores.** `insertBatch` takes a whole chunk across one N-API
   crossing and fans the inserts out over worker threads inside the native module, off the
   event loop — the per-slot seqlocks are what make concurrent inserts safe. Scaling curve in
-  [DESIGN.md §11](DESIGN.md#11-prototype-measurements).
+  [DESIGN.md §11](DESIGN.md#parallel-batch-build-hnsw6).
 - **Incremental by design.** Insert, update in place, delete with neighbor repair; deleted
   ids are reused via the freelist, so churn never inflates the graph. Reverse-edge overflow
   uses coverage-aware pruning (a bounded RobustPrune) — measured recall\@10 of 0.999 at 1M
