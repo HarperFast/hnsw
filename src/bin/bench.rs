@@ -326,7 +326,8 @@ fn run(
         qs.iter().map(|_| Vec::new()).collect()
     } else {
         // brute-force truth is O(n x queries); spread it over the machine so an 8M plane does not
-        // spend longer on truth than on the build it measures
+        // spend longer on truth than on the build it measures. Bounded top-10 running insert per
+        // query (not collect-all-then-sort), so no query keeps an n-entry buffer resident.
         let truth_threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1).min(queries.max(1));
         std::thread::scope(|s| {
             let chunk = qs.len().div_ceil(truth_threads).max(1);
