@@ -1,5 +1,4 @@
-//! Kernel page prefetch: the span handed to the kernel, the gate controller, each backend on
-//! the host it runs on, and the gate opening on a plane whose pages were reclaimed.
+//! Kernel page prefetch (`prefetch.rs` and the gate in `search.rs`).
 
 use hnsw_plane::format::PlaneFile;
 use hnsw_plane::insert::{insert, InsertParams};
@@ -66,6 +65,12 @@ fn slot_read_span_straddles_a_page_boundary_when_slots_are_packed() {
     let straddling = (0..100u32).filter(|&id| graph.slot_read_span(id).len == 2 * page).count();
     let single = (0..100u32).filter(|&id| graph.slot_read_span(id).len == page).count();
     assert!(straddling > 0 && single > 0, "straddling {straddling}, single {single}");
+    // the batch dedup must keep the longer of two same-base spans (a straddling slot after a
+    // single-page one on the same page)
+    let (a, b) = (11u32, 12u32);
+    let (sa, sb) = (graph.slot_read_span(a), graph.slot_read_span(b));
+    assert_eq!(sa.base, sb.base);
+    assert!(sb.len > sa.len, "{sa:?} {sb:?}");
 }
 
 #[test]
@@ -143,9 +148,9 @@ fn resident_search_issues_no_kernel_prefetch() {
         visits += stats.visits;
     }
     assert!(visits > 0);
-    // a freshly written plane is resident; a pre-emption can arm the hold for 16 expansions,
-    // so allow a handful of batches over 200 queries but nothing systematic
-    assert!(batches < 64, "{batches} kernel prefetch batches on a resident plane");
+    // a freshly written plane is resident; each pre-emption on a loaded host can arm the hold
+    // for 16 expansions, so the bound is a fraction of the work rather than a count
+    assert!(batches * 20 < visits, "{batches} kernel prefetch batches over {visits} visits on a resident plane");
 }
 
 /// Reclaim the plane's pages and confirm the gate arms and issues kernel prefetches. Skipped

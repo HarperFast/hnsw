@@ -41,6 +41,54 @@ fn page_size() -> usize {
     })
 }
 
+/// The gate's clock: a raw cycle counter, because one `clock_gettime` (32 ns measured on a
+/// loaded Alder Lake host) per expansion was 3–5 % of an in-cache query at ef 512, where an
+/// expansion scores only a handful of unvisited slots.
+pub mod clock {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    pub fn ticks() -> u64 {
+        unsafe { core::arch::x86_64::_rdtsc() }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    pub fn ticks() -> u64 {
+        let v: u64;
+        unsafe { std::arch::asm!("mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack, preserves_flags)) };
+        v
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[inline(always)]
+    pub fn ticks() -> u64 {
+        static EPOCH: OnceLock<Instant> = OnceLock::new();
+        EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64
+    }
+
+    /// Nanoseconds in `elapsed` ticks, from a one-time 200 µs calibration against `Instant`.
+    #[inline]
+    pub fn ns(elapsed: u64) -> u64 {
+        static NS_PER_TICK_Q32: OnceLock<u64> = OnceLock::new();
+        let q = *NS_PER_TICK_Q32.get_or_init(|| {
+            if cfg!(not(any(target_arch = "x86_64", target_arch = "aarch64"))) {
+                return 1 << 32;
+            }
+            let (t0, i0) = (ticks(), Instant::now());
+            while i0.elapsed().as_micros() < 200 {
+                std::hint::spin_loop();
+            }
+            let (t1, i1) = (ticks(), Instant::now());
+            let elapsed = i1.duration_since(i0).as_nanos() as u64;
+            ((elapsed << 32) / t1.wrapping_sub(t0).max(1)).max(1)
+        });
+        ((elapsed as u128 * q as u128) >> 32) as u64
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Mode {
@@ -116,10 +164,10 @@ pub fn willneed_in(mode: Mode, ranges: &[PageRange]) -> Outcome {
 #[cfg(target_os = "linux")]
 mod sys {
     use super::{Mode, Outcome, PageRange};
-    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    static PIDFD: AtomicI32 = AtomicI32::new(-1);
-    static PIDFD_PID: AtomicI32 = AtomicI32::new(0);
+    /// `pid << 32 | fd`, one word so a reader never pairs a new fd with a stale pid.
+    static PIDFD: AtomicU64 = AtomicU64::new(0);
 
     pub fn initial_mode() -> Mode {
         Mode::Vectored
@@ -129,24 +177,21 @@ mod sys {
     /// parent's address space (the inherited descriptor is left open: another thread may be
     /// mid-call on it, and it is close-on-exec).
     fn pidfd() -> Option<i32> {
-        let pid = unsafe { libc::getpid() };
-        let fd = PIDFD.load(Ordering::Acquire);
-        if fd >= 0 && PIDFD_PID.load(Ordering::Acquire) == pid {
-            return Some(fd);
+        let pid = unsafe { libc::getpid() } as u32;
+        let seen = PIDFD.load(Ordering::Acquire);
+        if seen != 0 && (seen >> 32) as u32 == pid {
+            return Some(seen as i32);
         }
-        let opened = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
+        let opened = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::c_long, 0 as libc::c_long) };
         if opened < 0 {
             return None;
         }
-        let opened = opened as i32;
-        match PIDFD.compare_exchange(fd, opened, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => {
-                PIDFD_PID.store(pid, Ordering::Release);
-                Some(opened)
-            }
+        let word = (pid as u64) << 32 | opened as u32 as u64;
+        match PIDFD.compare_exchange(seen, word, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => Some(opened as i32),
             Err(current) => {
-                unsafe { libc::close(opened) };
-                Some(current)
+                unsafe { libc::close(opened as i32) };
+                Some(current as i32)
             }
         }
     }
@@ -172,7 +217,7 @@ mod sys {
         for chunk in ranges.chunks(libc::UIO_MAXIOV as usize) {
             let mut r = process_madvise(fd, chunk);
             if r < 0 && matches!(errno(), libc::EBADF | libc::ESRCH) {
-                PIDFD_PID.store(0, Ordering::Release);
+                PIDFD.store(0, Ordering::Release);
                 let Some(again) = pidfd() else { return Outcome::Unusable };
                 fd = again;
                 r = process_madvise(fd, chunk);
@@ -184,8 +229,6 @@ mod sys {
                     _ => Outcome::Issued,
                 };
             }
-            // a short byte count stopped at a range the kernel would not advise; the rest of
-            // the chunk faults as before
         }
         Outcome::Issued
     }
@@ -233,13 +276,19 @@ mod sys {
     }
 }
 
-/// `Unusable` only when every range is refused, so a sandbox that filters `madvise` latches
-/// off instead of paying `k` failing syscalls per armed expansion.
+/// `Unusable` only when every range is refused with a permanent errno, so a sandbox that
+/// filters `madvise` latches off instead of paying `k` failing syscalls per armed expansion,
+/// while a transient `ENOMEM` on a one-range batch does not.
 #[cfg(unix)]
 fn unix_per_range(ranges: &[PageRange]) -> Outcome {
     let mut refused = 0;
     for r in ranges {
-        if unsafe { libc::madvise(r.base as *mut libc::c_void, r.len, libc::MADV_WILLNEED) } != 0 {
+        if unsafe { libc::madvise(r.base as *mut libc::c_void, r.len, libc::MADV_WILLNEED) } != 0
+            && matches!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ENOSYS) | Some(libc::EPERM) | Some(libc::EINVAL)
+            )
+        {
             refused += 1;
         }
     }

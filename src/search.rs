@@ -5,10 +5,9 @@
 use crate::distance::Query;
 use crate::format::{MAX_UPPER_LEVELS, NO_ID};
 use crate::graph::Graph;
-use crate::prefetch::{self, PageRange};
+use crate::prefetch::{self, clock, PageRange};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::BinaryHeap;
-use std::time::Instant;
 
 #[derive(PartialEq)]
 struct Candidate {
@@ -61,9 +60,11 @@ pub struct SearchScratch {
     /// Expansions left in the kernel-prefetch hold; per layer sweep, so one cold query never
     /// arms the next query that draws this scratch from the pool.
     willneed_hold: u8,
-    /// When the previous expansion's distance loop began, and how many slots it scored.
-    batch_clock: Option<Instant>,
-    batch_kept: u32,
+    /// Tick at which the current gate window opened (0 = none), how many slots it has scored,
+    /// and the expansion count within it.
+    window_tick: u64,
+    window_kept: u32,
+    window_len: u8,
     ranges: Vec<PageRange>,
 }
 
@@ -79,8 +80,9 @@ impl SearchScratch {
             batch_keys: BatchKeys::default(),
             capacity: 0,
             willneed_hold: 0,
-            batch_clock: None,
-            batch_kept: 0,
+            window_tick: 0,
+            window_kept: 0,
+            window_len: 0,
             ranges: Vec::new(),
         }
     }
@@ -94,7 +96,8 @@ impl SearchScratch {
             self.visited.resize(capacity as usize, 0);
         }
         self.capacity = capacity;
-        self.batch_clock = None;
+        self.window_tick = 0;
+        self.window_len = 0;
         self.willneed_hold = 0;
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 {
@@ -150,10 +153,15 @@ fn bit_allowed(filter: Option<&[u8]>, id: u32) -> bool {
 /// undetected expansion of a cold region.
 const WILLNEED_HOLD: u8 = 16;
 
-/// The hold after an expansion that scored `kept` slots in `elapsed_ns`. The allowance is
-/// ~8–10× a resident visit at every supported width plus a term below one NVMe fault, so one
-/// fault trips it while a resident batch of wide vectors does not; a prefetch-assisted
-/// expansion under pressure still waits one device round trip, so the hold does not oscillate.
+/// Unarmed, the gate samples the clock once per this many expansions (~14 ns of `rdtsc`
+/// amortised to ~3.5 ns per expansion); armed, every expansion, so the hold decays per
+/// expansion while the syscall it gates dwarfs the read.
+const GATE_WINDOW: u8 = 4;
+
+/// The hold after a window that scored `kept` slots in `elapsed_ns`. The allowance is ~8–10×
+/// a resident visit at every supported width plus a term below one NVMe fault, so one fault
+/// trips it while a resident window of wide vectors does not; a prefetch-assisted expansion
+/// under pressure still waits one device round trip, so the hold does not oscillate.
 /// Thresholds and their measurements: DESIGN.md §7, "Prefetch has two tiers".
 #[inline]
 pub fn willneed_hold_after(hold: u8, elapsed_ns: u64, kept: u32, vector_bytes: usize) -> u8 {
@@ -169,21 +177,28 @@ pub fn willneed_hold_after(hold: u8, elapsed_ns: u64, kept: u32, vector_bytes: u
 /// slots, so the distance reads that follow find the lines in flight instead of missing one
 /// at a time. Returns the compacted length.
 ///
-/// The kernel page prefetch (`prefetch.rs`) is added while the hold is armed. Its gate reads
-/// the clock once per expansion on a resident plane: the interval since the previous call
-/// covers that expansion's distance loop, the pop and the parent's adjacency read. An armed
-/// expansion re-reads it after the advice call so the syscalls' own time never counts as
-/// fault latency (per-range advice would otherwise sustain its own arm).
+/// The kernel page prefetch (`prefetch.rs`) is added while the hold is armed, for batches of
+/// at least two pages (one page faults the same either way). The gate's window runs from the
+/// end of the previous armed call's advice, not its start, so the advice syscalls' own time
+/// never counts as fault latency (per-range advice would otherwise sustain its own arm).
 #[inline]
 fn unvisited_prefetched(graph: &Graph, scratch: &mut SearchScratch, stats: &mut SearchStats, nbuf: &mut [u32]) -> usize {
-    let now = Instant::now();
-    if let Some(prev) = scratch.batch_clock {
-        let elapsed = now.duration_since(prev).as_nanos() as u64;
-        scratch.willneed_hold = willneed_hold_after(scratch.willneed_hold, elapsed, scratch.batch_kept, graph.file.vector_bytes());
+    let armed = scratch.willneed_hold > 0;
+    scratch.window_len = if armed { 0 } else { (scratch.window_len + 1) % GATE_WINDOW };
+    if scratch.window_len == 0 {
+        let now = clock::ticks();
+        if scratch.window_tick != 0 {
+            let elapsed = clock::ns(now.wrapping_sub(scratch.window_tick));
+            scratch.willneed_hold =
+                willneed_hold_after(scratch.willneed_hold, elapsed, scratch.window_kept, graph.file.vector_bytes());
+        }
+        scratch.window_tick = now;
+        scratch.window_kept = 0;
     }
-    scratch.batch_clock = Some(now);
     let kernel = scratch.willneed_hold > 0 && prefetch::mode() != prefetch::Mode::Off;
-    scratch.ranges.clear();
+    if kernel {
+        scratch.ranges.clear();
+    }
     let mut kept = 0;
     for i in 0..nbuf.len() {
         let nid = nbuf[i];
@@ -195,8 +210,9 @@ fn unvisited_prefetched(graph: &Graph, scratch: &mut SearchScratch, stats: &mut 
         }
         if kernel && (nid as u64) < scratch.capacity {
             let span = graph.slot_read_span(nid);
-            if scratch.ranges.last().map_or(true, |last| last.base != span.base) {
-                scratch.ranges.push(span);
+            match scratch.ranges.last_mut() {
+                Some(last) if last.base == span.base => last.len = last.len.max(span.len),
+                _ => scratch.ranges.push(span),
             }
         }
         graph.prefetch_slot(nid);
@@ -204,12 +220,12 @@ fn unvisited_prefetched(graph: &Graph, scratch: &mut SearchScratch, stats: &mut 
         kept += 1;
     }
     if kernel {
-        if prefetch::willneed(&scratch.ranges) {
+        if scratch.ranges.len() >= 2 && prefetch::willneed(&scratch.ranges) {
             stats.willneed_batches += 1;
         }
-        scratch.batch_clock = Some(Instant::now());
+        scratch.window_tick = clock::ticks();
     }
-    scratch.batch_kept = kept as u32;
+    scratch.window_kept += kept as u32;
     kept
 }
 
