@@ -58,17 +58,15 @@ const GROW_SLACK_WORDS: usize = 1024;
 /// Reusable per-thread search scratch.
 ///
 /// The visited set is one bit per node id plus a journal of the bitmap words a sweep set, so
-/// `begin()` clears only what the last sweep touched. Per scratch: `8 * ceil(ids / 64)` bytes
-/// of bitmap (ids = the largest high-water mark it was begun at, plus at most
-/// `GROW_SLACK_WORDS` words) and at most `4 * TOUCHED_CAP` bytes of journal — 200M nodes is
-/// 25 MB + 256 KB. `begin()` sizes both buffers; `visit()` allocates only for an id minted by
-/// a concurrent insert after the sizing snapshot, at most once per `GROW_SLACK_WORDS` words
-/// of growth and never past `max_nodes / 64` words.
+/// `begin()` clears only what the last sweep touched. Per scratch: at most
+/// `9/8 * 8 * ceil(ids / 64)` bytes of bitmap (ids = the largest high-water mark it was begun
+/// at, plus at most `GROW_SLACK_WORDS` words; the 1/8 is growth headroom) and at most
+/// `4 * TOUCHED_CAP` bytes of journal — 200M nodes is under 29 MB. `begin()` sizes both
+/// buffers; `visit()` reallocates only for an id minted by a concurrent insert past both the
+/// sizing snapshot and the headroom, never past `max_nodes / 64` words.
 pub struct SearchScratch {
     visited: Vec<u64>,
-    /// Words that went 0 -> nonzero since `begin()`.
     touched: Vec<u32>,
-    /// The journal filled, so the next `begin()` clears the whole bitmap instead.
     touched_overflow: bool,
     neighbors: Vec<u32>,
     candidates: BinaryHeap<Candidate>,
@@ -124,9 +122,8 @@ impl SearchScratch {
         }
     }
 
-    /// Clear the visited set. `begin()` does this itself; a pool calls it before handing the
-    /// scratch on so the clear — a whole-bitmap fill after a journal overflow — is paid by the
-    /// query that touched the words, not by whichever query takes the scratch next.
+    /// Clear the visited set now, so a pool hands on a scratch whose clear — a whole-bitmap fill
+    /// after a journal overflow — was paid by the query that caused it. `begin()` also clears.
     pub fn finish(&mut self) {
         if self.touched_overflow {
             self.visited.fill(0);
@@ -139,11 +136,17 @@ impl SearchScratch {
         self.touched.clear();
     }
 
-    /// Exact, so a scratch holds the documented bytes and not an amortized-doubling multiple.
+    /// 1/8 headroom rather than `Vec`'s doubling: a writer raising the high-water mark by one
+    /// word per 64 inserts must not reallocate every scratch that often, and the documented
+    /// bound must stay tight.
     fn grow(&mut self, words: usize) {
-        self.visited.reserve_exact(words - self.visited.len());
+        let len = self.visited.len();
+        let target = words.max(len + len / 8);
+        if self.visited.capacity() < words {
+            self.visited.reserve_exact(target - len);
+        }
         self.visited.resize(words, 0);
-        let journal = words.min(TOUCHED_CAP);
+        let journal = target.min(TOUCHED_CAP);
         if self.touched.capacity() < journal {
             self.touched.reserve_exact(journal - self.touched.len());
         }
@@ -744,9 +747,8 @@ mod visited_tests {
         }
     }
 
-    /// On capacity rather than length: amortized-doubling growth would leave a scratch holding up
-    /// to twice the documented bytes. `reserve_exact` may be rounded up by the allocator, hence
-    /// the page of slack.
+    /// Capacity, not length, is what the process pays for; the allocator may round
+    /// `reserve_exact` up by a page.
     #[test]
     fn a_scratch_holds_one_bit_per_node_plus_a_bounded_journal() {
         let page_words = 4096 / 8;
@@ -762,6 +764,15 @@ mod visited_tests {
         // a smaller sweep neither shrinks nor grows either buffer
         scratch.begin(1_000);
         assert_eq!(scratch.visited.capacity(), bitmap);
+
+        // a high-water mark creeping up under a writer grows within the 1/8 headroom, not per word
+        scratch.begin(nodes + 64);
+        let grown = scratch.visited.capacity();
+        assert!(grown <= words + words / 8 + page_words, "growth by one word reserved {grown} words for {words}");
+        for step in 2..=64u64 {
+            scratch.begin(nodes + 64 * step);
+        }
+        assert_eq!(scratch.visited.capacity(), grown, "64 one-word growths reallocated instead of using the headroom");
         assert_eq!(scratch.touched.capacity(), journal);
     }
 

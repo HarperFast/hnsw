@@ -253,9 +253,10 @@ search(sliceHandles, queryVector: Float32Array, k, ef, filter?): Promise<{ids, d
   x86, NEON on ARM; `std::arch` intrinsics with a scalar fallback).
 - Visited set: one bit per node id plus a journal of the words a sweep set, cleared per sweep
   by walking the journal (one per pool thread, reused across queries — no allocation per
-  query). Per scratch: `8 × ceil(nodes / 64)` bytes of bitmap plus at most 256 KB of journal,
-  so 200M nodes is ~25 MB; worst case per process is `(in-flight searches + 1 insert scratch)
-  × that`, and the pool retains at most 64 idle scratches. The u32 epoch stamp it replaced was
+  query). Per scratch: `8 × ceil(nodes / 64)` bytes of bitmap, up to 9/8 of that after growth
+  under a concurrent writer, plus at most 256 KB of journal — so 200M nodes is 25–29 MB; worst
+  case per process is `(in-flight searches + 1 insert scratch) × that`, and the pool retains at
+  most 64 idle scratches. The u32 epoch stamp it replaced was
   4 B/node materialized per scratch — 800 MB at 200M, 205 GB across a 256-thread libuv pool
   (issue #8). A sweep that sets more than 65 536 distinct words overflows the journal and the
   next clear walks the whole bitmap, amortized against the ≥ 65 536 visits that caused it. Candidate heap: fixed-capacity binary heap of (dist, id) pairs.
