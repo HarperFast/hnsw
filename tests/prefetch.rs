@@ -64,11 +64,11 @@ fn slot_read_span_straddles_a_page_boundary_when_slots_are_packed() {
     let straddling = (0..100u32).filter(|&id| graph.slot_read_span(id).len == 2 * page).count();
     let single = (0..100u32).filter(|&id| graph.slot_read_span(id).len == page).count();
     assert!(straddling > 0 && single > 0, "straddling {straddling}, single {single}");
-    // the batch dedup must keep the longer of two same-base spans (a straddling slot after a
-    // single-page one on the same page)
-    let (a, b) = (11u32, 12u32);
-    let (sa, sb) = (graph.slot_read_span(a), graph.slot_read_span(b));
-    assert_eq!(sa.base, sb.base);
+    // the batch dedup must keep the longer of two same-base spans: the first straddling slot
+    // shares its base page with the single-page slot before it (id 12 at 4 KiB pages, 51 at 16)
+    let straddler = (1..200u32).find(|&id| graph.slot_read_span(id).len == 2 * page).expect("a straddling slot");
+    let (sa, sb) = (graph.slot_read_span(straddler - 1), graph.slot_read_span(straddler));
+    assert_eq!(sa.base, sb.base, "{sa:?} {sb:?}");
     assert!(sb.len > sa.len, "{sa:?} {sb:?}");
 }
 
