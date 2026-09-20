@@ -94,16 +94,15 @@ native.Plane.prototype.searchWithPredicate = function (vector, k, ef, predicate,
 // The native side reports a plane fault as `failure` on a resolved result so the ids of the
 // records that landed survive the crossing; the JS contract is a rejection that still carries them.
 const nativeInsertBatch = native.Plane.prototype.insertBatch;
-native.Plane.prototype.insertBatch = function (...args) {
-	return nativeInsertBatch.apply(this, args).then(({ ids, rejected, failure }) => {
-		if (failure === undefined || failure === null) return { ids, rejected };
-		const error = new Error(`${failure.reason} (batch record ${failure.index}; see error.ids for the records that landed)`);
-		error.code = failure.code;
-		error.index = failure.index;
-		error.ids = ids;
-		error.rejected = rejected;
-		throw error;
-	});
+native.Plane.prototype.insertBatch = async function (...args) {
+	const { ids, rejected, failure } = await nativeInsertBatch.apply(this, args);
+	if (failure === undefined || failure === null) return { ids, rejected };
+	const error = new Error(`${failure.reason} (batch record ${failure.index}; see error.ids for the records that landed)`);
+	error.code = failure.code;
+	error.index = failure.index;
+	error.ids = ids;
+	error.rejected = rejected;
+	throw error;
 };
 
 module.exports = native;

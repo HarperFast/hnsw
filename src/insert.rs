@@ -5,7 +5,7 @@
 //! format, so neighbor↔neighbor distances are recomputed (int8×int8) on id-match hits only.
 
 use crate::distance::{quantize, Query};
-use crate::format::{NO_ID, NO_UPPER};
+use crate::format::{key_class, NO_ID, NO_UPPER};
 use crate::graph::{Graph, KeyError, WriteError};
 use crate::search::{beam_descend, search_layer, SearchScratch, SearchStats, DESCENT_EF};
 use std::sync::atomic::{AtomicU32, AtomicU8, AtomicUsize, Ordering};
@@ -246,18 +246,27 @@ pub fn insert_with_key(
     graph.check_key(key).map_err(|e| match e {
         KeyError::NoKeys | KeyError::TooLong => InsertError::KeyUnstorable,
     })?;
-    // best-effort: an arena that cannot hold the key is refused before any neighbor edge is
-    // touched, since an abandoned insert cannot restore the edges its selection removed
-    if key.len() > graph.file.key_cap && !graph.file.key_arena_has_room(key.len()) {
-        return Err(InsertError::KeyArenaFull);
-    }
-    if vector.iter().any(|v| !v.is_finite()) {
+    let stored = quantize(vector, graph.file.quant());
+    if !stored.finite {
         return Err(InsertError::NotFinite);
     }
-    let stored = quantize(vector, graph.file.quant());
     let (bytes, scale, inv_mag) = (&stored.bytes, stored.scale, stored.inv_mag);
+    // An overflow key's arena range is reserved before anything else: selection removes edges
+    // between existing nodes, and an insert abandoned after that cannot put them back, so the
+    // one resource the final write could still run out of is taken first.
+    let key_range = if key.len() > graph.file.key_cap {
+        Some(graph.file.allocate_key_bytes(key_class(key.len())).ok_or(InsertError::KeyArenaFull)?)
+    } else {
+        None
+    };
+    let release_key_range = || {
+        if let Some(offset) = key_range {
+            graph.file.release_key_bytes(offset, key_class(key.len()));
+        }
+    };
     let id = graph.file.allocate_id();
     if id == NO_ID {
+        release_key_range();
         return Err(InsertError::Full);
     }
     // `slot_upper` is the entry the published slot names (freed with it); a fresh one is freed here
@@ -270,6 +279,7 @@ pub fn insert_with_key(
         } else {
             graph.file.free_upper(upper);
             graph.file.free_id(id);
+            release_key_range();
         }
     };
     let level = level_for(id, params.ml);
@@ -290,7 +300,9 @@ pub fn insert_with_key(
         }
         *published_upper =
             if level > 0 { graph.write_upper(&vec![Vec::new(); level as usize]).unwrap_or(NO_UPPER) } else { NO_UPPER };
-        if let Err(error) = graph.write_node(id, level, bytes, scale, inv_mag, &[], *published_upper, Some(key)) {
+        if let Err(error) =
+            graph.write_node_with_key_range(id, level, bytes, scale, inv_mag, &[], *published_upper, Some(key), key_range)
+        {
             abandon(false, *published_upper, NO_UPPER);
             return Err(write_error(error));
         }
@@ -434,7 +446,7 @@ pub fn insert_with_key(
     };
     let mut l0: Vec<u32> = connections[0].iter().map(|&(nid, _)| nid).collect();
     l0.truncate(layer0_cap);
-    if let Err(error) = graph.write_node(id, level, bytes, scale, inv_mag, &l0, upper_idx, Some(key)) {
+    if let Err(error) = graph.write_node_with_key_range(id, level, bytes, scale, inv_mag, &l0, upper_idx, Some(key), key_range) {
         abandon(published, upper_idx, published_upper);
         return Err(write_error(error));
     }

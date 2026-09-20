@@ -80,12 +80,14 @@ export declare class Plane {
 	 * boundary, because threads claim records out of order. Malformed arguments reject too;
 	 * nothing throws synchronously.
 	 *
-	 * Batches on one plane run in order on one worker thread; a second call queues behind the
-	 * first, holding its copied inputs until it runs, so `await` each chunk rather than fanning
-	 * out an unbounded `Promise.all`. Other mutations (`insert`, `remove`, `writeNodeRaw`) may
-	 * run while a batch is in flight under the plane's per-slot rules. Records land in whatever
-	 * order the threads reach them, so two builds of the same input produce different, equally
-	 * valid graphs.
+	 * Batches on one plane run in order on one worker thread (started on demand, retired when
+	 * idle, joined at process teardown); a second call queues behind the first, holding its
+	 * copied inputs until it runs, so `await` each chunk rather than fanning out an unbounded
+	 * `Promise.all`. Standalone-allocation mode only, like `insert`: ids come from the plane's
+	 * allocator, so never mix it with `writeNodeRaw`/`clearNode`, whose host-allocated ids
+	 * would overwrite batch nodes in place. `insert` and `remove` may run while a batch is in
+	 * flight under the plane's per-slot rules. Records land in whatever order the threads reach
+	 * them, so two builds of the same input produce different, equally valid graphs.
 	 *
 	 * Working memory: each thread's visited set is 4 bytes per allocated id, so a batch on an
 	 * 8M-node plane with 16 threads holds ~512 MB of scratch, retained in the plane's scratch

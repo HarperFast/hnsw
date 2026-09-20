@@ -391,8 +391,6 @@ fn batch_records(indices: &[u32], dims: usize) -> (Vec<Vec<f32>>, Vec<[u8; 4]>) 
     (vectors, keys)
 }
 
-/// A batch build over the clustered corpus, 8 threads per batch: every returned id is in input
-/// order, findable by a self-query at generous ef, and carries its record's key.
 #[test]
 fn batch_insert_returns_ids_in_input_order_and_every_node_stays_reachable() {
     let dims = 64;
@@ -441,8 +439,6 @@ fn batch_insert_returns_ids_in_input_order_and_every_node_stays_reachable() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// Record-level faults — a non-finite component, a key the plane cannot store — reject exactly
-/// that record (NO_ID in its slot, an entry in `rejected`) and the rest of the batch lands.
 #[test]
 fn batch_insert_reports_record_faults_by_index_and_inserts_the_rest() {
     let dims = 16;
@@ -533,14 +529,17 @@ fn batch_insert_rejects_overflow_keys_past_the_arena_and_lands_inline_ones() {
     let dims = 16;
     let path = std::env::temp_dir().join(format!("hnsw-batch-arena-{}.hnsw", std::process::id()));
     let _ = std::fs::remove_file(&path);
-    // 64 nodes x 64 B = 4096 B of arena; a 500-byte key reserves a 512-byte class, so 8 fit
-    let graph = Graph::new(PlaneFile::create_with_key_arena(&path, dims, 16, 64, 8, 64).expect("create"));
+    // 256 nodes x 64 B = 16 KB of arena; a 500-byte key reserves a 512-byte class, so 32 fit.
+    // 8 workers over 200 records keep the arena contended through its tail: a record refused
+    // there must be refused before it took an id or touched an edge, which id_high_water
+    // (never lowered by free_id) detects.
+    let graph = Graph::new(PlaneFile::create_with_key_arena(&path, dims, 16, 256, 8, 64).expect("create"));
     let params = InsertParams::default();
-    let mut scratches: Vec<SearchScratch> = (0..3).map(|_| SearchScratch::new()).collect();
+    let mut scratches: Vec<SearchScratch> = (0..8).map(|_| SearchScratch::new()).collect();
 
-    let indices: Vec<u32> = (0..24).collect();
+    let indices: Vec<u32> = (0..200).collect();
     let (vectors, _) = batch_records(&indices, dims);
-    let long_keys: Vec<Vec<u8>> = (0..24u8).map(|i| vec![b'a' + i; 500]).collect();
+    let long_keys: Vec<Vec<u8>> = (0..200u32).map(|i| vec![(i % 251) as u8; 500]).collect();
     let records: Vec<(&[f32], &[u8])> = vectors
         .iter()
         .enumerate()
@@ -548,10 +547,16 @@ fn batch_insert_rejects_overflow_keys_past_the_arena_and_lands_inline_ones() {
         .collect();
     let outcome = insert_batch(&graph, &params, &records, &mut scratches).expect("arena exhaustion does not fail the batch");
     let rejected: Vec<(usize, InsertError)> = outcome.rejected.clone();
-    assert_eq!(rejected.len(), 4, "12 overflow keys into an arena that holds 8: {rejected:?}");
+    assert_eq!(rejected.len(), 68, "100 overflow keys into an arena that holds 32: {rejected:?}");
     assert!(rejected.iter().all(|&(i, e)| i % 2 == 0 && e == InsertError::KeyArenaFull), "{rejected:?}");
-    assert_eq!(outcome.ids.iter().filter(|&&id| id != NO_ID).count(), 20, "8 overflow + 12 inline keys land");
-    assert_eq!(graph.file.id_high_water(), 20, "rejected records hold no id");
+    let landed = outcome.ids.iter().filter(|&&id| id != NO_ID).count();
+    assert_eq!(landed, 132, "32 overflow + 100 inline keys land");
+    assert_eq!(graph.file.id_high_water(), landed as u64, "a refused record took no id");
+    let mut scratch = SearchScratch::new();
+    for (i, &id) in outcome.ids.iter().enumerate().filter(|(_, &id)| id != NO_ID) {
+        let (results, _) = search(&graph, &graph.query(vector_for(i as u32, dims)), 5, 64, &mut scratch);
+        assert!(results.iter().any(|&(rid, _)| rid == id), "record {i} (id {id}) unreachable after arena refusals");
+    }
     let _ = std::fs::remove_file(&path);
 }
 
@@ -627,4 +632,3 @@ fn batch_insert_beside_concurrent_deletes_keeps_survivors_reachable() {
     assert_eq!(misses, 0, "survivors unreachable after batch inserts beside deletes ({checked} checked)");
     let _ = std::fs::remove_file(&path);
 }
-

@@ -13,8 +13,10 @@ use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::{JsDeferred, JsFunction, JsObject, JsUnknown, NapiValue};
 use napi_derive::napi;
-use std::sync::mpsc::{channel, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Pooled per-query scratch (the visited array is O(nodes); never allocate per query).
 struct ScratchPool(Mutex<Vec<SearchScratch>>);
@@ -350,6 +352,50 @@ impl BatchJob {
     }
 }
 
+/// The plane's batch thread: it runs jobs in order, exits once the queue has been idle for a
+/// while (a plane that bulk-loaded once does not keep a thread for its lifetime), and is joined
+/// at env teardown so no batch is still writing, or settling a promise, into a torn-down env.
+struct BatchWorker {
+    sender: Sender<BatchJob>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+type BatchWorkerSlot = Arc<Mutex<Option<BatchWorker>>>;
+
+const BATCH_THREAD_IDLE: Duration = Duration::from_secs(5);
+
+fn batch_worker_loop(jobs: Receiver<BatchJob>, slot: BatchWorkerSlot) {
+    loop {
+        match jobs.recv_timeout(BATCH_THREAD_IDLE) {
+            Ok(job) => job.settle(),
+            Err(RecvTimeoutError::Disconnected) => return,
+            Err(RecvTimeoutError::Timeout) => {
+                // retire under the slot lock, where senders enqueue, so a job sent while the
+                // thread decides cannot land in a queue nobody reads
+                let mut worker = slot.lock().unwrap_or_else(|p| p.into_inner());
+                match jobs.try_recv() {
+                    Ok(job) => {
+                        drop(worker);
+                        job.settle();
+                    }
+                    Err(_) => {
+                        *worker = None;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn join_batch_worker(slot: BatchWorkerSlot) {
+    let worker = slot.lock().unwrap_or_else(|p| p.into_inner()).take();
+    if let Some(BatchWorker { sender, handle }) = worker {
+        drop(sender);
+        let _ = handle.join();
+    }
+}
+
 fn run_batch(
     graph: &Graph,
     pool: &Arc<ScratchPool>,
@@ -429,8 +475,8 @@ pub struct Plane {
     // Concurrent mutation is otherwise the crate's per-slot contract (DESIGN.md §5): a batch's
     // workers run alongside insert/remove/writeNodeRaw calls, as multi-worker hosts already do.
     insert_scratch: Mutex<SearchScratch>,
-    // one worker thread per plane, started on the first insertBatch, running batches in order
-    batch_queue: Mutex<Option<Sender<BatchJob>>>,
+    batch_worker: BatchWorkerSlot,
+    batch_cleanup_hooked: AtomicBool,
 }
 
 #[napi]
@@ -484,23 +530,39 @@ impl Plane {
             pool: Arc::new(ScratchPool(Mutex::new(Vec::new()))),
             params: InsertParams::default(),
             insert_scratch: Mutex::new(SearchScratch::new()),
-            batch_queue: Mutex::new(None),
+            batch_worker: Arc::new(Mutex::new(None)),
+            batch_cleanup_hooked: AtomicBool::new(false),
         }
     }
 
-    fn batch_sender(&self) -> std::io::Result<Sender<BatchJob>> {
-        let mut queue = self.batch_queue.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(sender) = queue.as_ref() {
-            return Ok(sender.clone());
-        }
-        let (sender, jobs) = channel::<BatchJob>();
-        std::thread::Builder::new().name("hnsw-insert-batch".into()).spawn(move || {
-            for job in jobs {
-                job.settle();
+    fn enqueue_batch(&self, env: &mut Env, job: BatchJob) -> std::result::Result<(), (BatchDeferred, Error)> {
+        if !self.batch_cleanup_hooked.swap(true, Ordering::AcqRel) {
+            let slot = self.batch_worker.clone();
+            if let Err(error) = env.add_env_cleanup_hook(slot, join_batch_worker) {
+                self.batch_cleanup_hooked.store(false, Ordering::Release);
+                return Err((job.deferred, error));
             }
-        })?;
-        *queue = Some(sender.clone());
-        Ok(sender)
+        }
+        let mut worker = self.batch_worker.lock().unwrap_or_else(|p| p.into_inner());
+        if worker.is_none() {
+            let (sender, jobs) = channel::<BatchJob>();
+            let slot = self.batch_worker.clone();
+            let spawned = std::thread::Builder::new()
+                .name("hnsw-insert-batch".into())
+                .spawn(move || batch_worker_loop(jobs, slot));
+            match spawned {
+                Ok(handle) => *worker = Some(BatchWorker { sender, handle }),
+                Err(error) => {
+                    return Err((job.deferred, Error::from_reason(format!("could not start the batch thread: {error}"))))
+                }
+            }
+        }
+        worker
+            .as_ref()
+            .expect("worker present")
+            .sender
+            .send(job)
+            .map_err(|failed| (failed.0.deferred, Error::from_reason("the batch thread is gone")))
     }
 
     /// Insert a vector; returns the allocated node id (freelist ids are reused). `key` is
@@ -531,9 +593,9 @@ impl Plane {
     /// `rejected` with 0xFFFFFFFF in its slot and the rest of the batch lands. A plane fault
     /// (full, wedged) stops the batch once in-flight inserts finish and sets `failure`, which
     /// index.js turns into a rejection still carrying `ids` and `rejected`. Batches on one
-    /// plane run in order on one worker thread; malformed inputs reject the promise. Working
-    /// memory is `threads x 4 B x idHighWater` of visited-set scratch, retained in the plane's
-    /// scratch pool afterwards.
+    /// plane run in order on one worker thread that retires when idle; malformed inputs reject
+    /// the promise. Working memory is `threads x 4 B x idHighWater` of visited-set scratch,
+    /// retained in the plane's scratch pool afterwards.
     #[napi(ts_return_type = "Promise<InsertBatchResult>")]
     pub fn insert_batch(
         &self,
@@ -543,8 +605,9 @@ impl Plane {
         key_ends: Option<Uint32Array>,
         threads: Option<u32>,
     ) -> Result<JsObject> {
+        let mut env = env;
         let (deferred, promise) = env.create_deferred::<InsertBatchResult, BatchResolver>()?;
-        match self.queue_batch(vectors, keys, key_ends, threads, deferred) {
+        match self.queue_batch(&mut env, vectors, keys, key_ends, threads, deferred) {
             Ok(()) => {}
             Err((deferred, error)) => deferred.reject(error),
         }
@@ -553,6 +616,7 @@ impl Plane {
 
     fn queue_batch(
         &self,
+        env: &mut Env,
         vectors: Float32Array,
         keys: Option<Buffer>,
         key_ends: Option<Uint32Array>,
@@ -591,10 +655,6 @@ impl Plane {
             None | Some(0) => hardware.min(16),
             Some(t) => (t as usize).min(hardware * 2),
         };
-        let sender = match self.batch_sender() {
-            Ok(sender) => sender,
-            Err(error) => return Err((deferred, Error::from_reason(format!("could not start the batch thread: {error}")))),
-        };
         let job = BatchJob {
             graph: self.graph.clone(),
             pool: self.pool.clone(),
@@ -605,7 +665,7 @@ impl Plane {
             threads,
             deferred,
         };
-        sender.send(job).map_err(|failed| (failed.0.deferred, Error::from_reason("the batch thread is gone")))
+        self.enqueue_batch(env, job)
     }
 
     /// Delete a node; its id returns to the plane freelist. Standalone-allocation mode only

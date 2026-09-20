@@ -197,7 +197,7 @@ impl Graph {
     /// the class allocates, and a key that shrinks to inline (or below its class) releases the
     /// range. A record torn by a dead writer is never reused: the lock takeover sanitizer
     /// zeroes the length. `None` leaves the stored key untouched.
-    unsafe fn store_key_locked(&self, p: *mut u8, key: Option<&[u8]>) -> Result<(), WriteError> {
+    unsafe fn store_key_locked(&self, p: *mut u8, key: Option<&[u8]>, reserved: Option<u64>) -> Result<(), WriteError> {
         let Some(key) = key else { return Ok(()) };
         if self.file.key_cap == 0 {
             return Ok(());
@@ -221,9 +221,10 @@ impl Graph {
                 reused = Some(existing);
             }
         }
-        let offset = match reused {
-            Some(offset) => offset,
-            None => self.file.allocate_key_bytes(key_class(key.len())).ok_or(WriteError::KeyArenaFull)?,
+        let offset = match (reserved, reused) {
+            (Some(offset), _) => offset,
+            (None, Some(offset)) => offset,
+            (None, None) => self.file.allocate_key_bytes(key_class(key.len())).ok_or(WriteError::KeyArenaFull)?,
         };
         std::ptr::copy_nonoverlapping(key.as_ptr(), self.file.key_arena_ptr_mut(offset), key.len());
         (payload as *mut u32).write_unaligned((offset as u32).to_le());
@@ -672,6 +673,13 @@ impl Graph {
     /// None to keep the key the slot already holds.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn write_node(&self, id: u32, level: u8, vector: &[u8], scale: f32, inv_mag: f32, neighbors: &[u32], upper_idx: u32, key: Option<&[u8]>) -> Result<(), WriteError> {
+        self.write_node_with_key_range(id, level, vector, scale, inv_mag, neighbors, upper_idx, key, None)
+    }
+
+    /// `write_node` with an arena range the caller reserved for an overflow key before it
+    /// touched the graph, so the write cannot fail on the arena after edges were removed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_node_with_key_range(&self, id: u32, level: u8, vector: &[u8], scale: f32, inv_mag: f32, neighbors: &[u32], upper_idx: u32, key: Option<&[u8]>, reserved_key_range: Option<u64>) -> Result<(), WriteError> {
         debug_assert!(neighbors.len() <= self.file.layer0_cap);
         // the copy below is sized by this, so an over-long slice would write through the
         // neighbor array into the following slot. The element-domain scan stays at the raw
@@ -686,7 +694,7 @@ impl Graph {
         let nbase = self.file.neighbor_offset();
         unsafe {
             // key first: an exhausted arena leaves the slot's previous state intact
-            self.store_key_locked(p, key)?;
+            self.store_key_locked(p, key, reserved_key_range)?;
             *p.add(S_LEVEL) = level;
             (p.add(S_DEGREE) as *mut u16).write_unaligned((neighbors.len() as u16).to_le());
             (p.add(S_SCALE) as *mut f32).write_unaligned(scale);
@@ -1003,7 +1011,7 @@ impl Graph {
                 if *p.add(S_FLAGS) != 0 {
                     false
                 } else {
-                    if let Err(error) = self.store_key_locked(p, key) {
+                    if let Err(error) = self.store_key_locked(p, key, None) {
                         self.file.free_upper(upper_idx);
                         return Err(error);
                     }
