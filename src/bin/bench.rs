@@ -10,6 +10,7 @@
 //! background writer inserting throughout, reporting aggregate QPS and per-thread p50/p99.
 //! `precision=both` builds and measures an int8 and an int16 plane over the same corpus.
 //! HNSW_BENCH_KERNELS=1 runs the kernel microbenchmark alone (no graph build).
+//! HNSW_BENCH_NO_RECALL=1 skips the brute-force recall truths (queries only; recall prints NaN).
 
 use hnsw_plane::distance::{quantize, Query};
 use hnsw_plane::format::Quant;
@@ -237,9 +238,14 @@ fn run(n: u64, dims: usize, queries: usize, efs: &[usize], path: &std::path::Pat
     // Query with held-out vectors; measure latency and set-recall@10 vs brute-force truth
     // (same asymmetric metric, so recall isolates graph quality, not quantization).
     let qs: Vec<Query> = (0..queries).map(|i| Query::for_plane(&graph.file, corpus.query_row(i, &mut rng))).collect();
+    // HNSW_BENCH_NO_RECALL=1 skips the brute-force truth pass: under a page-cache limit it is
+    // 200 full scans of the plane, hours of refaults before the first timed query
     let truths: Vec<Vec<u32>> = qs
         .iter()
         .map(|q| {
+            if std::env::var_os("HNSW_BENCH_NO_RECALL").is_some() {
+                return Vec::new();
+            }
             let mut truth: Vec<(u32, f32)> =
                 (0..n as u32).filter_map(|id| graph.distance_to(id, q).map(|d| (id, d))).collect();
             truth.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
