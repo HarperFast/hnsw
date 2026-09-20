@@ -91,7 +91,9 @@ export declare class Plane {
 	 *
 	 * Working memory: each thread's visited set is 4 bytes per allocated id, so a batch on an
 	 * 8M-node plane with 16 threads holds ~512 MB of scratch, retained in the plane's scratch
-	 * pool for later batches and searches.
+	 * pool for later batches and searches. The thread count and that memory are per plane: a
+	 * host bulk-loading several planes at once should pass `threads` so the total fits its
+	 * cores and memory.
 	 */
 	insertBatch(vectors: Float32Array, keys?: Buffer, keyEnds?: Uint32Array, threads?: number): Promise<InsertBatchResult>;
 	/** Delete a node; its id returns to the freelist. Pairs with insert(). */

@@ -73,7 +73,6 @@ for (let i = 0; i < pred.ids.length; i++) {
 }
 console.log(`predicate top hit: id ${pred.ids[0]} (calls: ${predicateCalls})`);
 
-// insertBatch
 {
 	const count = 500;
 	// per-record signature on top of the cluster spike, so a self-query has one right answer
@@ -133,7 +132,6 @@ console.log(`predicate top hit: id ${pred.ids[0]} (calls: ${predicateCalls})`);
 		const empty = await plane.insertBatch(new Float32Array(0));
 		if (empty.ids.length !== 0 || empty.rejected.length !== 0) throw new Error('an empty batch must resolve empty');
 	}
-	// malformed arguments reject the promise; nothing throws synchronously
 	const badShape = plane.insertBatch(new Float32Array(dims + 1));
 	if (!(badShape instanceof Promise)) throw new Error('a misaligned batch must return a promise');
 	const shapeError = await badShape.then(
@@ -141,13 +139,11 @@ console.log(`predicate top hit: id ${pred.ids[0]} (calls: ${predicateCalls})`);
 		(error) => error
 	);
 	if (!shapeError || !/dims/.test(shapeError.message)) throw new Error(`a misaligned batch must reject, got ${shapeError}`);
-	// keys on a keyless plane are per-record rejections, like insert() throwing per record
 	const keyless = Plane.create(join(tmpdir(), `smoke-batch-keyless-${process.pid}.hnsw`), dims, 32, 64);
 	const withKeys = await keyless.insertBatch(vectors.subarray(0, 3 * dims), Buffer.from('abc'), Uint32Array.from([1, 2, 3]), 2);
 	if (withKeys.rejected.length !== 3 || withKeys.rejected.some((r) => r.code !== 'key-unstorable'))
 		throw new Error(`keys on a keyless plane must reject per record: ${JSON.stringify(withKeys.rejected)}`);
 	if (keyless.idHighWater() !== 0) throw new Error('rejected records must not consume ids');
-	// a plane fault rejects with the ids that landed
 	const small = Plane.create(join(tmpdir(), `smoke-batch-full-${process.pid}.hnsw`), dims, 32, 64);
 	const full = await small.insertBatch(vectors, undefined, undefined, 4).then(
 		() => undefined,

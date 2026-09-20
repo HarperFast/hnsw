@@ -217,7 +217,7 @@ fn run(
         .map(|d| format!("fvecs:{d}"))
         .or_else(|_| std::env::var("HNSW_BENCH_F32").map(|f| format!("f32:{f}")))
         .unwrap_or_else(|_| "synthetic".into());
-    let corpus_id = format!("{corpus_id}:{}", quant.name());
+    let corpus_id = format!("{corpus_id}:{}:build{}", quant.name(), build_threads);
     let sidecar = path.with_extension("hnsw.corpus");
     let reuse = PlaneFile::open(&path)
         .ok()
@@ -335,11 +335,17 @@ fn run(
                     s.spawn(move || {
                         qs.iter()
                             .map(|q| {
-                                let mut truth: Vec<(u32, f32)> =
-                                    (0..n as u32).filter_map(|id| graph.distance_to(id, q).map(|d| (id, d))).collect();
-                                truth.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-                                truth.truncate(10);
-                                truth.into_iter().map(|(id, _)| id).collect::<Vec<u32>>()
+                                // bounded top-10 rather than an n-element scored list per thread
+                                let mut top: Vec<(u32, f32)> = Vec::with_capacity(11);
+                                for id in 0..n as u32 {
+                                    let Some(d) = graph.distance_to(id, q) else { continue };
+                                    if top.len() < 10 || d < top[9].1 {
+                                        let at = top.partition_point(|&(_, td)| td <= d);
+                                        top.insert(at, (id, d));
+                                        top.truncate(10);
+                                    }
+                                }
+                                top.into_iter().map(|(id, _)| id).collect::<Vec<u32>>()
                             })
                             .collect::<Vec<_>>()
                     })

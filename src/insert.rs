@@ -251,24 +251,28 @@ pub fn insert_with_key(
         return Err(InsertError::NotFinite);
     }
     let (bytes, scale, inv_mag) = (&stored.bytes, stored.scale, stored.inv_mag);
-    // An overflow key's arena range is reserved before anything else: selection removes edges
-    // between existing nodes, and an insert abandoned after that cannot put them back, so the
-    // one resource the final write could still run out of is taken first.
-    let key_range = if key.len() > graph.file.key_cap {
-        Some(graph.file.allocate_key_bytes(key_class(key.len())).ok_or(InsertError::KeyArenaFull)?)
-    } else {
-        None
-    };
-    let release_key_range = || {
-        if let Some(offset) = key_range {
-            graph.file.release_key_bytes(offset, key_class(key.len()));
-        }
-    };
     let id = graph.file.allocate_id();
     if id == NO_ID {
-        release_key_range();
         return Err(InsertError::Full);
     }
+    // An overflow key's arena range is settled before the graph is touched: selection removes
+    // edges between existing nodes, and an insert abandoned after that cannot put them back,
+    // so the one resource the final write could still run out of is taken first — the
+    // recycled slot's own range when it still fits, else a fresh reservation.
+    let (key_range, fresh_range) = if key.len() > graph.file.key_cap {
+        match graph.recycled_key_range(id, key.len()) {
+            Some(range) => (Some(range), false),
+            None => match graph.file.allocate_key_bytes(key_class(key.len())) {
+                Some(range) => (Some(range), true),
+                None => {
+                    graph.file.free_id(id);
+                    return Err(InsertError::KeyArenaFull);
+                }
+            },
+        }
+    } else {
+        (None, false)
+    };
     // `slot_upper` is the entry the published slot names (freed with it); a fresh one is freed here
     let abandon = |published: bool, upper: u32, slot_upper: u32| {
         if published {
@@ -279,7 +283,9 @@ pub fn insert_with_key(
         } else {
             graph.file.free_upper(upper);
             graph.file.free_id(id);
-            release_key_range();
+            if let (Some(range), true) = (key_range, fresh_range) {
+                graph.file.release_key_bytes(range, key_class(key.len()));
+            }
         }
     };
     let level = level_for(id, params.ml);

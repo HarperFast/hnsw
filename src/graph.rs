@@ -209,28 +209,42 @@ impl Graph {
             std::ptr::copy_nonoverlapping(key.as_ptr(), payload, key.len());
             return Ok(());
         }
-        let old_len = u16::from_le((kp as *const u16).read_unaligned()) as usize;
-        let mut reused = None;
-        if old_len > self.file.key_cap && *p.add(S_FLAGS) != 0 && key_class(old_len) >= key.len() {
-            let lo = u32::from_le((payload as *const u32).read_unaligned()) as u64;
-            let hi = u32::from_le((payload.add(4) as *const u32).read_unaligned()) as u64;
-            let existing = lo | (hi << 32);
-            // file-sourced: a range that does not fit the arena is not reused
-            let end = existing.checked_add(key_class(old_len) as u64);
-            if end.is_some_and(|end| end <= self.file.key_arena_len) {
-                reused = Some(existing);
-            }
-        }
-        let offset = match (reserved, reused) {
-            (Some(offset), _) => offset,
-            (None, Some(offset)) => offset,
-            (None, None) => self.file.allocate_key_bytes(key_class(key.len())).ok_or(WriteError::KeyArenaFull)?,
+        let offset = match reserved.or_else(|| self.reusable_key_range(p, key.len())) {
+            Some(offset) => offset,
+            None => self.file.allocate_key_bytes(key_class(key.len())).ok_or(WriteError::KeyArenaFull)?,
         };
         std::ptr::copy_nonoverlapping(key.as_ptr(), self.file.key_arena_ptr_mut(offset), key.len());
         (payload as *mut u32).write_unaligned((offset as u32).to_le());
         (payload.add(4) as *mut u32).write_unaligned(((offset >> 32) as u32).to_le());
         (kp as *mut u16).write_unaligned((key.len() as u16).to_le());
         Ok(())
+    }
+
+    /// The slot's own overflow range, when the key it last stored (live or deleted) reserved
+    /// a class that still fits `key_len`.
+    unsafe fn reusable_key_range(&self, p: *const u8, key_len: usize) -> Option<u64> {
+        let kp = p.add(self.file.key_offset());
+        let payload = kp.add(KEY_PAYLOAD);
+        let old_len = u16::from_le((kp as *const u16).read_unaligned()) as usize;
+        if old_len <= self.file.key_cap || *p.add(S_FLAGS) == 0 || key_class(old_len) < key_len {
+            return None;
+        }
+        let lo = u32::from_le((payload as *const u32).read_unaligned()) as u64;
+        let hi = u32::from_le((payload.add(4) as *const u32).read_unaligned()) as u64;
+        let existing = lo | (hi << 32);
+        // file-sourced: a range that does not fit the arena is not reused
+        let end = existing.checked_add(key_class(old_len) as u64)?;
+        (end <= self.file.key_arena_len).then_some(existing)
+    }
+
+    /// An insert that just took `id` from the allocator asks whether the recycled slot already
+    /// owns an overflow range big enough for its key, before reserving a fresh one. The slot
+    /// is the caller's now, so the unlocked read races nothing that writes it.
+    pub(crate) fn recycled_key_range(&self, id: u32, key_len: usize) -> Option<u64> {
+        if self.file.key_cap == 0 || key_len <= self.file.key_cap || !self.in_range(id) {
+            return None;
+        }
+        unsafe { self.reusable_key_range(self.file.slot_ptr(id), key_len) }
     }
 
     /// Copy the host key of `id` into `out` (cleared first). None for absent/deleted nodes;

@@ -287,7 +287,6 @@ pub struct BatchRejection {
     pub reason: String,
 }
 
-/// The plane fault that stopped a batch: `index` is the lowest record that hit it.
 #[napi(object)]
 pub struct BatchFailureInfo {
     pub index: u32,
@@ -295,9 +294,8 @@ pub struct BatchFailureInfo {
     pub reason: String,
 }
 
-/// `ids[i]` is record i's node id, or 0xFFFFFFFF where `rejected` names it or the batch
-/// stopped before reaching it. `failure` is set when a plane fault stopped the batch; index.js
-/// turns that into a rejection that still carries `ids` and `rejected`.
+/// `failure` set means a plane fault stopped the batch; index.js turns that into a rejection
+/// that still carries `ids` and `rejected`, which is why it is a field rather than an Err.
 #[napi(object)]
 pub struct InsertBatchResult {
     pub ids: Uint32Array,
@@ -305,7 +303,6 @@ pub struct InsertBatchResult {
     pub failure: Option<BatchFailureInfo>,
 }
 
-/// Scratches checked out of the pool for a batch, returned on every exit path.
 struct PooledScratches {
     pool: Arc<ScratchPool>,
     scratches: Vec<SearchScratch>,
@@ -595,7 +592,8 @@ impl Plane {
     /// index.js turns into a rejection still carrying `ids` and `rejected`. Batches on one
     /// plane run in order on one worker thread that retires when idle; malformed inputs reject
     /// the promise. Working memory is `threads x 4 B x idHighWater` of visited-set scratch,
-    /// retained in the plane's scratch pool afterwards.
+    /// retained in the plane's scratch pool afterwards; the count is per plane, so a host
+    /// loading several planes at once divides its cores between them.
     #[napi(ts_return_type = "Promise<InsertBatchResult>")]
     pub fn insert_batch(
         &self,

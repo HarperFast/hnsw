@@ -5,7 +5,7 @@
 
 use hnsw_plane::distance::Query;
 use hnsw_plane::format::NO_ID;
-use hnsw_plane::insert::{insert, insert_batch, InsertError, InsertParams};
+use hnsw_plane::insert::{insert, insert_batch, insert_with_key, InsertError, InsertParams};
 use hnsw_plane::search::{beam_descend, search, search_layer, SearchScratch, SearchStats, DESCENT_EF};
 use hnsw_plane::{Graph, PlaneFile};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -483,8 +483,6 @@ fn batch_insert_reports_record_faults_by_index_and_inserts_the_rest() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// A plane fault stops the batch: the lowest faulting index and the error come back with the
-/// ids that landed, those nodes are complete, and nothing is left in flight on return.
 #[test]
 fn batch_insert_fails_the_batch_when_the_plane_fills() {
     let dims = 16;
@@ -522,8 +520,6 @@ fn batch_insert_fails_the_batch_when_the_plane_fills() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// Arena exhaustion is a record fault: overflow keys past the arena are rejected one by one and
-/// inline keys keep landing, as a loop of `insert_with_key` does (`tests/keys.rs`).
 #[test]
 fn batch_insert_rejects_overflow_keys_past_the_arena_and_lands_inline_ones() {
     let dims = 16;
@@ -531,8 +527,8 @@ fn batch_insert_rejects_overflow_keys_past_the_arena_and_lands_inline_ones() {
     let _ = std::fs::remove_file(&path);
     // 256 nodes x 64 B = 16 KB of arena; a 500-byte key reserves a 512-byte class, so 32 fit.
     // 8 workers over 200 records keep the arena contended through its tail: a record refused
-    // there must be refused before it took an id or touched an edge, which id_high_water
-    // (never lowered by free_id) detects.
+    // there must not have touched an edge (every landed node stays reachable) and must have
+    // freed its id (a later inline insert reuses one instead of growing the high water).
     let graph = Graph::new(PlaneFile::create_with_key_arena(&path, dims, 16, 256, 8, 64).expect("create"));
     let params = InsertParams::default();
     let mut scratches: Vec<SearchScratch> = (0..8).map(|_| SearchScratch::new()).collect();
@@ -551,8 +547,13 @@ fn batch_insert_rejects_overflow_keys_past_the_arena_and_lands_inline_ones() {
     assert!(rejected.iter().all(|&(i, e)| i % 2 == 0 && e == InsertError::KeyArenaFull), "{rejected:?}");
     let landed = outcome.ids.iter().filter(|&&id| id != NO_ID).count();
     assert_eq!(landed, 132, "32 overflow + 100 inline keys land");
-    assert_eq!(graph.file.id_high_water(), landed as u64, "a refused record took no id");
+    let high_water = graph.file.id_high_water();
+    assert!(high_water >= landed as u64 && high_water <= landed as u64 + scratches.len() as u64, "high water {high_water}");
     let mut scratch = SearchScratch::new();
+    for i in 0..(high_water - landed as u64) {
+        insert_with_key(&graph, &vector_for(1000 + i as u32, dims), b"k", &params, &mut scratch).expect("inline insert");
+    }
+    assert_eq!(graph.file.id_high_water(), high_water, "refused records freed their ids for reuse");
     for (i, &id) in outcome.ids.iter().enumerate().filter(|(_, &id)| id != NO_ID) {
         let (results, _) = search(&graph, &graph.query(vector_for(i as u32, dims)), 5, 64, &mut scratch);
         assert!(results.iter().any(|&(rid, _)| rid == id), "record {i} (id {id}) unreachable after arena refusals");
@@ -560,8 +561,6 @@ fn batch_insert_rejects_overflow_keys_past_the_arena_and_lands_inline_ones() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// Batch workers run beside deletes: a deleter removes earlier nodes (including the entry point)
-/// while batches insert. Every surviving node must stay reachable and the entry must be live.
 #[test]
 fn batch_insert_beside_concurrent_deletes_keeps_survivors_reachable() {
     let dims = 64;
