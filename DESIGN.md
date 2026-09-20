@@ -351,9 +351,74 @@ fails with a permanent error latches the next one down for the process. `HNSW_KE
 forces off — a kill switch and A/B control, read once; there is no "on" value because the gate
 decides.
 
-Measured on a 4M × 128-d int8 plane (cap 32, 1.3 GB, NVMe), 200 queries, baseline vs this branch:
+Measured 2026-09-19 on a 4M × 128-d int8 plane (cap 32, 1.3 GB, `/home` NVMe), `bench` built
+from `main` vs this branch on the same file and queries, CPU-pinned, on a 20-thread Alder Lake
+host that other agents' benchmarks kept at load 20+ and the NVMe under ~70 MB/s of random reads
+throughout (a serial fault cost 80 µs on the idle device and ~250 µs during these runs).
 
-<!-- PREFETCH-MEASUREMENTS -->
+*Resident* (file warm, 200 queries, mean µs, 4 alternating rounds after a warm-up pair):
+
+| ef | base per round | branch per round | median Δ | `willneed_batches`/query |
+|---|---|---|---|---|
+| 128 | 248 · 248 · 317 · 257 | 251 · 288 · 277 · 250 | −0.9 % | 0.0 |
+| 512 | 447 · 418 · 465 · 419 | 426 · 520 · 478 · 440 | +4.0 % | 0.0 |
+| 1448 | 1726 · 1691 · 1965 · 1754 | 1742 · 1876 · 1951 · 1753 | +0.4 % | 0.1 |
+
+Run-to-run spread on this host was ±15 %, wider than the effect, so the resident cost was also
+measured as retired user instructions (`perf stat -e instructions:u`, exact under contention):
+gate on vs `HNSW_KERNEL_PREFETCH=0` in the same binary differs by 7.8 M instructions over the
+1,200 queries of a run, 6.5 k per query or 0.3 % of the query phase, and by −1.8 M against the
+`main` binary (noise). With `rdtsc` at 14 ns on this CPU and one sample per 4 expansions, the
+gate's time is 0.4–0.8 % of a query at every ef. An earlier build that read `clock_gettime`
+(32 ns) on every expansion measured 3–8 % on the same runs, which is what set the window and the
+counter: a high-ef expansion scores only ~3–9 unvisited slots, so per-expansion overhead is paid
+~700 times in a 400 µs query.
+
+*Exceeds page cache* (same file under `systemd-run --scope -p MemoryMax=…` after
+`fadvise(DONTNEED)`; cgroup v2 charges the file pages, so the plane refaults from the device):
+
+`MemoryMax=256M` (≈ 20 % of the plane resident; base/branch back to back per ef, 100 queries,
+50 at ef 1448; ms):
+
+| ef | round | base p50 / p95 / p99 | branch p50 / p95 / p99 | speed-up | batches · major faults per query |
+|---|---|---|---|---|---|
+| 128 | 1 | 102 / 277 / 587 | 60 / 183 / 222 | 1.7× / 1.5× / 2.6× | 94 · 350 |
+| 128 | 2 | 103 / 168 / 453 | 56 / 74 / 146 | 1.8× / 2.3× / 3.1× | 94 · 352 |
+| 512 | 1 | 186 / 406 / 885 | 80 / 288 / 320 | 2.3× / 1.4× / 2.8× | 137 · 421 |
+| 512 | 2 | 152 / 306 / 542 | 74 / 272 / 370 | 2.0× / 1.1× / 1.5× | 137 · 420 |
+| 1448 | 1 | 2527 / 9064 / 10527 | 897 / 2615 / 4079 | 2.8× / 3.5× / 2.6× | 820 · 644 |
+| 1448 | 2 | 974 / 2273 / 3031 | 253 / 598 / 979 | 3.8× / 3.8× / 3.1× | 820 · 643 |
+
+The batch and fault counts are the mechanism: at ef 128 the branch takes ~350 major faults for
+~1,470 non-resident pages per query, the rest arriving through the ~94 kernel batches, and a
+probe on the same loaded device put a 12-page WILLNEED batch at 1.1 ms against 3.1 ms of serial
+faults (0.4 ms against 2.5 ms on the idle device), which is where the remaining cost sits. An
+earlier single-run round with all three efs in one process showed the branch 2× *worse* at
+ef 128/512 and 10× better at ef 1448; the per-ef back-to-back pairs above are what the
+minute-scale swings in the other tenant's I/O allow to be compared.
+
+`MemoryMax=768M` (≈ 60 % resident; after the warm-up pass most of a 100-query set's pages are
+in cache, so this is the issue's own regime — median on trend, tail from the few queries that
+walk into cold pages; ms):
+
+| ef | round | base p50 / p95 / p99 (mean) | branch p50 / p95 / p99 (mean) | batches · major faults per query |
+|---|---|---|---|---|
+| 128 | 1 | 0.32 / 0.39 / 0.45 | 0.34 / 0.42 / 0.47 | 0.0 · 0.0 |
+| 128 | 2 | 0.28 / 0.42 / 55.1 (1.87) | 0.25 / 0.30 / 0.35 (0.26) | 0.0 · 0.0 |
+| 512 | 1 | 0.71 / 1.23 / 884 (22.5) | 0.76 / 4.90 / 5.47 (1.62) | 2.1 · 0.0 |
+| 512 | 2 | 0.40 / 0.54 / 0.79 | 0.59 / 0.77 / 1.11 | 0.0 · 0.0 |
+| 1448 | 1 | 1475 / 5244 / 8327 | 667 / 1788 / 3268 | 818 · 373 |
+| 1448 | 2 | 559 / 881 / 1684 | 138 / 242 / 254 | 812 · 372 |
+
+The ef 512 round-1 pair is the issue's shape: base mean 22.5 ms from two or three queries near
+one second, branch mean 1.6 ms with those queries at ~5 ms. Which queries land on cold pages
+differs run to run (round 2's pairs came out warm on both sides), and pairs with zero batches on
+both sides differ only by CPU noise: right after this series, ef 512 fully resident and back to
+back at load 27 gave base 399 / 399 µs and branch 408 / 391 / 424 µs mean.
+
+A batch on the loaded device never lost to the serial faults it replaced, measured with the
+probe on mixed batches of cold and resident pages: 1 cold page 382 vs 372 µs, 2 cold 900 vs
+1518, 3 cold 405 vs 1017, 6 cold 747 vs 2670, 12 cold 2272 vs 9622.
 
 ## 8. Write path phasing
 
