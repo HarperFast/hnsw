@@ -17,6 +17,10 @@ built around a different contract:
 - **Reads and writes are genuinely concurrent.** Per-slot seqlocks, no global locks on the
   search path. Measured on one Linux box at 1M × 768-d (ef 512): **6,300+ QPS aggregate
   across 8 search threads while a writer sustains ~1,100 inserts/s**, p50 ≈ 1 ms.
+- **Index build scales with cores.** `insertBatch` takes a whole chunk across one N-API
+  crossing and fans the inserts out over worker threads inside the native module, off the
+  event loop — the per-slot seqlocks are what make concurrent inserts safe. Scaling curve in
+  [DESIGN.md §11](DESIGN.md#11-prototype-measurements).
 - **Incremental by design.** Insert, update in place, delete with neighbor repair; deleted
   ids are reused via the freelist, so churn never inflates the graph. Reverse-edge overflow
   uses coverage-aware pruning (a bounded RobustPrune) — measured recall\@10 of 0.999 at 1M
@@ -58,6 +62,10 @@ const plane = Plane.create('/data/vectors.hnsw', 768, 128, 10_000_000, 40);
 // ... or with the finer storage precision (see below):
 // const plane = Plane.create('/data/vectors.hnsw', 128, 128, 10_000_000, 40, undefined, 'int16');
 const id = plane.insert(myFloat32Vector, Buffer.from(myRecordKey));
+// bulk load: one crossing per chunk, inserted in parallel off the event loop; `ids` is in input
+// order, keys are concatenated with SearchHits-style ends. Records the plane cannot hold come
+// back in `rejected` (index + code) with 0xFFFFFFFF in their slot; a full plane rejects the promise.
+const { ids, rejected } = await plane.insertBatch(chunkVectors /* count × dims */, chunkKeys, chunkKeyEnds, 8 /* threads */);
 // parallel typed arrays, ascending by distance; hit i's key is keys.subarray(keyEnds[i-1] ?? 0, keyEnds[i])
 const { ids, distances, keys, keyEnds } = await plane.search(queryVector, 10, 512);
 

@@ -73,6 +73,88 @@ for (let i = 0; i < pred.ids.length; i++) {
 }
 console.log(`predicate top hit: id ${pred.ids[0]} (calls: ${predicateCalls})`);
 
+// batch insert: one crossing per chunk, fanned out across threads inside Rust; ids come back in
+// input order, record faults are reported by index, and every landed record is searchable
+{
+	const count = 500;
+	// per-record signature on top of the cluster spike, so a self-query has one right answer
+	// rather than a near-duplicate from the same cluster
+	const batchVec = (i) => {
+		const v = vec(20_000 + i);
+		v[i % dims] += 0.5;
+		v[Math.floor(i / dims) % dims] += 0.35;
+		return v;
+	};
+	const vectors = new Float32Array(count * dims);
+	const keyParts = [];
+	const keyEnds = new Uint32Array(count);
+	let keyLength = 0;
+	for (let i = 0; i < count; i++) {
+		vectors.set(batchVec(i), i * dims);
+		const key = Buffer.from(`b${i}`);
+		keyParts.push(key);
+		keyLength += key.length;
+		keyEnds[i] = keyLength;
+	}
+	vectors[7 * dims + 3] = NaN;
+	const keys = Buffer.concat(keyParts);
+	const batch = await plane.insertBatch(vectors, keys, keyEnds, 4);
+	if (!(batch.ids instanceof Uint32Array) || batch.ids.length !== count) throw new Error('batch ids must parallel the input');
+	if (batch.rejected.length !== 1 || batch.rejected[0].index !== 7 || !/finite/.test(batch.rejected[0].reason))
+		throw new Error(`batch must reject exactly record 7: ${JSON.stringify(batch.rejected)}`);
+	if (batch.ids[7] !== 0xffffffff) throw new Error('a rejected record must carry the NO_ID sentinel');
+	const seen = new Set();
+	for (let i = 0; i < count; i++) {
+		if (i === 7) continue;
+		if (seen.has(batch.ids[i])) throw new Error(`batch handed out id ${batch.ids[i]} twice`);
+		seen.add(batch.ids[i]);
+	}
+	for (const i of [0, 123, 250, 499]) {
+		const found = await plane.search(batchVec(i), 10, 256);
+		const at = [...found.ids].indexOf(batch.ids[i]);
+		if (at < 0) throw new Error(`batch record ${i} (id ${batch.ids[i]}) is not searchable`);
+		if (keyAt(found, at) !== `b${i}`) throw new Error(`batch record ${i} carries key ${keyAt(found, at)}`);
+	}
+	// the batch runs off the event loop: timers keep firing and searches keep answering while
+	// it is in flight, and two batches issued together both settle with disjoint ids
+	{
+		const big = 3000;
+		const more = new Float32Array(big * dims);
+		for (let i = 0; i < big; i++) more.set(batchVec(count + i), i * dims);
+		let ticks = 0;
+		const heartbeat = setInterval(() => ticks++, 1);
+		const inFlight = plane.insertBatch(more, undefined, undefined, 2);
+		const during = await plane.search(batchVec(3), 5, 64);
+		if (during.ids.length === 0) throw new Error('search during a batch returned nothing');
+		const second = plane.insertBatch(new Float32Array(dims * 10).map(() => 0.5), undefined, undefined, 2);
+		const [first, twin] = await Promise.all([inFlight, second]);
+		clearInterval(heartbeat);
+		if (ticks === 0) throw new Error('the event loop stalled for the whole batch');
+		const twinIds = new Set(twin.ids);
+		for (const id of first.ids) if (twinIds.has(id)) throw new Error(`concurrent batches shared id ${id}`);
+		if (first.ids.length !== big || twin.ids.length !== 10) throw new Error('concurrent batches lost records');
+		const empty = await plane.insertBatch(new Float32Array(0));
+		if (empty.ids.length !== 0 || empty.rejected.length !== 0) throw new Error('an empty batch must resolve empty');
+	}
+	let badShape;
+	try {
+		await plane.insertBatch(new Float32Array(dims + 1));
+	} catch (error) {
+		badShape = error;
+	}
+	if (!badShape || !/dims/.test(badShape.message)) throw new Error(`a misaligned batch must throw, got ${badShape}`);
+	const small = Plane.create(join(tmpdir(), `smoke-batch-full-${process.pid}.hnsw`), dims, 32, 64);
+	let full;
+	try {
+		await small.insertBatch(vectors, undefined, undefined, 4);
+	} catch (error) {
+		full = error;
+	}
+	if (!full || !/full/.test(full.message)) throw new Error(`a batch past maxNodes must reject, got ${full}`);
+	if (small.idHighWater() !== 64) throw new Error(`the failed batch should have used every slot, highWater ${small.idHighWater()}`);
+	console.log('batch insert OK, rejected', batch.rejected.length, 'highWater', plane.idHighWater());
+}
+
 // raw mirroring path (dual-write phase 1): host-allocated ids, full node state per call
 const mirror = Plane.create(join(tmpdir(), `smoke-mirror-${process.pid}.hnsw`), dims, 32, 10_000);
 const q42 = vec(42);

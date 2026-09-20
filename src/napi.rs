@@ -4,16 +4,18 @@
 //! txnlog-anchored replay live in the host application.
 
 use crate::distance::Query;
-use crate::insert::{insert_with_key, InsertError, InsertParams};
+use crate::insert::{insert_batch, insert_with_key, BatchOutcome, InsertError, InsertParams};
 use crate::search::{gather_keys, search_filtered, search_predicated, PredicatePipe, PredicatedHits, SearchScratch};
 use crate::graph::{KeyError, WriteError};
 use crate::format::Quant;
 use crate::{Graph, PlaneFile};
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode};
-use napi::{JsFunction, JsUnknown, NapiValue};
+use napi::{JsFunction, JsObject, JsUnknown, NapiValue};
 use napi_derive::napi;
 use std::sync::{Arc, Mutex};
+
+const NO_ID: u32 = crate::format::NO_ID;
 
 /// Pooled per-query scratch (the visited array is O(nodes); never allocate per query).
 struct ScratchPool(Mutex<Vec<SearchScratch>>);
@@ -123,6 +125,22 @@ fn check_key(graph: &Graph, key: &[u8]) -> Result<()> {
             key.len(),
             graph.file.key_cap
         )),
+    })
+}
+
+fn insert_error(error: InsertError, graph: &Graph, vector_len: usize, key_len: usize) -> Error {
+    Error::from_reason(match error {
+        InsertError::Full => "plane is full (maxNodes reached)".to_string(),
+        InsertError::Wedged => "plane slot lock is wedged (unreclaimable holder); rebuild the index".to_string(),
+        InsertError::KeyArenaFull => "plane key arena is full; rebuild the index".to_string(),
+        InsertError::DimensionMismatch => {
+            format!("vector has {} dims; plane was created with {}", vector_len, graph.file.dims())
+        }
+        InsertError::KeyUnstorable => format!(
+            "key of {} bytes cannot be stored (plane keyCap = {}, max 65535)",
+            key_len, graph.file.key_cap
+        ),
+        InsertError::NotFinite => "vector has a component that is not finite".to_string(),
     })
 }
 
@@ -247,6 +265,108 @@ impl Task for PredicateSearchTask {
     }
 }
 
+/// One record a batch skipped: its position in the batch, the stable fault `code`
+/// (`InsertError::code`), and the message the single `insert` would have thrown.
+#[napi(object)]
+pub struct BatchRejection {
+    pub index: u32,
+    pub code: String,
+    pub reason: String,
+}
+
+/// `ids[i]` is record i's node id, or 0xFFFFFFFF where `rejected` names it.
+#[napi(object)]
+pub struct InsertBatchResult {
+    pub ids: Uint32Array,
+    pub rejected: Vec<BatchRejection>,
+}
+
+/// Scratches checked out of the pool for a batch; returned on every exit path, including a
+/// panic unwinding through the batch thread.
+struct PooledScratches {
+    pool: Arc<ScratchPool>,
+    scratches: Vec<SearchScratch>,
+}
+
+impl PooledScratches {
+    fn take(pool: &Arc<ScratchPool>, n: usize) -> Self {
+        PooledScratches { pool: pool.clone(), scratches: (0..n).map(|_| pool.take()).collect() }
+    }
+}
+
+impl Drop for PooledScratches {
+    fn drop(&mut self) {
+        for scratch in self.scratches.drain(..) {
+            self.pool.put(scratch);
+        }
+    }
+}
+
+/// The batch's inputs, copied out of the JS buffers so the worker threads never touch V8 memory.
+struct BatchJob {
+    graph: Arc<Graph>,
+    pool: Arc<ScratchPool>,
+    gate: Arc<Mutex<()>>,
+    params: InsertParams,
+    vectors: Vec<f32>,
+    keys: Vec<u8>,
+    key_ends: Vec<u32>,
+    threads: usize,
+}
+
+impl BatchJob {
+    fn run(self) -> Result<InsertBatchResult> {
+        let dims = self.graph.file.dims();
+        let count = self.vectors.len() / dims;
+        let records: Vec<(&[f32], &[u8])> = (0..count)
+            .map(|i| {
+                let key = if self.key_ends.is_empty() {
+                    &self.keys[..0]
+                } else {
+                    let start = if i == 0 { 0 } else { self.key_ends[i - 1] as usize };
+                    &self.keys[start..self.key_ends[i] as usize]
+                };
+                (&self.vectors[i * dims..(i + 1) * dims], key)
+            })
+            .collect();
+        // one batch at a time per plane: a second concurrent call waits rather than doubling
+        // the worker count and the scratch memory
+        let _serialized = self.gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut scratches = PooledScratches::take(&self.pool, self.threads.min(count.max(1)));
+        let result = insert_batch(&self.graph, &self.params, &records, &mut scratches.scratches);
+        drop(scratches);
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(failure) => {
+                let (vector, key) = records[failure.index];
+                let landed = failure.outcome.ids.iter().filter(|&&id| id != NO_ID).count();
+                let error = insert_error(failure.error, &self.graph, vector.len(), key.len());
+                return Err(Error::from_reason(format!(
+                    "{} (batch record {} of {}; {} records of this batch were inserted before it failed)",
+                    error.reason, failure.index, count, landed
+                )));
+            }
+        };
+        Ok(outcome_to_js(&self.graph, &records, outcome))
+    }
+}
+
+fn outcome_to_js(graph: &Graph, records: &[(&[f32], &[u8])], outcome: BatchOutcome) -> InsertBatchResult {
+    let rejected = outcome
+        .rejected
+        .into_iter()
+        .map(|(index, error)| {
+            let (vector, key) = records[index];
+            BatchRejection {
+                index: index as u32,
+                code: error.code().to_string(),
+                reason: insert_error(error, graph, vector.len(), key.len()).reason,
+            }
+        })
+        .collect();
+    InsertBatchResult { ids: Uint32Array::new(outcome.ids), rejected }
+}
+
 pub struct FlushTask {
     graph: Arc<Graph>,
     txn: Option<u64>,
@@ -274,6 +394,8 @@ pub struct Plane {
     // insert scratch, serialized: phase-1 hosts call insert from a single writer at a time
     // per index (Harper's commit path); a Mutex keeps misuse safe rather than fast.
     insert_scratch: Mutex<SearchScratch>,
+    // held for the duration of an insertBatch, so batches on one plane run one at a time
+    batch_gate: Arc<Mutex<()>>,
 }
 
 #[napi]
@@ -327,6 +449,7 @@ impl Plane {
             pool: Arc::new(ScratchPool(Mutex::new(Vec::new()))),
             params: InsertParams::default(),
             insert_scratch: Mutex::new(SearchScratch::new()),
+            batch_gate: Arc::new(Mutex::new(())),
         }
     }
 
@@ -343,30 +466,100 @@ impl Plane {
                 self.graph.file.dims()
             )));
         }
-        for (i, v) in vector.iter().enumerate() {
-            if !v.is_finite() {
-                // a NaN component yields a huge invMag and -inf distances: that node would
-                // rank first for roughly half of all queries, permanently
-                return Err(Error::from_reason(format!("vector component {i} is not finite")));
-            }
-        }
         let mut scratch = self.insert_scratch.lock().unwrap();
         let key = key.as_deref().unwrap_or(&[]);
-        insert_with_key(&self.graph, &vector, key, &self.params, &mut scratch).map_err(|e| match e {
-            InsertError::Full => Error::from_reason("plane is full (maxNodes reached)"),
-            InsertError::Wedged => Error::from_reason("plane slot lock is wedged (unreclaimable holder); rebuild the index"),
-            InsertError::KeyArenaFull => Error::from_reason("plane key arena is full; rebuild the index"),
-            InsertError::DimensionMismatch => Error::from_reason(format!(
-                "vector has {} dims; plane was created with {}",
-                vector.len(),
-                self.graph.file.dims()
-            )),
-            InsertError::KeyUnstorable => Error::from_reason(format!(
-                "key of {} bytes cannot be stored (plane keyCap = {}, max 65535)",
-                key.len(),
-                self.graph.file.key_cap
-            )),
-        })
+        insert_with_key(&self.graph, &vector, key, &self.params, &mut scratch)
+            .map_err(|e| insert_error(e, &self.graph, vector.len(), key.len()))
+    }
+
+    /// Insert a chunk of records in one crossing, fanned out across `threads` worker threads
+    /// inside the crate (default: every hardware thread; clamped to 4x that and to the record
+    /// count). `vectors` is `count x dims` row-major; `keys` and `keyEnds` (both or neither)
+    /// split the concatenated key bytes as `SearchHits` does. Resolves with every record's id
+    /// in input order; a record the plane cannot hold (non-finite component, over-long key) is
+    /// reported in `rejected` with 0xFFFFFFFF in its slot and the rest of the batch lands. A
+    /// plane fault (full, wedged, key arena exhausted) rejects the promise once in-flight inserts
+    /// finish; the records that landed before it stay in the plane, so treat a rejected batch as
+    /// the host treats a failed single insert. Batches on one plane run one at a time. Working
+    /// memory is `threads x 4 B x idHighWater` of visited-set scratch, retained in the plane's
+    /// scratch pool afterwards.
+    #[napi(ts_return_type = "Promise<InsertBatchResult>")]
+    pub fn insert_batch(
+        &self,
+        env: Env,
+        vectors: Float32Array,
+        keys: Option<Buffer>,
+        key_ends: Option<Uint32Array>,
+        threads: Option<u32>,
+    ) -> Result<JsObject> {
+        let dims = self.graph.file.dims();
+        if !vectors.len().is_multiple_of(dims) {
+            return Err(Error::from_reason(format!(
+                "batch has {} floats, not a multiple of the plane's {} dims",
+                vectors.len(),
+                dims
+            )));
+        }
+        let count = vectors.len() / dims;
+        let (keys, key_ends) = match (keys, key_ends) {
+            (None, None) => (Vec::new(), Vec::new()),
+            (Some(keys), Some(ends)) => {
+                if ends.len() != count {
+                    return Err(Error::from_reason(format!("keyEnds has {} entries for {} records", ends.len(), count)));
+                }
+                let mut previous = 0u32;
+                for &end in ends.iter() {
+                    if end < previous || end as usize > keys.len() {
+                        return Err(Error::from_reason("keyEnds must be non-decreasing and end within keys"));
+                    }
+                    previous = end;
+                }
+                if count > 0 && previous as usize != keys.len() {
+                    return Err(Error::from_reason("the last keyEnd must equal keys.length"));
+                }
+                if self.graph.file.key_cap == 0 && !keys.is_empty() {
+                    return Err(Error::from_reason("plane was created without keyCap; it cannot store keys"));
+                }
+                (keys.to_vec(), ends.to_vec())
+            }
+            _ => return Err(Error::from_reason("keys and keyEnds must be given together")),
+        };
+        let hardware = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
+        let threads = match threads {
+            None | Some(0) => hardware,
+            Some(t) => (t as usize).min(hardware * 4),
+        };
+        let job = BatchJob {
+            graph: self.graph.clone(),
+            pool: self.pool.clone(),
+            gate: self.batch_gate.clone(),
+            params: self.params,
+            vectors: vectors.to_vec(),
+            keys,
+            key_ends,
+            threads,
+        };
+        let (deferred, promise) = env.create_deferred::<InsertBatchResult, _>()?;
+        // the deferred travels in a slot so a thread the OS refuses to start can still reject
+        // it: a dropped deferred would leave the promise pending forever
+        let slot = Arc::new(Mutex::new(Some(deferred)));
+        let thread_slot = slot.clone();
+        let spawned = std::thread::Builder::new().name("hnsw-insert-batch".into()).spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run()));
+            let deferred = thread_slot.lock().unwrap_or_else(|p| p.into_inner()).take();
+            let Some(deferred) = deferred else { return };
+            match result {
+                Ok(Ok(outcome)) => deferred.resolve(move |_env| Ok(outcome)),
+                Ok(Err(error)) => deferred.reject(error),
+                Err(_) => deferred.reject(Error::from_reason("insertBatch panicked; the plane may be inconsistent")),
+            }
+        });
+        if let Err(error) = spawned {
+            if let Some(deferred) = slot.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                deferred.reject(Error::from_reason(format!("could not start the batch thread: {error}")));
+            }
+        }
+        Ok(promise)
     }
 
     /// Delete a node; its id returns to the plane freelist. Standalone-allocation mode only

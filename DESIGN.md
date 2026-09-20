@@ -183,6 +183,17 @@ a header field, so revising it is a rebuild, not a format change.
   holds: id allocation is one atomic fetch_add on the header, freelist pop is CAS, slot writes
   are seqlocked. Two inserts updating the same neighbor's edge list serialize on that slot's
   seqlock (a Rust-side per-slot spinlock on the odd state).
+- **Batch insert.** `insert_batch` (napi `insertBatch`) is the bulk driver for those writer
+  primitives: one crossing per chunk, one worker per scratch pulling records off a shared
+  counter, so a hub-heavy or cold region slows one worker rather than the chunk. Record faults
+  (non-finite component, unstorable key, wrong dims) skip that record and are reported by
+  index; a plane fault (full, wedged, key arena exhausted) stops the dispatch and fails the
+  batch once in-flight inserts finish — the call never returns with an insert still running,
+  which is what lets a host's barrier cover exactly what it applied. Batches on one plane are
+  serialized, and each worker's visited set is 4 B per allocated id, so a batch's working
+  memory is `threads × 4 B × id_high_water`. Records land in thread order, so a batch-built
+  graph is one of many equally valid shapes for the same input (§10: concurrency only shuffles
+  the insertion permutation). Scaling in §11.
 - **Id reuse & ABA.** Delete pushes the id onto the freelist; a traversal holding the old id may
   read the reused slot and score the wrong vector — acceptable under the relaxed contract
   (rescore/record-load rejects it). The freelist head itself is tag-guarded against ABA.

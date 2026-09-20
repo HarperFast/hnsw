@@ -61,6 +61,27 @@ export declare class Plane {
 	 * (maxNodes reached), an exhausted key arena, or a key the plane cannot store.
 	 */
 	insert(vector: Float32Array, key?: Buffer): number;
+	/**
+	 * Insert a chunk of records in one crossing, fanned out across `threads` worker threads
+	 * inside the native module (default: every hardware thread; clamped to 4× that and to the
+	 * record count) and off the event loop. `vectors` is `count × dims` row-major; `keys` and
+	 * `keyEnds` (both or neither) split the concatenated key bytes the way `SearchHits` does:
+	 * record i's key is `keys.subarray(keyEnds[i - 1] ?? 0, keyEnds[i])`.
+	 *
+	 * Resolves with every record's node id in input order. A record the plane cannot hold (a
+	 * non-finite component, an over-long key) is listed in `rejected` with 0xFFFFFFFF in its
+	 * `ids` slot, and the rest of the batch lands. A plane fault — full, wedged, key arena
+	 * exhausted — rejects the promise once in-flight inserts have finished; the records that
+	 * landed before it stay in the plane, so treat a rejected batch as a failed `insert`
+	 * (the host's mapping decides what to do with the plane). Batches on one plane run one at a
+	 * time; a second call waits for the first. Records land in whatever order the threads reach
+	 * them, so two builds of the same input produce different, equally valid graphs.
+	 *
+	 * Working memory: each thread's visited set is 4 bytes per allocated id, so a batch on an
+	 * 8M-node plane with 16 threads holds ~512 MB of scratch, retained in the plane's scratch
+	 * pool for later batches and searches.
+	 */
+	insertBatch(vectors: Float32Array, keys?: Buffer, keyEnds?: Uint32Array, threads?: number): Promise<InsertBatchResult>;
 	/** Delete a node; its id returns to the freelist. Pairs with insert(). */
 	remove(id: number): void;
 
@@ -164,6 +185,23 @@ export declare class Plane {
 	invalidateFile(): InvalidationOutcome;
 	/** Whether the plane was invalidated, by any handle, since this one opened. */
 	invalidated(): boolean;
+}
+
+/** One record `insertBatch` skipped. */
+export interface BatchRejection {
+	/** Position in the batch. */
+	index: number;
+	/** Stable fault name: 'not-finite' | 'key-unstorable' | 'dimension-mismatch'. */
+	code: string;
+	/** The message `insert` would have thrown for this record. */
+	reason: string;
+}
+
+export interface InsertBatchResult {
+	/** Node id per record, in input order; 0xFFFFFFFF where `rejected` names the record. */
+	ids: Uint32Array;
+	/** Ascending by index. */
+	rejected: Array<BatchRejection>;
 }
 
 export interface InvalidationOutcome {
