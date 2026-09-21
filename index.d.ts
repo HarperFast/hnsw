@@ -181,9 +181,11 @@ export declare class Plane {
 	 * Durability barrier: flush all data, then advance the watermark (omitted = leave the
 	 * stored watermark untouched), then flush the header alone — a crash between the two
 	 * flushes leaves an old watermark over durable data, never a new watermark over missing
-	 * data. Crash recovery is per-slot: a lock abandoned by a dead handle is detected via a
-	 * kernel-owned registration (immune to pid reuse) and taken over, with the slot marked
-	 * deleted until rewritten.
+	 * data. That promise assumes the watermark you pass already landed: `await` every
+	 * outstanding insertBatch() first, or a queued batch not yet applied is exactly a new
+	 * watermark over missing data. Crash recovery is per-slot: a lock abandoned by a dead
+	 * handle is detected via a kernel-owned registration (immune to pid reuse) and taken
+	 * over, with the slot marked deleted until rewritten.
 	 */
 	flush(watermark?: number): void;
 	/** flush() on the libuv thread pool — a whole-map msync can stall its calling thread. */

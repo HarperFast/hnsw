@@ -973,7 +973,9 @@ impl Plane {
     /// Durability barrier: flush all data, then advance the watermark (defaults to the
     /// current one) and the clean-shutdown flag, then flush the header alone — so a crash
     /// between the flushes can only leave an OLD watermark over durable data (replay
-    /// re-covers a suffix), never a new watermark over missing data.
+    /// re-covers a suffix), never a new watermark over missing data. That promise assumes
+    /// the watermark you pass already landed: `await` every outstanding `insertBatch` first,
+    /// or a queued batch not yet applied is exactly a new watermark over missing data.
     #[napi]
     pub fn flush(&self, watermark: Option<f64>) -> Result<()> {
         self.graph.file.flush_with_watermark(watermark.map(|w| w as u64)).map_err(|e| Error::from_reason(e.to_string()))
