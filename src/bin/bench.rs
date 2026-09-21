@@ -2,7 +2,7 @@
 //! per-visit cost — the number that decides whether the native plane hits its 0.25–0.4 µs
 //! budget (JS baseline: 4.34 µs/visit at 5M/ef 512).
 //!
-//! Usage: bench [n=100000] [dims=768] [queries=200] [ef=512] [path=/tmp/bench.hnsw] [cap=128] [threads=0] [precision=int8|int16|both] [buildThreads=1]
+//! Usage: bench [n=100000] [dims=768] [queries=200] [ef=512] [path=/tmp/bench.hnsw] [cap=64] [threads=0] [precision=int8|int16|both] [buildThreads=1]
 //! Env: HNSW_BENCH_FVECS=<dir> reads SIFT-style `sift_base.fvecs` / `sift_query.fvecs` from that
 //! directory (its dims must match the argument; n rows from base, queries from query) instead of the synthetic
 //! corpus, so a run matches the Harper-vs-pgvector benchmark's data. HNSW_BENCH_F32=<file> reads a
@@ -167,29 +167,37 @@ impl Source {
     }
 }
 
+/// A supplied argument that does not parse is an error, never the default.
+fn arg_or<T: std::str::FromStr>(args: &[String], index: usize, name: &str, default: T) -> T {
+    match args.get(index) {
+        None => default,
+        Some(raw) => raw.parse().unwrap_or_else(|_| panic!("{name}: cannot parse {raw:?}")),
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if std::env::var("HNSW_BENCH_KERNELS").is_ok() {
         kernel_bench();
         return;
     }
-    let n: u64 = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(100_000);
-    let dims: usize = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(768);
-    let queries: usize = args.get(3).and_then(|a| a.parse().ok()).unwrap_or(200);
+    let n: u64 = arg_or(&args, 1, "n", 100_000);
+    let dims: usize = arg_or(&args, 2, "dims", 768);
+    let queries: usize = arg_or(&args, 3, "queries", 200);
     let efs: Vec<usize> = args
         .get(4)
         .map(|a| a.split(',').map(|e| e.parse().expect("ef")).collect())
         .unwrap_or_else(|| vec![512]);
     let path: PathBuf = args.get(5).map(Into::into).unwrap_or_else(|| "/tmp/bench.hnsw".into());
-    let layer0_cap: usize = args.get(6).and_then(|a| a.parse().ok()).unwrap_or(128);
-    let threads: usize = args.get(7).and_then(|a| a.parse().ok()).unwrap_or(0);
+    let layer0_cap: usize = arg_or(&args, 6, "cap", 64);
+    let threads: usize = arg_or(&args, 7, "threads", 0);
     let quants: Vec<Quant> = match args.get(8).map(String::as_str).unwrap_or("int8") {
         "int8" => vec![Quant::Int8],
         "int16" => vec![Quant::Int16],
         "both" => vec![Quant::Int8, Quant::Int16],
         other => panic!("precision must be int8, int16 or both (got {other})"),
     };
-    let build_threads: usize = args.get(9).and_then(|a| a.parse().ok()).unwrap_or(1).max(1);
+    let build_threads: usize = arg_or::<usize>(&args, 9, "buildThreads", 1).max(1);
     kernel_bench();
     for quant in quants {
         // per-precision path so `both` does not rebuild over the other width's file
@@ -314,22 +322,30 @@ fn run(
             n as f64 / build.as_secs_f64()
         );
         graph.file.msync().expect("msync");
+        // a truth file from the plane this build replaced answers for different base data
+        drop_truth_caches(&path);
         std::fs::write(&sidecar, &corpus_id).expect("write corpus sidecar");
     }
 
     // Query with held-out vectors; measure latency and set-recall@10 vs brute-force truth
     // (same asymmetric metric, so recall isolates graph quality, not quantization).
-    let qs: Vec<Query> = (0..queries).map(|i| Query::for_plane(&graph.file, corpus.query_row(i, &mut rng))).collect();
-    // HNSW_BENCH_NO_RECALL=1 skips the brute-force truth pass: under a page-cache limit it is
-    // 200 full scans of the plane, hours of refaults before the first timed query
+    let rows: Vec<Vec<f32>> = (0..queries).map(|i| corpus.query_row(i, &mut rng)).collect();
+    // HNSW_BENCH_NO_RECALL=1 skips the brute-force truth pass entirely; otherwise the truth is
+    // cached beside the plane, keyed by node count and the query vectors themselves, so an ef
+    // sweep or a run under a page-cache limit does not rescan the whole plane once per query
+    let truth_path = PathBuf::from(format!("{}.truth-{n}n-{:016x}", path.display(), query_hash(&rows)));
+    let qs: Vec<Query> = rows.into_iter().map(|row| Query::for_plane(&graph.file, row)).collect();
     let truths: Vec<Vec<u32>> = if std::env::var_os("HNSW_BENCH_NO_RECALL").is_some() {
         qs.iter().map(|_| Vec::new()).collect()
+    } else if let Some(cached) = std::fs::read(&truth_path).ok().filter(|bytes| reuse && bytes.len() == queries * 40) {
+        println!("reusing brute-force truth at {}", truth_path.display());
+        cached.chunks(40).map(|q| q.chunks(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect()).collect()
     } else {
         // brute-force truth is O(n x queries); spread it over the machine so an 8M plane does not
         // spend longer on truth than on the build it measures. Bounded top-10 running insert per
         // query (not collect-all-then-sort), so no query keeps an n-entry buffer resident.
         let truth_threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1).min(queries.max(1));
-        std::thread::scope(|s| {
+        let truths: Vec<Vec<u32>> = std::thread::scope(|s| {
             let chunk = qs.len().div_ceil(truth_threads).max(1);
             let handles: Vec<_> = qs
                 .chunks(chunk)
@@ -354,7 +370,12 @@ fn run(
                 })
                 .collect();
             handles.into_iter().flat_map(|h| h.join().expect("truth thread")).collect()
-        })
+        });
+        let bytes: Vec<u8> = truths.iter().flat_map(|q| q.iter().flat_map(|id| id.to_le_bytes())).collect();
+        if let Err(error) = std::fs::write(&truth_path, bytes) {
+            eprintln!("could not write the truth cache {}: {error}", truth_path.display());
+        }
+        truths
     };
     let mut dump = std::env::var("HNSW_BENCH_DUMP").ok().map(|p| {
         std::io::BufWriter::new(std::fs::File::create(&p).expect("create HNSW_BENCH_DUMP"))
@@ -412,6 +433,9 @@ fn run(
     }
 
     drop(dump);
+    // after the timed passes: the scan touches every slot, which would warm a plane that the
+    // memory-limited measurement wants cold
+    degree_report(&graph, n);
 
     if threads > 0 {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -614,4 +638,46 @@ fn kernel_bench() {
         );
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// FNV-1a over the queries' bytes: the truth cache identity.
+fn query_hash(rows: &[Vec<f32>]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in rows.iter().flatten().flat_map(|v| v.to_le_bytes()) {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+fn drop_truth_caches(plane: &std::path::Path) {
+    let Some(name) = plane.file_name().and_then(|f| f.to_str()) else { return };
+    let prefix = format!("{name}.truth-");
+    let dir = plane.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        if entry.file_name().to_str().is_some_and(|f| f.starts_with(&prefix)) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn degree_report(graph: &Graph, n: u64) {
+    let mut degrees: Vec<u32> = Vec::with_capacity(n as usize);
+    let mut buf = Vec::new();
+    for id in 0..n as u32 {
+        if graph.neighbors_into(id, &mut buf).is_some() {
+            degrees.push(buf.len() as u32);
+        }
+    }
+    if degrees.is_empty() {
+        return;
+    }
+    degrees.sort_unstable();
+    let pct = |p: usize| degrees[(degrees.len() * p / 100).min(degrees.len() - 1)];
+    let mean = degrees.iter().map(|&d| d as f64).sum::<f64>() / degrees.len() as f64;
+    let within = |cap: u32| degrees.iter().filter(|&&d| d <= cap).count() as f64 / degrees.len() as f64 * 100.0;
+    println!(
+        "layer-0 degree: mean {:.1}  p50 {}  p90 {}  p99 {}  max {}  |  nodes at degree <=32 {:.1}%  <=48 {:.1}%  <=64 {:.1}%",
+        mean, pct(50), pct(90), pct(99), degrees[degrees.len() - 1], within(32), within(48), within(64)
+    );
 }
