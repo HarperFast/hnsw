@@ -125,8 +125,8 @@ and writing neighbor ids over its vector. `PlaneFile` carries the parsed codec a
 `vector_bytes`, and exposes `neighbor_offset()` / `key_offset()` as methods — every slot
 offset comes from the byte length, and no call site can pass `dims` where bytes are meant.
 
-At 100M nodes: ~109 GB (int8); int16 adds one byte per dimension per slot, +18% at 128 dims
-and +73% at 1536, which is why it is a per-index choice and not the default. A binary-code v2 slot (96 B codes + ids) is ~384 B → ~38 GB.
+At 100M nodes: ~109 GB (int8, cap 64); int16 adds one byte per dimension per slot — at cap 32,
++40% at 128 dims and +89% at 1536 — which is why it is a per-index choice and not the default. A binary-code v2 slot (96 B codes + ids) is ~384 B → ~38 GB.
 For comparison, today's encoding averages 1,425 B/node _plus_ RocksDB overhead — so v1 is
 already ~25% smaller while being fixed-offset addressable, because per-edge cached float64
 distances are dropped (recomputing a distance costs ~50 ns native; storing it costs 8 B and
@@ -153,20 +153,19 @@ their class, are not reclaimed until a rebuild; a record torn by a dead writer i
 mirroring without a key keeps the stored one. Searches and predicate batches return the keys with the hits, so the host
 resolves a hit to its record without a lookup by node id: in Harper that lookup was one RocksDB
 read per candidate, about half the per-query CPU once traversal went native. For 128-d/768-d
-int8 slots at cap 128 a 40-byte inline key fits inside the existing 64 B padding (704 B / 1,344 B
-slots, unchanged). A key read happens under the slot's seqlock at result time; a slot deleted or
+int8 slots at cap 32 a 40-byte inline key fits inside the existing 64 B padding (320 B / 960 B
+slots, unchanged; at cap 128 the same holds at 704 B / 1,344 B). A key read happens under the slot's seqlock at result time; a slot deleted or
 reused since the traversal yields an empty key (host skips) or the new occupant's key (the
 host's exact rescore drops it), the same relaxed contract as the mapping race it replaces. A
 predicated search returns each admitted hit with the key its predicate batch carried, so the
 verdict and the returned key always describe the same record.
 
-**Degree cap decision.** Today layer-0 caps at `M<<1` then `<<2` under `optimizeRouting` = 128,
-with transient overshoot to 160 before pruning; measured mean degree is ~37. Sizing slots at
-cap 128 doubles the file for a tail. v1 policy: **hard prune-to-cap-64 on write** — the insert
-path's in-memory candidate selection can overshoot as today, but what is written is pruned to
-64 by the same routing-aware selection that currently prunes at 160→128. Transient overshoot
-never touches the file. Recall impact must be measured in the validation phase (§9); the cap is
-a header field, so revising it is a rebuild, not a format change.
+**Degree cap decision.** The JS graph caps layer 0 at `M<<1`, then `<<2` under `optimizeRouting`
+= 128, with transient overshoot to 160 before pruning. The slot reserves the cap, and the cap is
+a header field: revising it is a rebuild, not a format change. **The cap is 32** (`M<<1`, the
+traditional HNSW value) — the neighbour array is the slot's dominant field at low dimensionality
+(512 of 704 B at cap 128 for 128-d int8) and ~90% of nodes never use more than 48 of the 128;
+measurements and the decision record are in §10.
 
 ## 5. Concurrency
 
@@ -455,8 +454,9 @@ probe on mixed batches of cold and resident pages: 1 cold page 382 vs 372 µs, 2
   _Integrated_ behind the opt-in `nativePlane: true` index option (search-only: toggling never
   reindexes; int8 + cosine indexes only — the flag no-ops elsewhere). Mutations mirror at the
   exact `indexStore.put/remove` sites via `writeNodeRaw`/`clearNode`/`setEntryPoint` with
-  host-allocated ids; the plane file (`<store path>/<table>.<attr>.hnsw`, layer0 cap 128,
-  16M-node sparse reservation) is created lazily with a full mirror of the existing CF graph on
+  host-allocated ids; the plane file (`<store path>/<table>.<attr>.hnsw`, layer0 cap
+  `planeLayer0Cap()` — 128 under optimizeRouting at the time of writing, to move to `M << 1` = 32
+  together with the JS graph's own cap per §10, 16M-node sparse reservation) is created lazily with a full mirror of the existing CF graph on
   first enable, reopened on restart, deleted on drop/clear/reindex. The compiled module is
   optional (`npm run build:hnsw-plane`); absence falls back to the JS path with one warning.
   Parity, predicate, restart, and lifecycle coverage in `unitTests/resources/vectorIndexPlane.test.js`.
@@ -478,8 +478,8 @@ p50 7.2 ms / recall@10-set 0.997 @ ef 512). Acceptance for phase 1:
 1. **Parity:** native search over a dual-written graph returns identical candidate sets to the
    JS path at equal ef (modulo seqlock-retry races under concurrent write load — measured as a
    bounded divergence rate, not exact equality under churn).
-2. **Recall:** cap-64 prune vs cap-128 measured at 1M and 5M; accept if recall@10 delta ≤ 0.5 pt
-   at equal ef, else revisit the cap (header field — rebuild, not redesign).
+2. **Recall:** cap 32/48/64 vs cap 128 measured at 1M (this crate) and 4M (harper, issue #7);
+   results in §10 — cap 32 is the decided value.
 3. **Latency:** ≥8× p50 improvement at 5M/ef 512 (22.2 ms → ≤2.8 ms), p99 within 2× p50 under
    concurrent insert load (the metric that motivates off-loop execution).
 4. **Crash:** kill -9 during sustained ingest → reopen → watermark replay → graph passes
@@ -489,9 +489,44 @@ p50 7.2 ms / recall@10-set 0.997 @ ef 512). Acceptance for phase 1:
 
 ## 10. Decisions & open questions
 
+Decided (Kris, 2026-09-21) — **layer-0 cap: 32** (`M << 1`), superseding the 2026-08-31 cap-128
+decision below. What changed is the measurement: the earlier one was 768-d, where the vector
+dominates the slot and cap 128 cost +24% for 2.2 pts of recall over cap 64. At the 128-d planes
+harper actually runs the neighbour array IS the slot (512 of 704 B), and a live 7.7M-node plane
+(issue #7) uses a mean of 29.4 of the 128 (median 24, p90 51): 77% of the array is zeros that
+still fault in, and the resident working set is what sets tail latency once a plane outgrows RAM
+(issue ladder: p95 5.6 ms at 4M → 68.8 ms at 8M, p50 flat).
+
+- **1M × 128-d int8, this crate's insert path, M 16, optimizeRouting 0.5** (`bench 1000000 128
+  1000 64,128,256,512 … <cap>`, 2026-09-20; recall@10 vs brute force, 1 000 queries):
+
+  | cap | slot | degree mean / p50 / p90 / max | recall ef 64 | ef 128 | ef 256 | ef 512 |
+  |---|---|---|---|---|---|---|
+  | 128 | 704 B | 29.6 / 25 / 49 / 128 | 0.9999 | 1.0000 | 1.0000 | 1.0000 |
+  | 64 | 448 B | 29.4 / 25 / 49 / 64 | 0.9979 | 1.0000 | 1.0000 | 1.0000 |
+  | 48 | 384 B | 28.6 / 25 / 48 / 48 | 0.9978 | 0.9989 | 0.9999 | 0.9999 |
+  | **32** | **320 B** | 26.0 / 27 / 32 / 32 | 0.9931 | 0.9966 | 0.9987 | 0.9987 |
+
+  The cap-128 degree row reproduces the live plane's, so this corpus is a fair proxy for the
+  distribution, not for the difficulty: it is a Gaussian mixture.
+- **4M × 128-d int8, harper's mirror path, SIFT-derived corpus** (issue #7, 2026-09-20; auto ef
+  1024 at this size): cap 32 vs 128 is 320 vs 704 B slots, 452 vs 836 B/vector allocated, PSS
+  −22%, build +10% faster, unloaded p50/p95/p99 4.3/4.9/5.8 vs 5.0/6.0/7.5 ms, recall 99.95% vs
+  100.00% at ef 1024 and 92.8% vs 95.5% at ef 80. The large lists buy graph quality only at an ef
+  far below the operating point.
+- **4M × 128-d int8, this crate, resident and not** — see `## 4M before/after` below.
+- Rejected: **two-tier storage** (inline ~48 ids + an overflow record for the tail; same 384-B
+  slot with the graph unchanged) — not worth its format and concurrency surface against a cap
+  that measures as the best trade generally; and **3-byte ids** (saves 25% of the array, caps a
+  plane at 2^24 nodes). The cap remains a create parameter; a host with a corpus where the ef-80
+  gap matters raises it and pays the bytes.
+
+4M_PLACEHOLDER
+
 Decided (Kris, 2026-08-31):
 
-- **Degree cap: 128 for the int8 plane** (revised 2026-08-31 after measurement). The original
+- ~~**Degree cap: 128 for the int8 plane**~~ (revised 2026-08-31 after measurement; superseded
+  2026-09-21 above). The original
   cap-64 preference assumed 128 doubles the file; it does not for int8 slots — the 768 B vector
   dominates, so 128 costs +23.5% (1,344 vs 1,088 B slots). Measured at 1M: cap-64 loses 2.2 pts
   of recall (0.975 vs 0.996, where JS = 0.997) at equal ef and equal latency. +24% bytes for

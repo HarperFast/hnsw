@@ -2,7 +2,7 @@
 //! per-visit cost — the number that decides whether the native plane hits its 0.25–0.4 µs
 //! budget (JS baseline: 4.34 µs/visit at 5M/ef 512).
 //!
-//! Usage: bench [n=100000] [dims=768] [queries=200] [ef=512] [path=/tmp/bench.hnsw] [cap=128] [threads=0] [precision=int8|int16|both] [buildThreads=1]
+//! Usage: bench [n=100000] [dims=768] [queries=200] [ef=512] [path=/tmp/bench.hnsw] [cap=32] [threads=0] [precision=int8|int16|both] [buildThreads=1]
 //! Env: HNSW_BENCH_FVECS=<dir> reads SIFT-style `sift_base.fvecs` / `sift_query.fvecs` from that
 //! directory (its dims must match the argument; n rows from base, queries from query) instead of the synthetic
 //! corpus, so a run matches the Harper-vs-pgvector benchmark's data. HNSW_BENCH_F32=<file> reads a
@@ -167,29 +167,38 @@ impl Source {
     }
 }
 
+/// A supplied argument must parse: a typo like `64x` is an error, never a silent default, so a
+/// published number is always labelled with the cap it was actually measured at.
+fn arg_or<T: std::str::FromStr>(args: &[String], index: usize, name: &str, default: T) -> T {
+    match args.get(index) {
+        None => default,
+        Some(raw) => raw.parse().unwrap_or_else(|_| panic!("{name}: cannot parse {raw:?}")),
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if std::env::var("HNSW_BENCH_KERNELS").is_ok() {
         kernel_bench();
         return;
     }
-    let n: u64 = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(100_000);
-    let dims: usize = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(768);
-    let queries: usize = args.get(3).and_then(|a| a.parse().ok()).unwrap_or(200);
+    let n: u64 = arg_or(&args, 1, "n", 100_000);
+    let dims: usize = arg_or(&args, 2, "dims", 768);
+    let queries: usize = arg_or(&args, 3, "queries", 200);
     let efs: Vec<usize> = args
         .get(4)
         .map(|a| a.split(',').map(|e| e.parse().expect("ef")).collect())
         .unwrap_or_else(|| vec![512]);
     let path: PathBuf = args.get(5).map(Into::into).unwrap_or_else(|| "/tmp/bench.hnsw".into());
-    let layer0_cap: usize = args.get(6).and_then(|a| a.parse().ok()).unwrap_or(128);
-    let threads: usize = args.get(7).and_then(|a| a.parse().ok()).unwrap_or(0);
+    let layer0_cap: usize = arg_or(&args, 6, "cap", 32);
+    let threads: usize = arg_or(&args, 7, "threads", 0);
     let quants: Vec<Quant> = match args.get(8).map(String::as_str).unwrap_or("int8") {
         "int8" => vec![Quant::Int8],
         "int16" => vec![Quant::Int16],
         "both" => vec![Quant::Int8, Quant::Int16],
         other => panic!("precision must be int8, int16 or both (got {other})"),
     };
-    let build_threads: usize = args.get(9).and_then(|a| a.parse().ok()).unwrap_or(1).max(1);
+    let build_threads: usize = arg_or::<usize>(&args, 9, "buildThreads", 1).max(1);
     kernel_bench();
     for quant in quants {
         // per-precision path so `both` does not rebuild over the other width's file
@@ -316,6 +325,8 @@ fn run(
         graph.file.msync().expect("msync");
         std::fs::write(&sidecar, &corpus_id).expect("write corpus sidecar");
     }
+
+    degree_report(&graph, n);
 
     // Query with held-out vectors; measure latency and set-recall@10 vs brute-force truth
     // (same asymmetric metric, so recall isolates graph quality, not quantization).
@@ -614,4 +625,27 @@ fn kernel_bench() {
         );
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Layer-0 degree distribution over every live node: how much of the slot's neighbour array a
+/// corpus like this one actually fills at the chosen cap.
+fn degree_report(graph: &Graph, n: u64) {
+    let mut degrees: Vec<u32> = Vec::with_capacity(n as usize);
+    let mut buf = Vec::new();
+    for id in 0..n as u32 {
+        if graph.neighbors_into(id, &mut buf).is_some() {
+            degrees.push(buf.len() as u32);
+        }
+    }
+    if degrees.is_empty() {
+        return;
+    }
+    degrees.sort_unstable();
+    let pct = |p: usize| degrees[(degrees.len() * p / 100).min(degrees.len() - 1)];
+    let mean = degrees.iter().map(|&d| d as f64).sum::<f64>() / degrees.len() as f64;
+    let within = |cap: u32| degrees.iter().filter(|&&d| d <= cap).count() as f64 / degrees.len() as f64 * 100.0;
+    println!(
+        "layer-0 degree: mean {:.1}  p50 {}  p90 {}  p99 {}  max {}  |  nodes at degree <=32 {:.1}%  <=48 {:.1}%  <=64 {:.1}%",
+        mean, pct(50), pct(90), pct(99), degrees[degrees.len() - 1], within(32), within(48), within(64)
+    );
 }

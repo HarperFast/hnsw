@@ -58,9 +58,11 @@ macOS and Windows are functional (no lock takeover — bounded degradation inste
 const { Plane } = require('@harperfast/hnsw');
 
 // keyCap 40 (min 8): each slot carries up to 40 bytes of the host's key inline (longer keys overflow)
-const plane = Plane.create('/data/vectors.hnsw', 768, 128, 10_000_000, 40);
+// layer-0 cap 32 (= 2M for M 16): the recommended value — smallest slot, recall within 0.5 pt of
+// cap 128 at ef ≥ 1024 and 1–2 pts below it at ef ≤ 512 (measured at 128-d; DESIGN.md §10)
+const plane = Plane.create('/data/vectors.hnsw', 768, 32, 10_000_000, 40);
 // ... or with the finer storage precision (see below):
-// const plane = Plane.create('/data/vectors.hnsw', 128, 128, 10_000_000, 40, undefined, 'int16');
+// const plane = Plane.create('/data/vectors.hnsw', 128, 32, 10_000_000, 40, undefined, 'int16');
 const id = plane.insert(myFloat32Vector, Buffer.from(myRecordKey));
 // bulk load: one crossing per chunk, inserted in parallel off the event loop; `ids` is in input
 // order, keys are concatenated with SearchHits-style ends. Records the plane cannot hold come
@@ -90,8 +92,8 @@ typically rerank the returned hits against exact vectors. `'int16'` maps to `max
 instead: ~256× finer, about 0.003% per element. Whether that is close enough to drop the
 rerank is a question about your corpus and your accuracy budget, and this package cannot
 answer it for you — validate it against your own data before turning a rerank off. It costs
-one more byte per dimension per slot — +18% at 128 dims (704 → 832 B), +73% at 1536
-(2112 → 3648 B) — so it suits small-to-mid dimensionality, while int8 stays the right choice
+one more byte per dimension per slot — at cap 32, +40% at 128 dims (320 → 448 B), +89% at
+1536 (1728 → 3264 B) — so it suits small-to-mid dimensionality, while int8 stays the right choice
 for wide embeddings, where doubling the bytes each traversal scans pushes search into the
 memory-bound regime. The choice is fixed at create and cannot be changed without a rebuild.
 Int16 planes carry a newer format version, so an older build of this package refuses to open
@@ -108,7 +110,7 @@ Full API in [index.d.ts](index.d.ts).
 
 ## Benchmarks
 
-`cargo run --release --bin bench -- 1000000 768 100 512 /tmp/bench.hnsw 128 8` builds a 1M ×
+`cargo run --release --bin bench -- 1000000 768 100 512 /tmp/bench.hnsw 32 8` builds a 1M ×
 768-d graph on a calibrated Gaussian-mixture corpus, reports p50/p95/p99, per-visit cost,
 brute-force recall\@10, and a concurrent-throughput pass. A ninth argument selects the
 storage precision (`int8`, `int16`, or `both` to build and measure one plane of each), and

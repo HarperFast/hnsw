@@ -24,9 +24,17 @@ export declare class Plane {
 	 * per node (default max(128, 4 × keyCap), at least 64; sparse, so size it for the keys that will
 	 * spill). Searches return the keys, so a hit resolves without a lookup by node id.
 	 *
+	 * `layer0Cap` is the layer-0 neighbour capacity per slot and the slot's dominant field at
+	 * low dimensionality (128 B of a 320 B slot at 128-d int8; 512 B of 704 B at cap 128). 32,
+	 * i.e. 2M for M 16, is the recommended value: a 4x larger cap holds a tail that ~90% of
+	 * nodes never reach (they use at most ~50), and a plane that outgrows the page cache pays for every byte of it in
+	 * page faults. The cost is recall at low ef — measured at 4M × 128-d, cap 32 trails cap 128
+	 * by ~2 points of recall@10 at ef ≤ 256, 1.3 at ef 512 and 0.4 at ef 1024 — so a resident,
+	 * recall-sensitive index at low ef may prefer 64 (DESIGN.md §10 has the tables).
+	 *
 	 * `precision` fixes the stored element width for the life of the file. 'int8' (the default)
 	 * quantizes each component to max|c|/127; 'int16' to max|c|/32767 — ~256× finer, at one more
-	 * byte per dimension per slot (+18% at 128 dims, +73% at 1536). Whether that is close
+	 * byte per dimension per slot (at cap 32: +40% at 128 dims, +89% at 1536). Whether that is close
 	 * enough to rank without reranking hits against exact distances depends on your corpus and
 	 * accuracy budget — validate it against your own data. int8 stays the right choice for wide
 	 * embeddings, where the doubled scan bandwidth makes traversal memory-bound.
