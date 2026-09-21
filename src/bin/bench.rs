@@ -167,8 +167,7 @@ impl Source {
     }
 }
 
-/// A supplied argument must parse: a typo like `64x` is an error, never a silent default, so a
-/// published number is always labelled with the cap it was actually measured at.
+/// A supplied argument that does not parse is an error, never the default.
 fn arg_or<T: std::str::FromStr>(args: &[String], index: usize, name: &str, default: T) -> T {
     match args.get(index) {
         None => default,
@@ -323,24 +322,30 @@ fn run(
             n as f64 / build.as_secs_f64()
         );
         graph.file.msync().expect("msync");
+        // a truth file from the plane this build replaced answers for different base data
+        drop_truth_caches(&path);
         std::fs::write(&sidecar, &corpus_id).expect("write corpus sidecar");
     }
 
-    degree_report(&graph, n);
-
     // Query with held-out vectors; measure latency and set-recall@10 vs brute-force truth
     // (same asymmetric metric, so recall isolates graph quality, not quantization).
-    let qs: Vec<Query> = (0..queries).map(|i| Query::for_plane(&graph.file, corpus.query_row(i, &mut rng))).collect();
-    // HNSW_BENCH_NO_RECALL=1 skips the brute-force truth pass: under a page-cache limit it is
-    // 200 full scans of the plane, hours of refaults before the first timed query
+    let rows: Vec<Vec<f32>> = (0..queries).map(|i| corpus.query_row(i, &mut rng)).collect();
+    // HNSW_BENCH_NO_RECALL=1 skips the brute-force truth pass entirely; otherwise the truth is
+    // cached beside the plane, keyed by node count and the query vectors themselves, so an ef
+    // sweep or a run under a page-cache limit does not rescan the whole plane once per query
+    let truth_path = PathBuf::from(format!("{}.truth-{n}n-{:016x}", path.display(), query_hash(&rows)));
+    let qs: Vec<Query> = rows.into_iter().map(|row| Query::for_plane(&graph.file, row)).collect();
     let truths: Vec<Vec<u32>> = if std::env::var_os("HNSW_BENCH_NO_RECALL").is_some() {
         qs.iter().map(|_| Vec::new()).collect()
+    } else if let Some(cached) = std::fs::read(&truth_path).ok().filter(|bytes| reuse && bytes.len() == queries * 40) {
+        println!("reusing brute-force truth at {}", truth_path.display());
+        cached.chunks(40).map(|q| q.chunks(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect()).collect()
     } else {
         // brute-force truth is O(n x queries); spread it over the machine so an 8M plane does not
         // spend longer on truth than on the build it measures. Bounded top-10 running insert per
         // query (not collect-all-then-sort), so no query keeps an n-entry buffer resident.
         let truth_threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1).min(queries.max(1));
-        std::thread::scope(|s| {
+        let truths: Vec<Vec<u32>> = std::thread::scope(|s| {
             let chunk = qs.len().div_ceil(truth_threads).max(1);
             let handles: Vec<_> = qs
                 .chunks(chunk)
@@ -365,7 +370,12 @@ fn run(
                 })
                 .collect();
             handles.into_iter().flat_map(|h| h.join().expect("truth thread")).collect()
-        })
+        });
+        let bytes: Vec<u8> = truths.iter().flat_map(|q| q.iter().flat_map(|id| id.to_le_bytes())).collect();
+        if let Err(error) = std::fs::write(&truth_path, bytes) {
+            eprintln!("could not write the truth cache {}: {error}", truth_path.display());
+        }
+        truths
     };
     let mut dump = std::env::var("HNSW_BENCH_DUMP").ok().map(|p| {
         std::io::BufWriter::new(std::fs::File::create(&p).expect("create HNSW_BENCH_DUMP"))
@@ -423,6 +433,9 @@ fn run(
     }
 
     drop(dump);
+    // after the timed passes: the scan touches every slot, which would warm a plane that the
+    // memory-limited measurement wants cold
+    degree_report(&graph, n);
 
     if threads > 0 {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -627,8 +640,27 @@ fn kernel_bench() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Layer-0 degree distribution over every live node: how much of the slot's neighbour array a
-/// corpus like this one actually fills at the chosen cap.
+/// FNV-1a over the queries' bytes: the truth cache identity.
+fn query_hash(rows: &[Vec<f32>]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in rows.iter().flatten().flat_map(|v| v.to_le_bytes()) {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+fn drop_truth_caches(plane: &std::path::Path) {
+    let Some(name) = plane.file_name().and_then(|f| f.to_str()) else { return };
+    let prefix = format!("{name}.truth-");
+    let dir = plane.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        if entry.file_name().to_str().is_some_and(|f| f.starts_with(&prefix)) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 fn degree_report(graph: &Graph, n: u64) {
     let mut degrees: Vec<u32> = Vec::with_capacity(n as usize);
     let mut buf = Vec::new();

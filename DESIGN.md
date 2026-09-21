@@ -164,7 +164,7 @@ verdict and the returned key always describe the same record.
 = 128, with transient overshoot to 160 before pruning. The slot reserves the cap, and the cap is
 a header field: revising it is a rebuild, not a format change. **The cap is 32** (`M<<1`, the
 traditional HNSW value) — the neighbour array is the slot's dominant field at low dimensionality
-(512 of 704 B at cap 128 for 128-d int8) and ~90% of nodes never use more than 48 of the 128;
+(512 of 704 B at cap 128 for 128-d int8) and ~90% of nodes use at most ~50 of the 128;
 measurements and the decision record are in §10.
 
 ## 5. Concurrency
@@ -478,8 +478,9 @@ p50 7.2 ms / recall@10-set 0.997 @ ef 512). Acceptance for phase 1:
 1. **Parity:** native search over a dual-written graph returns identical candidate sets to the
    JS path at equal ef (modulo seqlock-retry races under concurrent write load — measured as a
    bounded divergence rate, not exact equality under churn).
-2. **Recall:** cap 32/48/64 vs cap 128 measured at 1M (this crate) and 4M (harper, issue #7);
-   results in §10 — cap 32 is the decided value.
+2. **Recall:** cap 32/48/64 vs cap 128 measured at 1M and 4M (§10). The ≤ 0.5 pt bar holds for
+   cap 64 from ef 128 up and for cap 32 from ef 1024 up; below that cap 32 costs 1–2 pts at 4M.
+   Cap 32 was chosen anyway, for the not-resident regime (owner's call, §10).
 3. **Latency:** ≥8× p50 improvement at 5M/ef 512 (22.2 ms → ≤2.8 ms), p99 within 2× p50 under
    concurrent insert load (the metric that motivates off-loop execution).
 4. **Crash:** kill -9 during sustained ingest → reopen → watermark replay → graph passes
@@ -514,14 +515,50 @@ still fault in, and the resident working set is what sets tail latency once a pl
   −22%, build +10% faster, unloaded p50/p95/p99 4.3/4.9/5.8 vs 5.0/6.0/7.5 ms, recall 99.95% vs
   100.00% at ef 1024 and 92.8% vs 95.5% at ef 80. The large lists buy graph quality only at an ef
   far below the operating point.
-- **4M × 128-d int8, this crate, resident and not** — see `## 4M before/after` below.
+- **4M × 128-d int8, this crate's insert path, same corpus, 1 000 queries** (2026-09-21).
+  Recall@10 / p50 ms, both planes fully resident (30 GB box, no limit):
+
+  | cap | slot | allocated B/node | ef 64 | ef 128 | ef 256 | ef 512 | ef 1024 | ef 2048 |
+  |---|---|---|---|---|---|---|---|---|
+  | 128 | 704 B | 836 | 0.9792 / 0.196 | 0.9895 / 0.227 | 0.9975 / 0.276 | 0.9985 / 0.398 | 0.9995 / 1.269 | 0.9995 / 2.811 |
+  | 64 | 448 B | 587 | 0.9748 / 0.197 | 0.9842 / 0.228 | 0.9962 / 0.276 | 0.9972 / 0.398 | 0.9992 / 1.226 | 0.9992 / 2.699 |
+  | **32** | **320 B** | **452** | 0.9616 / 0.184 | 0.9677 / 0.216 | 0.9759 / 0.260 | 0.9860 / 0.364 | 0.9952 / 1.018 | 0.9967 / 2.245 |
+
+  At 4M the cap-32 recall cost is larger than at 1M: −2.2 pts at ef 128–256, −1.3 at ef 512,
+  −0.4 at ef 1024 (harper's auto ef at this size) and −0.3 at ef 2048, where cap 32 is also
+  20% faster per query. Cap 64 stays within 0.5 pt from ef 128 up. At matched *recall* with
+  everything resident, cap 128 wins (0.9985 at ef 512 in 0.40 ms vs cap 32's 0.9967 at ef 2048
+  in 2.25 ms); the smaller cap earns its keep where the plane is not resident:
+
+  **Not resident.** Same planes, page cache evicted (`fadvise(DONTNEED)`), searched inside a
+  cgroup with `MemoryMax` (swap off), kernel prefetch (§7) on; p50 / p95 / p99 ms and major
+  page faults per query over the 1 000 queries after one warm-up pass of the same queries, so
+  what is resident is the query working set, not a scan. Recall is the same as above (it does
+  not depend on memory). Allocated: cap 128 3.34 GB, cap 64 2.35 GB, cap 32 1.81 GB.
+
+  | limit | cap | ef 128 | faults | ef 512 | faults | ef 1024 | faults |
+  |---|---|---|---|---|---|---|---|
+  | 2 GB | 128 | 0.22 / 0.27 / 0.35 | 0 | 22.4 / 33.4 / 51.0 | 184 | 67.7 / 145 / 283 | 179 |
+  | 2 GB | 64 | 0.23 / 0.27 / 0.37 | 0 | 0.39 / 0.48 / 0.69 | 0 | 1.22 / 1.38 / 1.49 | 0 |
+  | 2 GB | **32** | 0.21 / 0.25 / 0.31 | 0 | 0.35 / 0.43 / 0.75 | 0 | 0.98 / 1.13 / 1.36 | 0 |
+  | 768 MB | 128 | 32.8 / 39.5 / 45.1 | 301 | 47.0 / 90.2 / 104 | 363 | 121 / 166 / 193 | 495 |
+  | 768 MB | 64 | 27.8 / 62.7 / 69.6 | 238 | 33.1 / 42.4 / 51.2 | 280 | 92.0 / 105 / 114 | 382 |
+  | 768 MB | **32** | 17.8 / 22.9 / 27.4 | 145 | 29.0 / 74.9 / 91.2 | 191 | 88.7 / 135 / 197 | 254 |
+
+  At 2 GB the cap-128 plane's query working set fits at ef 128 and stops fitting from ef 512
+  (180 I/O faults, p50 22–68 ms per query) while the cap-64 and cap-32 planes stay resident at
+  their unconstrained latencies through ef 1024. When nothing fits (768 MB) the smaller slot
+  still faults proportionally less: cap 32 is 1.4–1.8x faster than cap 128 at p50 at every
+  ef, with the kernel prefetch taking the serial-fault multiplier out of both; the tails are
+  closer (ef 512 p95 74.9 vs 90.2 ms, ef 1024 p99 197 vs 193 ms), so the smaller cap buys
+  the median and the fault count, not a p99 guarantee, once nothing fits. This is the
+  regime the issue's ladder crossed between 4M and 8M; a smaller slot moves the crossing out
+  by the same factor.
 - Rejected: **two-tier storage** (inline ~48 ids + an overflow record for the tail; same 384-B
   slot with the graph unchanged) — not worth its format and concurrency surface against a cap
   that measures as the best trade generally; and **3-byte ids** (saves 25% of the array, caps a
   plane at 2^24 nodes). The cap remains a create parameter; a host with a corpus where the ef-80
   gap matters raises it and pays the bytes.
-
-4M_PLACEHOLDER
 
 Decided (Kris, 2026-08-31):
 
