@@ -4,16 +4,19 @@
 //! txnlog-anchored replay live in the host application.
 
 use crate::distance::Query;
-use crate::insert::{insert_with_key, InsertError, InsertParams};
+use crate::insert::{insert_batch, insert_with_key, InsertError, InsertParams};
 use crate::search::{gather_keys, search_filtered, search_predicated, PredicatePipe, PredicatedHits, SearchScratch};
 use crate::graph::{KeyError, WriteError};
 use crate::format::Quant;
 use crate::{Graph, PlaneFile};
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode};
-use napi::{JsFunction, JsUnknown, NapiValue};
+use napi::{JsDeferred, JsFunction, JsObject, JsUnknown, NapiValue};
 use napi_derive::napi;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Pooled per-query scratch (the visited array is O(nodes); never allocate per query).
 struct ScratchPool(Mutex<Vec<SearchScratch>>);
@@ -124,6 +127,34 @@ fn check_key(graph: &Graph, key: &[u8]) -> Result<()> {
             graph.file.key_cap
         )),
     })
+}
+
+fn insert_error(error: InsertError, graph: &Graph, vector_len: usize, key_len: usize) -> Error {
+    Error::from_reason(match error {
+        InsertError::Full => "plane is full (maxNodes reached)".to_string(),
+        InsertError::Wedged => "plane slot lock is wedged (unreclaimable holder); rebuild the index".to_string(),
+        InsertError::KeyArenaFull => "plane key arena is full; rebuild the index".to_string(),
+        InsertError::DimensionMismatch => {
+            format!("vector has {} dims; plane was created with {}", vector_len, graph.file.dims())
+        }
+        InsertError::KeyUnstorable => format!(
+            "key of {} bytes cannot be stored (plane keyCap = {}, max 65535)",
+            key_len, graph.file.key_cap
+        ),
+        InsertError::NotFinite => "vector has a component that is not finite".to_string(),
+    })
+}
+
+fn not_finite_error(vector: &[f32]) -> Error {
+    let at = vector.iter().position(|v| !v.is_finite()).unwrap_or(0);
+    Error::from_reason(format!("vector component {at} is not finite"))
+}
+
+fn record_error(error: InsertError, graph: &Graph, vector: &[f32], key: &[u8]) -> Error {
+    match error {
+        InsertError::NotFinite => not_finite_error(vector),
+        other => insert_error(other, graph, vector.len(), key.len()),
+    }
 }
 
 fn write_error(error: WriteError) -> Error {
@@ -247,6 +278,172 @@ impl Task for PredicateSearchTask {
     }
 }
 
+/// One record a batch skipped: its position in the batch, the stable fault `code`
+/// (`InsertError::code`), and the message the single `insert` would have thrown.
+#[napi(object)]
+pub struct BatchRejection {
+    pub index: u32,
+    pub code: String,
+    pub reason: String,
+}
+
+#[napi(object)]
+pub struct BatchFailureInfo {
+    pub index: u32,
+    pub code: String,
+    pub reason: String,
+}
+
+/// `failure` set means a plane fault stopped the batch; index.js turns that into a rejection
+/// that still carries `ids` and `rejected`, which is why it is a field rather than an Err.
+#[napi(object)]
+pub struct InsertBatchResult {
+    pub ids: Uint32Array,
+    pub rejected: Vec<BatchRejection>,
+    pub failure: Option<BatchFailureInfo>,
+}
+
+struct PooledScratches {
+    pool: Arc<ScratchPool>,
+    scratches: Vec<SearchScratch>,
+}
+
+impl PooledScratches {
+    fn take(pool: &Arc<ScratchPool>, n: usize) -> Self {
+        PooledScratches { pool: pool.clone(), scratches: (0..n).map(|_| pool.take()).collect() }
+    }
+}
+
+impl Drop for PooledScratches {
+    fn drop(&mut self) {
+        for scratch in self.scratches.drain(..) {
+            self.pool.put(scratch);
+        }
+    }
+}
+
+type BatchResolver = Box<dyn FnOnce(Env) -> Result<InsertBatchResult> + Send + 'static>;
+type BatchDeferred = JsDeferred<InsertBatchResult, BatchResolver>;
+
+/// One queued batch: inputs copied out of the JS buffers, so the worker threads never touch
+/// V8 memory, plus the promise to settle.
+struct BatchJob {
+    graph: Arc<Graph>,
+    pool: Arc<ScratchPool>,
+    params: InsertParams,
+    vectors: Vec<f32>,
+    keys: Vec<u8>,
+    key_ends: Vec<u32>,
+    threads: usize,
+    deferred: BatchDeferred,
+}
+
+impl BatchJob {
+    fn settle(self) {
+        let BatchJob { graph, pool, params, vectors, keys, key_ends, threads, deferred } = self;
+        let run = || run_batch(&graph, &pool, &params, &vectors, &keys, &key_ends, threads);
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+            Ok(result) => deferred.resolve(Box::new(move |_env| Ok(result))),
+            Err(_) => deferred.reject(Error::from_reason("insertBatch panicked; the plane may be inconsistent")),
+        }
+    }
+}
+
+/// The plane's batch thread: it runs jobs in order, exits once the queue has been idle for a
+/// while (a plane that bulk-loaded once does not keep a thread for its lifetime), and is joined
+/// at env teardown so no batch is still writing, or settling a promise, into a torn-down env.
+struct BatchWorker {
+    sender: Sender<BatchJob>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+type BatchWorkerSlot = Arc<Mutex<Option<BatchWorker>>>;
+
+const BATCH_THREAD_IDLE: Duration = Duration::from_secs(5);
+
+fn batch_worker_loop(jobs: Receiver<BatchJob>, slot: BatchWorkerSlot) {
+    loop {
+        match jobs.recv_timeout(BATCH_THREAD_IDLE) {
+            Ok(job) => job.settle(),
+            Err(RecvTimeoutError::Disconnected) => return,
+            Err(RecvTimeoutError::Timeout) => {
+                // retire under the slot lock, where senders enqueue, so a job sent while the
+                // thread decides cannot land in a queue nobody reads
+                let mut worker = slot.lock().unwrap_or_else(|p| p.into_inner());
+                match jobs.try_recv() {
+                    Ok(job) => {
+                        drop(worker);
+                        job.settle();
+                    }
+                    Err(_) => {
+                        *worker = None;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn join_batch_worker(slot: BatchWorkerSlot) {
+    let worker = slot.lock().unwrap_or_else(|p| p.into_inner()).take();
+    if let Some(BatchWorker { sender, handle }) = worker {
+        drop(sender);
+        let _ = handle.join();
+    }
+}
+
+fn run_batch(
+    graph: &Graph,
+    pool: &Arc<ScratchPool>,
+    params: &InsertParams,
+    vectors: &[f32],
+    keys: &[u8],
+    key_ends: &[u32],
+    threads: usize,
+) -> InsertBatchResult {
+    let dims = graph.file.dims();
+    let count = vectors.len() / dims;
+    let records: Vec<(&[f32], &[u8])> = (0..count)
+        .map(|i| {
+            let key = if key_ends.is_empty() {
+                &keys[..0]
+            } else {
+                let start = if i == 0 { 0 } else { key_ends[i - 1] as usize };
+                &keys[start..key_ends[i] as usize]
+            };
+            (&vectors[i * dims..(i + 1) * dims], key)
+        })
+        .collect();
+    let mut scratches = PooledScratches::take(pool, threads.min(count.max(1)));
+    let (outcome, failure) = match insert_batch(graph, params, &records, &mut scratches.scratches) {
+        Ok(outcome) => (outcome, None),
+        Err(failure) => {
+            let (vector, key) = records[failure.index];
+            let info = BatchFailureInfo {
+                index: failure.index as u32,
+                code: failure.error.code().to_string(),
+                reason: record_error(failure.error, graph, vector, key).reason,
+            };
+            (failure.outcome, Some(info))
+        }
+    };
+    drop(scratches);
+    let rejected = outcome
+        .rejected
+        .into_iter()
+        .map(|(index, error)| {
+            let (vector, key) = records[index];
+            BatchRejection {
+                index: index as u32,
+                code: error.code().to_string(),
+                reason: record_error(error, graph, vector, key).reason,
+            }
+        })
+        .collect();
+    InsertBatchResult { ids: Uint32Array::new(outcome.ids), rejected, failure }
+}
+
 pub struct FlushTask {
     graph: Arc<Graph>,
     txn: Option<u64>,
@@ -271,9 +468,12 @@ pub struct Plane {
     graph: Arc<Graph>,
     pool: Arc<ScratchPool>,
     params: InsertParams,
-    // insert scratch, serialized: phase-1 hosts call insert from a single writer at a time
-    // per index (Harper's commit path); a Mutex keeps misuse safe rather than fast.
+    // scratch for the synchronous insert; the Mutex keeps a misuse safe rather than fast.
+    // Concurrent mutation is otherwise the crate's per-slot contract (DESIGN.md §5): a batch's
+    // workers run alongside insert/remove/writeNodeRaw calls, as multi-worker hosts already do.
     insert_scratch: Mutex<SearchScratch>,
+    batch_worker: BatchWorkerSlot,
+    batch_cleanup_hooked: AtomicBool,
 }
 
 #[napi]
@@ -327,7 +527,39 @@ impl Plane {
             pool: Arc::new(ScratchPool(Mutex::new(Vec::new()))),
             params: InsertParams::default(),
             insert_scratch: Mutex::new(SearchScratch::new()),
+            batch_worker: Arc::new(Mutex::new(None)),
+            batch_cleanup_hooked: AtomicBool::new(false),
         }
+    }
+
+    fn enqueue_batch(&self, env: &mut Env, job: BatchJob) -> std::result::Result<(), (BatchDeferred, Error)> {
+        if !self.batch_cleanup_hooked.swap(true, Ordering::AcqRel) {
+            let slot = self.batch_worker.clone();
+            if let Err(error) = env.add_env_cleanup_hook(slot, join_batch_worker) {
+                self.batch_cleanup_hooked.store(false, Ordering::Release);
+                return Err((job.deferred, error));
+            }
+        }
+        let mut worker = self.batch_worker.lock().unwrap_or_else(|p| p.into_inner());
+        if worker.is_none() {
+            let (sender, jobs) = channel::<BatchJob>();
+            let slot = self.batch_worker.clone();
+            let spawned = std::thread::Builder::new()
+                .name("hnsw-insert-batch".into())
+                .spawn(move || batch_worker_loop(jobs, slot));
+            match spawned {
+                Ok(handle) => *worker = Some(BatchWorker { sender, handle }),
+                Err(error) => {
+                    return Err((job.deferred, Error::from_reason(format!("could not start the batch thread: {error}"))))
+                }
+            }
+        }
+        worker
+            .as_ref()
+            .expect("worker present")
+            .sender
+            .send(job)
+            .map_err(|failed| (failed.0.deferred, Error::from_reason("the batch thread is gone")))
     }
 
     /// Insert a vector; returns the allocated node id (freelist ids are reused). `key` is
@@ -343,30 +575,99 @@ impl Plane {
                 self.graph.file.dims()
             )));
         }
-        for (i, v) in vector.iter().enumerate() {
-            if !v.is_finite() {
-                // a NaN component yields a huge invMag and -inf distances: that node would
-                // rank first for roughly half of all queries, permanently
-                return Err(Error::from_reason(format!("vector component {i} is not finite")));
-            }
-        }
         let mut scratch = self.insert_scratch.lock().unwrap();
         let key = key.as_deref().unwrap_or(&[]);
-        insert_with_key(&self.graph, &vector, key, &self.params, &mut scratch).map_err(|e| match e {
-            InsertError::Full => Error::from_reason("plane is full (maxNodes reached)"),
-            InsertError::Wedged => Error::from_reason("plane slot lock is wedged (unreclaimable holder); rebuild the index"),
-            InsertError::KeyArenaFull => Error::from_reason("plane key arena is full; rebuild the index"),
-            InsertError::DimensionMismatch => Error::from_reason(format!(
-                "vector has {} dims; plane was created with {}",
-                vector.len(),
-                self.graph.file.dims()
-            )),
-            InsertError::KeyUnstorable => Error::from_reason(format!(
-                "key of {} bytes cannot be stored (plane keyCap = {}, max 65535)",
-                key.len(),
-                self.graph.file.key_cap
-            )),
-        })
+        insert_with_key(&self.graph, &vector, key, &self.params, &mut scratch)
+            .map_err(|e| record_error(e, &self.graph, &vector, key))
+    }
+
+    /// Insert a chunk of records in one crossing, fanned out across `threads` worker threads
+    /// inside the crate (default: hardware threads, at most 16; an explicit value is clamped to
+    /// 2x the hardware threads and to the record count). `vectors` is `count x dims`
+    /// row-major; `keys` and `keyEnds` (both or neither) split the concatenated key bytes as
+    /// `SearchHits` does. Resolves with every record's id in input order; a record the plane
+    /// cannot hold (non-finite component, unstorable key, key arena exhausted) is reported in
+    /// `rejected` with 0xFFFFFFFF in its slot and the rest of the batch lands. A plane fault
+    /// (full, wedged) stops the batch once in-flight inserts finish and sets `failure`, which
+    /// index.js turns into a rejection still carrying `ids` and `rejected`. Batches on one
+    /// plane run in order on one worker thread that retires when idle; malformed inputs reject
+    /// the promise. Working memory is `threads x 4 B x idHighWater` of visited-set scratch,
+    /// retained in the plane's scratch pool afterwards; the count is per plane, so a host
+    /// loading several planes at once divides its cores between them.
+    ///
+    /// A queued or in-flight batch is not covered by `flush`'s durability promise until its
+    /// promise settles: `await` every outstanding `insertBatch` before advancing the watermark,
+    /// or the watermark can land over records that have not been inserted yet.
+    #[napi(ts_return_type = "Promise<InsertBatchResult>")]
+    pub fn insert_batch(
+        &self,
+        env: Env,
+        vectors: Float32Array,
+        keys: Option<Buffer>,
+        key_ends: Option<Uint32Array>,
+        threads: Option<u32>,
+    ) -> Result<JsObject> {
+        let mut env = env;
+        let (deferred, promise) = env.create_deferred::<InsertBatchResult, BatchResolver>()?;
+        match self.queue_batch(&mut env, vectors, keys, key_ends, threads, deferred) {
+            Ok(()) => {}
+            Err((deferred, error)) => deferred.reject(error),
+        }
+        Ok(promise)
+    }
+
+    fn queue_batch(
+        &self,
+        env: &mut Env,
+        vectors: Float32Array,
+        keys: Option<Buffer>,
+        key_ends: Option<Uint32Array>,
+        threads: Option<u32>,
+        deferred: BatchDeferred,
+    ) -> std::result::Result<(), (BatchDeferred, Error)> {
+        let dims = self.graph.file.dims();
+        if !vectors.len().is_multiple_of(dims) {
+            let reason = format!("batch has {} floats, not a multiple of the plane's {} dims", vectors.len(), dims);
+            return Err((deferred, Error::from_reason(reason)));
+        }
+        let count = vectors.len() / dims;
+        let (keys, key_ends) = match (keys, key_ends) {
+            (None, None) => (Vec::new(), Vec::new()),
+            (Some(keys), Some(ends)) => {
+                if ends.len() != count {
+                    let reason = format!("keyEnds has {} entries for {} records", ends.len(), count);
+                    return Err((deferred, Error::from_reason(reason)));
+                }
+                let mut previous = 0u32;
+                for &end in ends.iter() {
+                    if end < previous || end as usize > keys.len() {
+                        return Err((deferred, Error::from_reason("keyEnds must be non-decreasing and end within keys")));
+                    }
+                    previous = end;
+                }
+                if previous as usize != keys.len() {
+                    return Err((deferred, Error::from_reason("the last keyEnd must equal keys.length")));
+                }
+                (keys.to_vec(), ends.to_vec())
+            }
+            _ => return Err((deferred, Error::from_reason("keys and keyEnds must be given together"))),
+        };
+        let hardware = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
+        let threads = match threads {
+            None | Some(0) => hardware.min(16),
+            Some(t) => (t as usize).min(hardware * 2),
+        };
+        let job = BatchJob {
+            graph: self.graph.clone(),
+            pool: self.pool.clone(),
+            params: self.params,
+            vectors: vectors.to_vec(),
+            keys,
+            key_ends,
+            threads,
+            deferred,
+        };
+        self.enqueue_batch(env, job)
     }
 
     /// Delete a node; its id returns to the plane freelist. Standalone-allocation mode only
@@ -672,7 +973,9 @@ impl Plane {
     /// Durability barrier: flush all data, then advance the watermark (defaults to the
     /// current one) and the clean-shutdown flag, then flush the header alone — so a crash
     /// between the flushes can only leave an OLD watermark over durable data (replay
-    /// re-covers a suffix), never a new watermark over missing data.
+    /// re-covers a suffix), never a new watermark over missing data. That promise assumes
+    /// the watermark you pass already landed: `await` every outstanding `insertBatch` first,
+    /// or a queued batch not yet applied is exactly a new watermark over missing data.
     #[napi]
     pub fn flush(&self, watermark: Option<f64>) -> Result<()> {
         self.graph.file.flush_with_watermark(watermark.map(|w| w as u64)).map_err(|e| Error::from_reason(e.to_string()))

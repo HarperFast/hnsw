@@ -2,19 +2,23 @@
 //! per-visit cost — the number that decides whether the native plane hits its 0.25–0.4 µs
 //! budget (JS baseline: 4.34 µs/visit at 5M/ef 512).
 //!
-//! Usage: bench [n=100000] [dims=768] [queries=200] [ef=512] [path=/tmp/bench.hnsw] [cap=128] [threads=0] [precision=int8|int16|both]
+//! Usage: bench [n=100000] [dims=768] [queries=200] [ef=512] [path=/tmp/bench.hnsw] [cap=128] [threads=0] [precision=int8|int16|both] [buildThreads=1]
 //! Env: HNSW_BENCH_FVECS=<dir> reads SIFT-style `sift_base.fvecs` / `sift_query.fvecs` from that
 //! directory (its dims must match the argument; n rows from base, queries from query) instead of the synthetic
-//! corpus, so a run matches the Harper-vs-pgvector benchmark's data. `ef` may be a comma list.
+//! corpus, so a run matches the Harper-vs-pgvector benchmark's data. HNSW_BENCH_F32=<file> reads a
+//! row-major float32 pool (the harper benchmarks' `--corpus` format): rows 0..n are indexed, the next
+//! `queries` rows are held out as queries. `ef` may be a comma list.
 //! threads > 0 adds a concurrent-throughput pass: T searcher threads (queries each) + one
 //! background writer inserting throughout, reporting aggregate QPS and per-thread p50/p99.
 //! `precision=both` builds and measures an int8 and an int16 plane over the same corpus.
+//! buildThreads > 1 builds through `insert_batch` in 4096-record chunks (Harper's chunk size)
+//! with that many workers per chunk, instead of the serial one-insert-at-a-time path.
 //! HNSW_BENCH_KERNELS=1 runs the kernel microbenchmark alone (no graph build).
 //! HNSW_BENCH_NO_RECALL=1 skips the brute-force recall truths (queries only; recall prints NaN).
 
 use hnsw_plane::distance::{quantize, Query};
 use hnsw_plane::format::Quant;
-use hnsw_plane::insert::{insert, insert_with_key, InsertParams};
+use hnsw_plane::insert::{insert, insert_batch, insert_with_key, InsertParams};
 use hnsw_plane::search::{search, SearchScratch};
 use hnsw_plane::{Graph, PlaneFile};
 use std::path::PathBuf;
@@ -115,9 +119,33 @@ fn read_fvecs(path: &std::path::Path, limit: usize) -> Vec<Vec<f32>> {
     rows
 }
 
+/// Row-major float32 pool (the harper benchmarks' `--corpus=<pool>.f32` format), memory-mapped so
+/// a multi-GB pool costs page cache rather than heap. Rows `0..n` are the base; queries are the
+/// rows after `n`, held out of the index.
+struct F32Pool {
+    map: memmap2::Mmap,
+    dims: usize,
+    n: usize,
+}
+
+impl F32Pool {
+    fn open(path: &std::path::Path, dims: usize, n: usize, queries: usize) -> Self {
+        let file = std::fs::File::open(path).expect("open f32 pool");
+        let map = unsafe { memmap2::Mmap::map(&file) }.expect("map f32 pool");
+        let rows = map.len() / (dims * 4);
+        assert!(rows >= n + queries, "f32 pool holds {rows} rows of {dims} dims; need n + queries = {}", n + queries);
+        F32Pool { map, dims, n }
+    }
+    fn row(&self, i: usize) -> Vec<f32> {
+        let start = i * self.dims * 4;
+        self.map[start..start + self.dims * 4].chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
+    }
+}
+
 enum Source {
     Synthetic(Corpus),
     Fvecs { base: Vec<Vec<f32>>, query: Vec<Vec<f32>> },
+    F32(F32Pool),
 }
 
 impl Source {
@@ -125,12 +153,14 @@ impl Source {
         match self {
             Source::Synthetic(c) => c.row(rng),
             Source::Fvecs { base, .. } => base[i].clone(),
+            Source::F32(pool) => pool.row(i),
         }
     }
     fn query_row(&self, i: usize, rng: &mut Rng) -> Vec<f32> {
         match self {
             Source::Synthetic(c) => c.row(rng),
             Source::Fvecs { query, .. } => query[i % query.len()].clone(),
+            Source::F32(pool) => pool.row(pool.n + i),
         }
     }
 }
@@ -157,23 +187,37 @@ fn main() {
         "both" => vec![Quant::Int8, Quant::Int16],
         other => panic!("precision must be int8, int16 or both (got {other})"),
     };
+    let build_threads: usize = args.get(9).and_then(|a| a.parse().ok()).unwrap_or(1).max(1);
     kernel_bench();
     for quant in quants {
         // per-precision path so `both` does not rebuild over the other width's file
         let plane_path = PathBuf::from(format!("{}.{}", path.display(), quant.name()));
-        run(n, dims, queries, &efs, &plane_path, layer0_cap, threads, quant);
+        run(n, dims, queries, &efs, &plane_path, layer0_cap, threads, quant, build_threads);
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run(n: u64, dims: usize, queries: usize, efs: &[usize], path: &std::path::Path, layer0_cap: usize, threads: usize, quant: Quant) {
+fn run(
+    n: u64,
+    dims: usize,
+    queries: usize,
+    efs: &[usize],
+    path: &std::path::Path,
+    layer0_cap: usize,
+    threads: usize,
+    quant: Quant,
+    build_threads: usize,
+) {
     let path = path.to_path_buf();
     println!("\n=== precision {} ===", quant.name());
 
     // Reuse an existing plane file when it holds exactly n nodes at the same geometry from the
     // same corpus (a sidecar names the corpus): ef sweeps without rebuilding.
-    let corpus_id = std::env::var("HNSW_BENCH_FVECS").map(|d| format!("fvecs:{d}")).unwrap_or_else(|_| "synthetic".into());
-    let corpus_id = format!("{corpus_id}:{}", quant.name());
+    let corpus_id = std::env::var("HNSW_BENCH_FVECS")
+        .map(|d| format!("fvecs:{d}"))
+        .or_else(|_| std::env::var("HNSW_BENCH_F32").map(|f| format!("f32:{f}")))
+        .unwrap_or_else(|_| "synthetic".into());
+    let corpus_id = format!("{corpus_id}:{}:build{}", quant.name(), build_threads);
     let sidecar = path.with_extension("hnsw.corpus");
     let reuse = PlaneFile::open(&path)
         .ok()
@@ -200,6 +244,7 @@ fn run(n: u64, dims: usize, queries: usize, efs: &[usize], path: &std::path::Pat
     let mut scratch = SearchScratch::new();
     let mut rng = Rng(0x1234_5678_9abc_def0);
     let source = match std::env::var("HNSW_BENCH_FVECS") {
+        Ok(_) if std::env::var("HNSW_BENCH_F32").is_ok() => panic!("set HNSW_BENCH_FVECS or HNSW_BENCH_F32, not both"),
         Ok(dir) => {
             let dir = PathBuf::from(dir);
             let base = read_fvecs(&dir.join("sift_base.fvecs"), n as usize);
@@ -209,7 +254,14 @@ fn run(n: u64, dims: usize, queries: usize, efs: &[usize], path: &std::path::Pat
             println!("fvecs corpus: {} base rows, {} query rows", base.len(), query.len());
             Source::Fvecs { base, query }
         }
-        Err(_) => Source::Synthetic(Corpus::new(n, dims, &mut rng)),
+        Err(_) => match std::env::var("HNSW_BENCH_F32") {
+            Ok(file) => {
+                let pool = F32Pool::open(std::path::Path::new(&file), dims, n as usize, queries);
+                println!("f32 pool: {} rows indexed, {} held-out queries", n, queries);
+                Source::F32(pool)
+            }
+            Err(_) => Source::Synthetic(Corpus::new(n, dims, &mut rng)),
+        },
     };
     let corpus = &source;
 
@@ -221,16 +273,44 @@ fn run(n: u64, dims: usize, queries: usize, efs: &[usize], path: &std::path::Pat
         }
     } else {
         let build_start = Instant::now();
-        for i in 0..n {
-            let v = corpus.base_row(i as usize, &mut rng);
-            insert_with_key(&graph, &v, &i.to_le_bytes(), &params, &mut scratch).expect("build insert");
-            if (i + 1) % 50_000 == 0 {
-                let rate = (i + 1) as f64 / build_start.elapsed().as_secs_f64();
-                println!("  built {} ({:.0} inserts/s)", i + 1, rate);
+        let progress = |built: u64| {
+            if built.is_multiple_of(50_000) {
+                println!("  built {} ({:.0} inserts/s)", built, built as f64 / build_start.elapsed().as_secs_f64());
+            }
+        };
+        if build_threads > 1 {
+            let mut scratches: Vec<SearchScratch> = (0..build_threads).map(|_| SearchScratch::new()).collect();
+            let chunk = 4096u64;
+            let mut start = 0u64;
+            while start < n {
+                let end = (start + chunk).min(n);
+                let vectors: Vec<Vec<f32>> = (start..end).map(|i| corpus.base_row(i as usize, &mut rng)).collect();
+                let keys: Vec<[u8; 8]> = (start..end).map(|i| i.to_le_bytes()).collect();
+                let records: Vec<(&[f32], &[u8])> =
+                    vectors.iter().zip(&keys).map(|(v, k)| (v.as_slice(), k.as_slice())).collect();
+                let outcome = insert_batch(&graph, &params, &records, &mut scratches)
+                    .unwrap_or_else(|f| panic!("batch failed at record {}: {:?}", start + f.index as u64, f.error));
+                assert!(outcome.rejected.is_empty(), "rejected records: {:?}", outcome.rejected);
+                for built in (start + 1..=end).filter(|b| b % 50_000 == 0) {
+                    progress(built);
+                }
+                start = end;
+            }
+        } else {
+            for i in 0..n {
+                let v = corpus.base_row(i as usize, &mut rng);
+                insert_with_key(&graph, &v, &i.to_le_bytes(), &params, &mut scratch).expect("build insert");
+                progress(i + 1);
             }
         }
         let build = build_start.elapsed();
-        println!("build: {:.1}s ({:.0} inserts/s)", build.as_secs_f64(), n as f64 / build.as_secs_f64());
+        println!(
+            "build ({} thread{}): {:.1}s ({:.0} inserts/s)",
+            build_threads,
+            if build_threads == 1 { "" } else { "s" },
+            build.as_secs_f64(),
+            n as f64 / build.as_secs_f64()
+        );
         graph.file.msync().expect("msync");
         std::fs::write(&sidecar, &corpus_id).expect("write corpus sidecar");
     }
@@ -240,19 +320,39 @@ fn run(n: u64, dims: usize, queries: usize, efs: &[usize], path: &std::path::Pat
     let qs: Vec<Query> = (0..queries).map(|i| Query::for_plane(&graph.file, corpus.query_row(i, &mut rng))).collect();
     // HNSW_BENCH_NO_RECALL=1 skips the brute-force truth pass: under a page-cache limit it is
     // 200 full scans of the plane, hours of refaults before the first timed query
-    let truths: Vec<Vec<u32>> = qs
-        .iter()
-        .map(|q| {
-            if std::env::var_os("HNSW_BENCH_NO_RECALL").is_some() {
-                return Vec::new();
-            }
-            let mut truth: Vec<(u32, f32)> =
-                (0..n as u32).filter_map(|id| graph.distance_to(id, q).map(|d| (id, d))).collect();
-            truth.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-            truth.truncate(10);
-            truth.into_iter().map(|(id, _)| id).collect()
+    let truths: Vec<Vec<u32>> = if std::env::var_os("HNSW_BENCH_NO_RECALL").is_some() {
+        qs.iter().map(|_| Vec::new()).collect()
+    } else {
+        // brute-force truth is O(n x queries); spread it over the machine so an 8M plane does not
+        // spend longer on truth than on the build it measures
+        let truth_threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1).min(queries.max(1));
+        std::thread::scope(|s| {
+            let chunk = qs.len().div_ceil(truth_threads).max(1);
+            let handles: Vec<_> = qs
+                .chunks(chunk)
+                .map(|qs| {
+                    let graph = &graph;
+                    s.spawn(move || {
+                        qs.iter()
+                            .map(|q| {
+                                let mut top: Vec<(u32, f32)> = Vec::with_capacity(11);
+                                for id in 0..n as u32 {
+                                    let Some(d) = graph.distance_to(id, q) else { continue };
+                                    if top.len() < 10 || d < top[9].1 {
+                                        let at = top.partition_point(|&(_, td)| td <= d);
+                                        top.insert(at, (id, d));
+                                        top.truncate(10);
+                                    }
+                                }
+                                top.into_iter().map(|(id, _)| id).collect::<Vec<u32>>()
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles.into_iter().flat_map(|h| h.join().expect("truth thread")).collect()
         })
-        .collect();
+    };
     let mut ef = efs[0];
     for &ef_i in efs {
         ef = ef_i;

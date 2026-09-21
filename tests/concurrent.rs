@@ -4,7 +4,8 @@
 //! makes them bite.
 
 use hnsw_plane::distance::Query;
-use hnsw_plane::insert::{insert, InsertParams};
+use hnsw_plane::format::NO_ID;
+use hnsw_plane::insert::{insert, insert_batch, insert_with_key, InsertError, InsertParams};
 use hnsw_plane::search::{beam_descend, search, search_layer, SearchScratch, SearchStats, DESCENT_EF};
 use hnsw_plane::{Graph, PlaneFile};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -380,5 +381,253 @@ fn concurrent_insert_search_on_an_int16_plane() {
         }
     }
     assert_eq!(misses, 0, "every int16-stored vector must be findable as its own nearest neighbor");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Corpus rows as (vector, key = corpus index) records, so a hit names its row.
+fn batch_records(indices: &[u32], dims: usize) -> (Vec<Vec<f32>>, Vec<[u8; 4]>) {
+    let vectors: Vec<Vec<f32>> = indices.iter().map(|&i| vector_for(i, dims)).collect();
+    let keys: Vec<[u8; 4]> = indices.iter().map(|i| i.to_le_bytes()).collect();
+    (vectors, keys)
+}
+
+#[test]
+fn batch_insert_returns_ids_in_input_order_and_every_node_stays_reachable() {
+    let dims = 64;
+    let path = std::env::temp_dir().join(format!("hnsw-batch-{}.hnsw", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let graph = Graph::new(PlaneFile::create_with_keys(&path, dims, 32, 40_000, 8).expect("create"));
+    let params = InsertParams::default();
+    let mut scratches: Vec<SearchScratch> = (0..8).map(|_| SearchScratch::new()).collect();
+
+    let total = 8_000u32;
+    let chunk = 1_000usize;
+    let mut inserted: Vec<(u32, u32)> = Vec::with_capacity(total as usize);
+    for start in (0..total).step_by(chunk) {
+        let indices: Vec<u32> = (start..(start + chunk as u32).min(total)).collect();
+        let (vectors, keys) = batch_records(&indices, dims);
+        let records: Vec<(&[f32], &[u8])> = vectors.iter().zip(&keys).map(|(v, k)| (v.as_slice(), k.as_slice())).collect();
+        let outcome = insert_batch(&graph, &params, &records, &mut scratches).expect("batch insert");
+        assert_eq!(outcome.ids.len(), indices.len());
+        assert!(outcome.rejected.is_empty(), "unexpected rejections: {:?}", outcome.rejected);
+        inserted.extend(indices.iter().copied().zip(outcome.ids.iter().copied()));
+    }
+    assert_eq!(graph.file.id_high_water(), total as u64);
+    let mut ids: Vec<u32> = inserted.iter().map(|&(_, id)| id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), total as usize, "batch inserts must hand out distinct ids");
+
+    let mut scratch = SearchScratch::new();
+    let mut key = Vec::new();
+    let mut misses = 0;
+    for &(index, id) in inserted.iter().step_by(37) {
+        graph.key_into(id, &mut key).expect("live node");
+        assert_eq!(key, index.to_le_bytes(), "id {id} carries the wrong key");
+        let query = graph.query(vector_for(index, dims));
+        let (results, _) = search(&graph, &query, 10, 256, &mut scratch);
+        if !results.iter().any(|&(rid, _)| rid == id) {
+            misses += 1;
+        }
+    }
+    assert_eq!(misses, 0, "self-queries missing after a parallel batch build");
+    for id in (0..total).step_by(53) {
+        if let Some(n) = graph.read_node(id) {
+            assert!(n.neighbors.len() <= graph.file.layer0_cap);
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn batch_insert_reports_record_faults_by_index_and_inserts_the_rest() {
+    let dims = 16;
+    let path = std::env::temp_dir().join(format!("hnsw-batch-reject-{}.hnsw", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let graph = Graph::new(PlaneFile::create_with_keys(&path, dims, 16, 1_024, 8).expect("create"));
+    let params = InsertParams::default();
+    let mut scratches: Vec<SearchScratch> = (0..3).map(|_| SearchScratch::new()).collect();
+
+    let indices: Vec<u32> = (0..64).collect();
+    let (mut vectors, keys) = batch_records(&indices, dims);
+    vectors[5][3] = f32::NAN;
+    vectors[17][0] = f32::INFINITY;
+    let long_key = vec![b'k'; 70_000];
+    let short_vector = vec![1.0f32; dims - 1];
+    let mut records: Vec<(&[f32], &[u8])> = vectors.iter().zip(&keys).map(|(v, k)| (v.as_slice(), k.as_slice())).collect();
+    records[40].1 = &long_key;
+    records[41].0 = &short_vector;
+
+    let outcome = insert_batch(&graph, &params, &records, &mut scratches).expect("record faults do not fail the batch");
+    let mut rejected: Vec<(usize, InsertError)> = outcome.rejected.clone();
+    rejected.sort_by_key(|&(i, _)| i);
+    assert_eq!(
+        rejected,
+        vec![
+            (5, InsertError::NotFinite),
+            (17, InsertError::NotFinite),
+            (40, InsertError::KeyUnstorable),
+            (41, InsertError::DimensionMismatch),
+        ]
+    );
+    for (i, &id) in outcome.ids.iter().enumerate() {
+        let rejected_here = rejected.iter().any(|&(r, _)| r == i);
+        assert_eq!(id == NO_ID, rejected_here, "record {i}: id {id}");
+    }
+    assert_eq!(graph.file.id_high_water(), 60, "a rejected record must not consume an id");
+    let mut scratch = SearchScratch::new();
+    for (i, &id) in outcome.ids.iter().enumerate().filter(|(_, &id)| id != NO_ID) {
+        let (results, _) = search(&graph, &graph.query(vector_for(i as u32, dims)), 5, 64, &mut scratch);
+        assert!(results.iter().any(|&(rid, _)| rid == id), "record {i} (id {id}) unreachable");
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn batch_insert_fails_the_batch_when_the_plane_fills() {
+    let dims = 16;
+    let path = std::env::temp_dir().join(format!("hnsw-batch-full-{}.hnsw", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let capacity = 100u64;
+    let graph = Graph::new(PlaneFile::create_with_keys(&path, dims, 16, capacity, 8).expect("create"));
+    let params = InsertParams::default();
+    let mut scratches: Vec<SearchScratch> = (0..4).map(|_| SearchScratch::new()).collect();
+
+    let indices: Vec<u32> = (0..160).collect();
+    let (vectors, keys) = batch_records(&indices, dims);
+    let records: Vec<(&[f32], &[u8])> = vectors.iter().zip(&keys).map(|(v, k)| (v.as_slice(), k.as_slice())).collect();
+    let failure = insert_batch(&graph, &params, &records, &mut scratches).expect_err("the plane cannot hold 160 nodes");
+    assert_eq!(failure.error, InsertError::Full);
+    assert!(failure.index < records.len());
+    assert_eq!(failure.outcome.ids[failure.index], NO_ID, "the failing record did not land");
+    let landed: Vec<u32> = failure.outcome.ids.iter().copied().filter(|&id| id != NO_ID).collect();
+    assert_eq!(landed.len(), capacity as usize, "the outcome must name exactly the records that landed");
+    assert_eq!(graph.file.id_high_water(), capacity, "every slot was used before the batch failed");
+    let mut scratch = SearchScratch::new();
+    let mut live = 0;
+    for id in 0..capacity as u32 {
+        if let Some(node) = graph.read_node(id) {
+            live += 1;
+            assert!(node.neighbors.len() <= graph.file.layer0_cap);
+            let mut key = Vec::new();
+            graph.key_into(id, &mut key).expect("live node");
+            let index = u32::from_le_bytes(key[..4].try_into().unwrap());
+            let (results, _) = search(&graph, &graph.query(vector_for(index, dims)), 5, 64, &mut scratch);
+            assert!(results.iter().any(|&(rid, _)| rid == id), "node {id} landed but is unreachable");
+        }
+    }
+    assert_eq!(live, capacity, "every allocated slot must hold a finished node once the batch returns");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn batch_insert_rejects_overflow_keys_past_the_arena_and_lands_inline_ones() {
+    let dims = 16;
+    let path = std::env::temp_dir().join(format!("hnsw-batch-arena-{}.hnsw", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    // 256 nodes x 64 B = 16 KB of arena; a 500-byte key reserves a 512-byte class, so 32 fit.
+    // 8 workers over 200 records keep the arena contended through its tail: a record refused
+    // there must not have touched an edge (every landed node stays reachable) and must have
+    // freed its id (a later inline insert reuses one instead of growing the high water).
+    let graph = Graph::new(PlaneFile::create_with_key_arena(&path, dims, 16, 256, 8, 64).expect("create"));
+    let params = InsertParams::default();
+    let mut scratches: Vec<SearchScratch> = (0..8).map(|_| SearchScratch::new()).collect();
+
+    let indices: Vec<u32> = (0..200).collect();
+    let (vectors, _) = batch_records(&indices, dims);
+    let long_keys: Vec<Vec<u8>> = (0..200u32).map(|i| vec![(i % 251) as u8; 500]).collect();
+    let records: Vec<(&[f32], &[u8])> = vectors
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (v.as_slice(), if i % 2 == 0 { long_keys[i].as_slice() } else { &b"k"[..] }))
+        .collect();
+    let outcome = insert_batch(&graph, &params, &records, &mut scratches).expect("arena exhaustion does not fail the batch");
+    let rejected: Vec<(usize, InsertError)> = outcome.rejected.clone();
+    assert_eq!(rejected.len(), 68, "100 overflow keys into an arena that holds 32: {rejected:?}");
+    assert!(rejected.iter().all(|&(i, e)| i % 2 == 0 && e == InsertError::KeyArenaFull), "{rejected:?}");
+    let landed = outcome.ids.iter().filter(|&&id| id != NO_ID).count();
+    assert_eq!(landed, 132, "32 overflow + 100 inline keys land");
+    let high_water = graph.file.id_high_water();
+    assert!(high_water >= landed as u64 && high_water <= landed as u64 + scratches.len() as u64, "high water {high_water}");
+    let mut scratch = SearchScratch::new();
+    for i in 0..(high_water - landed as u64) {
+        insert_with_key(&graph, &vector_for(1000 + i as u32, dims), b"k", &params, &mut scratch).expect("inline insert");
+    }
+    assert_eq!(graph.file.id_high_water(), high_water, "refused records freed their ids for reuse");
+    for (i, &id) in outcome.ids.iter().enumerate().filter(|(_, &id)| id != NO_ID) {
+        let (results, _) = search(&graph, &graph.query(vector_for(i as u32, dims)), 5, 64, &mut scratch);
+        assert!(results.iter().any(|&(rid, _)| rid == id), "record {i} (id {id}) unreachable after arena refusals");
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn batch_insert_beside_concurrent_deletes_keeps_survivors_reachable() {
+    let dims = 64;
+    let path = std::env::temp_dir().join(format!("hnsw-batch-delete-{}.hnsw", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let graph = Arc::new(Graph::new(PlaneFile::create_with_keys(&path, dims, 32, 40_000, 8).expect("create")));
+    let params = InsertParams::default();
+    let total = 6_000u32;
+    let chunk = 500usize;
+    let deleted = Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let inserted: Vec<(u32, u32)> = std::thread::scope(|s| {
+        let deleter = {
+            let graph = graph.clone();
+            let deleted = deleted.clone();
+            let stop = stop.clone();
+            s.spawn(move || {
+                let mut next = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    let high = graph.file.id_high_water() as u32;
+                    if next + 4 < high {
+                        // every 4th id so far, entry point included whenever it lands on one
+                        let _ = graph.delete_node(next);
+                        deleted.lock().unwrap().push(next);
+                        next += 4;
+                    } else {
+                        std::thread::yield_now();
+                    }
+                }
+            })
+        };
+        let mut scratches: Vec<SearchScratch> = (0..6).map(|_| SearchScratch::new()).collect();
+        let mut inserted = Vec::new();
+        for start in (0..total).step_by(chunk) {
+            let indices: Vec<u32> = (start..start + chunk as u32).collect();
+            let (vectors, keys) = batch_records(&indices, dims);
+            let records: Vec<(&[f32], &[u8])> = vectors.iter().zip(&keys).map(|(v, k)| (v.as_slice(), k.as_slice())).collect();
+            let outcome = insert_batch(&graph, &params, &records, &mut scratches).expect("batch insert");
+            inserted.extend(indices.iter().copied().zip(outcome.ids.iter().copied()));
+        }
+        stop.store(true, Ordering::Relaxed);
+        deleter.join().expect("deleter panicked");
+        inserted
+    });
+
+    let (entry, _) = graph.file.entry_point();
+    assert!(graph.read_node(entry).is_some(), "entry point {entry} must be a live node");
+    let deleted = deleted.lock().unwrap();
+    let mut scratch = SearchScratch::new();
+    let mut misses = 0;
+    let mut checked = 0;
+    let mut key = Vec::new();
+    for &(index, id) in inserted.iter().step_by(23) {
+        if deleted.contains(&id) || graph.key_into(id, &mut key).is_none() {
+            continue; // deleted (ids are reused, so the key says whether this node is still ours)
+        }
+        if key != index.to_le_bytes() {
+            continue;
+        }
+        checked += 1;
+        let (results, _) = search(&graph, &graph.query(vector_for(index, dims)), 10, 256, &mut scratch);
+        if !results.iter().any(|&(rid, _)| rid == id) {
+            misses += 1;
+        }
+    }
+    assert!(checked > 100, "too few survivors checked: {checked}");
+    assert_eq!(misses, 0, "survivors unreachable after batch inserts beside deletes ({checked} checked)");
     let _ = std::fs::remove_file(&path);
 }

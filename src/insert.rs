@@ -5,10 +5,12 @@
 //! format, so neighbor↔neighbor distances are recomputed (int8×int8) on id-match hits only.
 
 use crate::distance::{quantize, Query};
-use crate::format::{NO_ID, NO_UPPER};
+use crate::format::{key_class, NO_ID, NO_UPPER};
 use crate::graph::{Graph, KeyError, WriteError};
 use crate::search::{beam_descend, search_layer, SearchScratch, SearchStats, DESCENT_EF};
+use std::sync::atomic::{AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
+#[derive(Clone, Copy)]
 pub struct InsertParams {
     pub m: usize,               // base connection count (JS M, default 16)
     pub ef_construction: usize, // candidate list size
@@ -162,6 +164,52 @@ pub enum InsertError {
     KeyUnstorable,
     /// the vector's length is not the plane's `dims`
     DimensionMismatch,
+    /// a component is NaN or infinite: such a node would rank first (or nowhere) for every
+    /// query, permanently
+    NotFinite,
+}
+
+impl InsertError {
+    /// A record fault is the record's own (skip it and go on). `KeyArenaFull` counts: only keys
+    /// past `key_cap` need the arena, so inline-key records keep landing after it fills. `Full`
+    /// and `Wedged` are the plane's, and no later insert can succeed until the host acts.
+    pub fn is_record_fault(self) -> bool {
+        !matches!(self, InsertError::Full | InsertError::Wedged)
+    }
+
+    /// Stable machine-readable name, for hosts that dispatch on the fault rather than its text.
+    pub fn code(self) -> &'static str {
+        match self {
+            InsertError::Full => "full",
+            InsertError::Wedged => "wedged",
+            InsertError::KeyArenaFull => "key-arena-full",
+            InsertError::KeyUnstorable => "key-unstorable",
+            InsertError::DimensionMismatch => "dimension-mismatch",
+            InsertError::NotFinite => "not-finite",
+        }
+    }
+
+    fn from_code(code: u8) -> Self {
+        match code {
+            1 => InsertError::Full,
+            2 => InsertError::Wedged,
+            3 => InsertError::KeyArenaFull,
+            4 => InsertError::KeyUnstorable,
+            5 => InsertError::DimensionMismatch,
+            _ => InsertError::NotFinite,
+        }
+    }
+
+    fn to_code(self) -> u8 {
+        match self {
+            InsertError::Full => 1,
+            InsertError::Wedged => 2,
+            InsertError::KeyArenaFull => 3,
+            InsertError::KeyUnstorable => 4,
+            InsertError::DimensionMismatch => 5,
+            InsertError::NotFinite => 6,
+        }
+    }
 }
 
 fn write_error(error: WriteError) -> InsertError {
@@ -198,17 +246,33 @@ pub fn insert_with_key(
     graph.check_key(key).map_err(|e| match e {
         KeyError::NoKeys | KeyError::TooLong => InsertError::KeyUnstorable,
     })?;
-    // best-effort: an arena that cannot hold the key is refused before any neighbor edge is
-    // touched, since an abandoned insert cannot restore the edges its selection removed
-    if key.len() > graph.file.key_cap && !graph.file.key_arena_has_room(key.len()) {
-        return Err(InsertError::KeyArenaFull);
-    }
     let stored = quantize(vector, graph.file.quant());
+    if !stored.finite {
+        return Err(InsertError::NotFinite);
+    }
     let (bytes, scale, inv_mag) = (&stored.bytes, stored.scale, stored.inv_mag);
     let id = graph.file.allocate_id();
     if id == NO_ID {
         return Err(InsertError::Full);
     }
+    // An overflow key's arena range is settled before the graph is touched: selection removes
+    // edges between existing nodes, and an insert abandoned after that cannot put them back,
+    // so the one resource the final write could still run out of is taken first — the
+    // recycled slot's own range when it still fits, else a fresh reservation.
+    let (key_range, fresh_range) = if key.len() > graph.file.key_cap {
+        match graph.recycled_key_range(id, key.len()) {
+            Some(range) => (Some(range), false),
+            None => match graph.file.allocate_key_bytes(key_class(key.len())) {
+                Some(range) => (Some(range), true),
+                None => {
+                    graph.file.free_id(id);
+                    return Err(InsertError::KeyArenaFull);
+                }
+            },
+        }
+    } else {
+        (None, false)
+    };
     // `slot_upper` is the entry the published slot names (freed with it); a fresh one is freed here
     let abandon = |published: bool, upper: u32, slot_upper: u32| {
         if published {
@@ -219,6 +283,9 @@ pub fn insert_with_key(
         } else {
             graph.file.free_upper(upper);
             graph.file.free_id(id);
+            if let (Some(range), true) = (key_range, fresh_range) {
+                graph.file.release_key_bytes(range, key_class(key.len()));
+            }
         }
     };
     let level = level_for(id, params.ml);
@@ -239,7 +306,9 @@ pub fn insert_with_key(
         }
         *published_upper =
             if level > 0 { graph.write_upper(&vec![Vec::new(); level as usize]).unwrap_or(NO_UPPER) } else { NO_UPPER };
-        if let Err(error) = graph.write_node(id, level, bytes, scale, inv_mag, &[], *published_upper, Some(key)) {
+        if let Err(error) =
+            graph.write_node_with_key_range(id, level, bytes, scale, inv_mag, &[], *published_upper, Some(key), key_range)
+        {
             abandon(false, *published_upper, NO_UPPER);
             return Err(write_error(error));
         }
@@ -383,7 +452,7 @@ pub fn insert_with_key(
     };
     let mut l0: Vec<u32> = connections[0].iter().map(|&(nid, _)| nid).collect();
     l0.truncate(layer0_cap);
-    if let Err(error) = graph.write_node(id, level, bytes, scale, inv_mag, &l0, upper_idx, Some(key)) {
+    if let Err(error) = graph.write_node_with_key_range(id, level, bytes, scale, inv_mag, &l0, upper_idx, Some(key), key_range) {
         abandon(published, upper_idx, published_upper);
         return Err(write_error(error));
     }
@@ -401,6 +470,103 @@ pub fn insert_with_key(
         graph.file.promote_entry_point(id, level as u32, entry_id);
     }
     Ok(id)
+}
+
+/// What a batch produced, in input order: `ids[i]` is the node id of record `i`, or `NO_ID`
+/// where the record was rejected (listed in `rejected`, ascending by index) or never started
+/// because the batch failed.
+#[derive(Debug, Default)]
+pub struct BatchOutcome {
+    pub ids: Vec<u32>,
+    pub rejected: Vec<(usize, InsertError)>,
+}
+
+/// A plane fault stopped the batch. `index` is the lowest record that hit one — not a prefix
+/// boundary: workers claim records out of order, so `outcome.ids` is the only statement of
+/// which records landed. Every claimed record finished before this was returned; nothing is
+/// left in flight.
+#[derive(Debug)]
+pub struct BatchFailure {
+    pub index: usize,
+    pub error: InsertError,
+    pub outcome: BatchOutcome,
+}
+
+const NO_FAULT: u8 = 0;
+const NO_FAILURE: usize = usize::MAX;
+
+/// Insert `records` (vector, key) with one worker per scratch in `scratches` — the calling
+/// thread runs the first worker, the rest are scoped threads — pulling records from a shared
+/// counter so a slow region (hub-heavy, cold pages) never idles the other workers. Record
+/// faults skip that record; a plane fault stops the dispatch, lets in-flight inserts finish,
+/// and fails the batch. Each worker's `SearchScratch` grows to a u32 per allocated id, so the
+/// batch's working memory is `scratches.len() x 4 B x id_high_water`.
+///
+/// Records land in whatever order the workers reach them, so two builds of the same input
+/// produce different (equally valid) graphs — DESIGN.md §10 on why that is only a shuffled
+/// insertion permutation.
+pub fn insert_batch(
+    graph: &Graph,
+    params: &InsertParams,
+    records: &[(&[f32], &[u8])],
+    scratches: &mut [SearchScratch],
+) -> Result<BatchOutcome, BatchFailure> {
+    assert!(!scratches.is_empty(), "insert_batch needs at least one scratch");
+    let count = records.len();
+    let ids: Vec<AtomicU32> = (0..count).map(|_| AtomicU32::new(NO_ID)).collect();
+    let faults: Vec<AtomicU8> = (0..count).map(|_| AtomicU8::new(NO_FAULT)).collect();
+    let next = AtomicUsize::new(0);
+    let failed = AtomicUsize::new(NO_FAILURE);
+
+    let worker = |scratch: &mut SearchScratch| {
+        while failed.load(Ordering::Acquire) == NO_FAILURE {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= count {
+                break;
+            }
+            let (vector, key) = records[i];
+            match insert_with_key(graph, vector, key, params, scratch) {
+                Ok(id) => ids[i].store(id, Ordering::Relaxed),
+                Err(error) => {
+                    faults[i].store(error.to_code(), Ordering::Relaxed);
+                    if !error.is_record_fault() {
+                        failed.fetch_min(i, Ordering::AcqRel);
+                        break;
+                    }
+                }
+            }
+        }
+    };
+
+    let workers = scratches.len().min(count.max(1));
+    std::thread::scope(|scope| {
+        let (first, rest) = scratches.split_first_mut().expect("non-empty");
+        for scratch in rest.iter_mut().take(workers - 1) {
+            let worker = &worker;
+            // a refused spawn only means fewer workers
+            let _ = std::thread::Builder::new().name("hnsw-insert-batch".into()).spawn_scoped(scope, move || worker(scratch));
+        }
+        worker(first);
+    });
+
+    let outcome = BatchOutcome {
+        ids: ids.iter().map(|id| id.load(Ordering::Relaxed)).collect(),
+        rejected: faults
+            .iter()
+            .enumerate()
+            .filter_map(|(i, fault)| match fault.load(Ordering::Relaxed) {
+                NO_FAULT => None,
+                code => Some((i, InsertError::from_code(code))).filter(|(_, e)| e.is_record_fault()),
+            })
+            .collect(),
+    };
+    match failed.load(Ordering::Acquire) {
+        NO_FAILURE => Ok(outcome),
+        index => {
+            let error = InsertError::from_code(faults[index].load(Ordering::Relaxed));
+            Err(BatchFailure { index, error, outcome })
+        }
+    }
 }
 
 #[inline]

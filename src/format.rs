@@ -877,9 +877,10 @@ impl PlaneFile {
     }
 
     /// Reserve `len` bytes in the key overflow arena (4-aligned bump allocation; ranges are
-    /// never reclaimed — a rebuild compacts). None when the arena is exhausted. A CAS loop
-    /// rather than fetch_add with a rollback: a failed reservation's rollback could rewind the
-    /// high-water below a reservation that succeeded meanwhile, handing out overlapping ranges.
+    /// never reclaimed except by `release_key_bytes` immediately after — a rebuild compacts).
+    /// None when the arena is exhausted. A CAS loop rather than fetch_add with a rollback: a
+    /// failed reservation's rollback could rewind the high-water below a reservation that
+    /// succeeded meanwhile, handing out overlapping ranges.
     pub fn allocate_key_bytes(&self, len: usize) -> Option<u64> {
         let aligned = (len as u64).next_multiple_of(4);
         let hw = self.header_atomic_u64(H_KEY_ARENA_HIGH_WATER);
@@ -894,6 +895,14 @@ impl PlaneFile {
                 Err(now) => cur = now,
             }
         }
+    }
+
+    /// Give back a range `allocate_key_bytes` just handed out, if nothing was reserved after
+    /// it; otherwise the range is left to the arena.
+    pub fn release_key_bytes(&self, offset: u64, len: usize) {
+        let aligned = (len as u64).next_multiple_of(4);
+        let hw = self.header_atomic_u64(H_KEY_ARENA_HIGH_WATER);
+        let _ = hw.compare_exchange(offset + aligned, offset, Ordering::AcqRel, Ordering::Acquire);
     }
 
     /// Pointer into the key overflow arena. Callers bounds-check `offset + len` against

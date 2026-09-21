@@ -15,6 +15,8 @@ pub struct Quantized {
     pub bytes: Vec<u8>,
     pub scale: f32,
     pub inv_mag: f32,
+    /// Every component was finite; a NaN or infinity quantizes to garbage a caller must refuse.
+    pub finite: bool,
 }
 
 /// Precomputed query state, built once per search and bound to one plane's codec. Exactly one
@@ -339,7 +341,7 @@ pub unsafe fn cosine_stored_raw(
 /// Quantize into a plane's storage encoding: symmetric per-vector scale mapping the largest
 /// magnitude component to `quant.max_abs()`, plus the cached 1/|v| the slot stores beside it.
 pub fn quantize(vector: &[f32], quant: Quant) -> Quantized {
-    let max_abs = vector.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let (max_abs, finite) = vector.iter().fold((0.0f32, true), |(m, f), v| (m.max(v.abs()), f & v.is_finite()));
     let limit = quant.max_abs() as f32;
     let scale = if max_abs == 0.0 { 1.0 } else { max_abs / limit };
     let inv_scale = 1.0 / scale;
@@ -351,7 +353,7 @@ pub fn quantize(vector: &[f32], quant: Quant) -> Quantized {
             Quant::Int16 => bytes.extend_from_slice(&(q as i16).to_le_bytes()),
         }
     }
-    Quantized { bytes, scale, inv_mag: inv_magnitude(vector) }
+    Quantized { bytes, scale, inv_mag: inv_magnitude(vector), finite }
 }
 
 /// Symmetric int8 quantization matching the JS quantizeInt8: scale maps max |component| to 127.

@@ -197,7 +197,7 @@ impl Graph {
     /// the class allocates, and a key that shrinks to inline (or below its class) releases the
     /// range. A record torn by a dead writer is never reused: the lock takeover sanitizer
     /// zeroes the length. `None` leaves the stored key untouched.
-    unsafe fn store_key_locked(&self, p: *mut u8, key: Option<&[u8]>) -> Result<(), WriteError> {
+    unsafe fn store_key_locked(&self, p: *mut u8, key: Option<&[u8]>, reserved: Option<u64>) -> Result<(), WriteError> {
         let Some(key) = key else { return Ok(()) };
         if self.file.key_cap == 0 {
             return Ok(());
@@ -209,19 +209,7 @@ impl Graph {
             std::ptr::copy_nonoverlapping(key.as_ptr(), payload, key.len());
             return Ok(());
         }
-        let old_len = u16::from_le((kp as *const u16).read_unaligned()) as usize;
-        let mut reused = None;
-        if old_len > self.file.key_cap && *p.add(S_FLAGS) != 0 && key_class(old_len) >= key.len() {
-            let lo = u32::from_le((payload as *const u32).read_unaligned()) as u64;
-            let hi = u32::from_le((payload.add(4) as *const u32).read_unaligned()) as u64;
-            let existing = lo | (hi << 32);
-            // file-sourced: a range that does not fit the arena is not reused
-            let end = existing.checked_add(key_class(old_len) as u64);
-            if end.is_some_and(|end| end <= self.file.key_arena_len) {
-                reused = Some(existing);
-            }
-        }
-        let offset = match reused {
+        let offset = match reserved.or_else(|| self.reusable_key_range(p, key.len())) {
             Some(offset) => offset,
             None => self.file.allocate_key_bytes(key_class(key.len())).ok_or(WriteError::KeyArenaFull)?,
         };
@@ -230,6 +218,33 @@ impl Graph {
         (payload.add(4) as *mut u32).write_unaligned(((offset >> 32) as u32).to_le());
         (kp as *mut u16).write_unaligned((key.len() as u16).to_le());
         Ok(())
+    }
+
+    /// The slot's own overflow range, when the key it last stored (live or deleted) reserved
+    /// a class that still fits `key_len`.
+    unsafe fn reusable_key_range(&self, p: *const u8, key_len: usize) -> Option<u64> {
+        let kp = p.add(self.file.key_offset());
+        let payload = kp.add(KEY_PAYLOAD);
+        let old_len = u16::from_le((kp as *const u16).read_unaligned()) as usize;
+        if old_len <= self.file.key_cap || *p.add(S_FLAGS) == 0 || key_class(old_len) < key_len {
+            return None;
+        }
+        let lo = u32::from_le((payload as *const u32).read_unaligned()) as u64;
+        let hi = u32::from_le((payload.add(4) as *const u32).read_unaligned()) as u64;
+        let existing = lo | (hi << 32);
+        // file-sourced: a range that does not fit the arena is not reused
+        let end = existing.checked_add(key_class(old_len) as u64)?;
+        (end <= self.file.key_arena_len).then_some(existing)
+    }
+
+    /// An insert that just took `id` from the allocator asks whether the recycled slot already
+    /// owns an overflow range big enough for its key, before reserving a fresh one. The slot
+    /// is the caller's now, so the unlocked read races nothing that writes it.
+    pub(crate) fn recycled_key_range(&self, id: u32, key_len: usize) -> Option<u64> {
+        if self.file.key_cap == 0 || key_len <= self.file.key_cap || !self.in_range(id) {
+            return None;
+        }
+        unsafe { self.reusable_key_range(self.file.slot_ptr(id), key_len) }
     }
 
     /// Copy the host key of `id` into `out` (cleared first). None for absent/deleted nodes;
@@ -672,6 +687,13 @@ impl Graph {
     /// None to keep the key the slot already holds.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn write_node(&self, id: u32, level: u8, vector: &[u8], scale: f32, inv_mag: f32, neighbors: &[u32], upper_idx: u32, key: Option<&[u8]>) -> Result<(), WriteError> {
+        self.write_node_with_key_range(id, level, vector, scale, inv_mag, neighbors, upper_idx, key, None)
+    }
+
+    /// `write_node` with an arena range the caller reserved for an overflow key before it
+    /// touched the graph, so the write cannot fail on the arena after edges were removed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_node_with_key_range(&self, id: u32, level: u8, vector: &[u8], scale: f32, inv_mag: f32, neighbors: &[u32], upper_idx: u32, key: Option<&[u8]>, reserved_key_range: Option<u64>) -> Result<(), WriteError> {
         debug_assert!(neighbors.len() <= self.file.layer0_cap);
         // the copy below is sized by this, so an over-long slice would write through the
         // neighbor array into the following slot. The element-domain scan stays at the raw
@@ -686,7 +708,7 @@ impl Graph {
         let nbase = self.file.neighbor_offset();
         unsafe {
             // key first: an exhausted arena leaves the slot's previous state intact
-            self.store_key_locked(p, key)?;
+            self.store_key_locked(p, key, reserved_key_range)?;
             *p.add(S_LEVEL) = level;
             (p.add(S_DEGREE) as *mut u16).write_unaligned((neighbors.len() as u16).to_le());
             (p.add(S_SCALE) as *mut f32).write_unaligned(scale);
@@ -1003,7 +1025,7 @@ impl Graph {
                 if *p.add(S_FLAGS) != 0 {
                     false
                 } else {
-                    if let Err(error) = self.store_key_locked(p, key) {
+                    if let Err(error) = self.store_key_locked(p, key, None) {
                         self.file.free_upper(upper_idx);
                         return Err(error);
                     }

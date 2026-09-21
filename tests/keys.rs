@@ -116,19 +116,16 @@ fn keys_are_refused_where_they_cannot_be_stored() {
     for i in 0..4u32 {
         insert_with_key(&graph, &vector_for(i, dims), &long, &params, &mut scratch).expect("arena has room");
     }
-    assert_eq!(
-        insert_with_key(&graph, &vector_for(5, dims), &long, &params, &mut scratch),
-        Err(InsertError::KeyArenaFull)
-    );
-    // refused inserts allocate nothing: the next success takes the next fresh id
+    // a refused insert frees the id it took: four refusals recycle one id among them, and the
+    // next success takes that id back
     let high_water = graph.file.id_high_water();
-    for _ in 0..3 {
+    for _ in 0..4 {
         assert_eq!(
             insert_with_key(&graph, &vector_for(5, dims), &long, &params, &mut scratch),
             Err(InsertError::KeyArenaFull)
         );
     }
-    assert_eq!(graph.file.id_high_water(), high_water, "a refused insert holds no id");
+    assert_eq!(graph.file.id_high_water(), high_water + 1, "refused inserts recycle one id among them");
     let short = insert_with_key(&graph, &vector_for(5, dims), b"short", &params, &mut scratch).expect("inline keys still fit");
     assert_eq!(short as u64, high_water);
     assert_eq!(graph.file.id_high_water(), high_water + 1);
@@ -180,5 +177,24 @@ fn rewriting_a_node_reuses_its_arena_range() {
     // a rewrite without a key keeps the stored one
     graph.write_node_raw(1, 0, &bytes, scale, inv_mag, &[], &[]).expect("keyless rewrite");
     assert_eq!(key_of(&graph, 1).as_deref(), Some(long.as_slice()), "an omitted key leaves the stored key");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn reinserting_an_overflow_key_into_a_recycled_slot_reuses_its_arena_range() {
+    let dims = 16;
+    let params = InsertParams::default();
+    let mut scratch = SearchScratch::new();
+    let path = temp("churn");
+    let graph = Graph::new(PlaneFile::create_with_keys(&path, dims, 16, 8, 8).expect("create"));
+    let long = vec![b'x'; 200];
+    let first = insert_with_key(&graph, &vector_for(1, dims), &long, &params, &mut scratch).expect("insert");
+    let arena_after_first = graph.file.key_arena_high_water();
+    for round in 0..12 {
+        graph.delete_node(first).expect("delete");
+        let again = insert_with_key(&graph, &vector_for(1, dims), &long, &params, &mut scratch).expect("reinsert");
+        assert_eq!(again, first, "round {round}: the freed slot is reused");
+        assert_eq!(graph.file.key_arena_high_water(), arena_after_first, "round {round}: no fresh arena range");
+    }
     let _ = std::fs::remove_file(&path);
 }

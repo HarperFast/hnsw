@@ -57,10 +57,49 @@ export declare class Plane {
 
 	/**
 	 * Insert a vector; returns the allocated node id (freed ids are reused). `key` is the host's
-	 * key bytes (needs a `keyCap` at create). Throws on a dimension mismatch, a full plane
-	 * (maxNodes reached), an exhausted key arena, or a key the plane cannot store.
+	 * key bytes (needs a `keyCap` at create). Throws on a dimension mismatch, a non-finite
+	 * component, a full plane (maxNodes reached), an exhausted key arena, or a key the plane
+	 * cannot store.
 	 */
 	insert(vector: Float32Array, key?: Buffer): number;
+	/**
+	 * Insert a chunk of records in one crossing, fanned out across `threads` worker threads
+	 * inside the native module (default: the hardware thread count, at most 16; an explicit
+	 * value is clamped to 2× the hardware threads and to the record count) and off the event
+	 * loop. `vectors` is `count × dims` row-major; `keys` and `keyEnds` (both or neither) split
+	 * the concatenated key bytes the way `SearchHits` does: record i's key is
+	 * `keys.subarray(keyEnds[i - 1] ?? 0, keyEnds[i])`.
+	 *
+	 * Resolves with every record's node id in input order. A record the plane cannot hold (a
+	 * non-finite component, an over-long key, a key on a plane without `keyCap`, an overflow
+	 * key once the key arena is exhausted) is listed in `rejected` with 0xFFFFFFFF in its `ids`
+	 * slot, and the rest of the batch lands — the same records a loop of `insert` would skip.
+	 * A plane fault — full or wedged — stops the batch once in-flight inserts have finished
+	 * and rejects with an `InsertBatchError`: its `ids` says which records landed (they stay
+	 * in the plane), and `index` is the lowest record that hit the fault, not a prefix
+	 * boundary, because threads claim records out of order. Malformed arguments reject too;
+	 * nothing throws synchronously.
+	 *
+	 * Batches on one plane run in order on one worker thread (started on demand, retired when
+	 * idle, joined at process teardown); a second call queues behind the first, holding its
+	 * copied inputs until it runs, so `await` each chunk rather than fanning out an unbounded
+	 * `Promise.all`. Standalone-allocation mode only, like `insert`: ids come from the plane's
+	 * allocator, so never mix it with `writeNodeRaw`/`clearNode`, whose host-allocated ids
+	 * would overwrite batch nodes in place. `insert` and `remove` may run while a batch is in
+	 * flight under the plane's per-slot rules. Records land in whatever order the threads reach
+	 * them, so two builds of the same input produce different, equally valid graphs.
+	 *
+	 * Working memory: each thread's visited set is 4 bytes per allocated id, so a batch on an
+	 * 8M-node plane with 16 threads holds ~512 MB of scratch, retained in the plane's scratch
+	 * pool for later batches and searches. The thread count and that memory are per plane: a
+	 * host bulk-loading several planes at once should pass `threads` so the total fits its
+	 * cores and memory.
+	 *
+	 * A queued or in-flight batch is not covered by flush()'s durability promise until its
+	 * promise settles: `await` every outstanding insertBatch() before advancing the watermark,
+	 * or the watermark can land over records that have not been inserted yet.
+	 */
+	insertBatch(vectors: Float32Array, keys?: Buffer, keyEnds?: Uint32Array, threads?: number): Promise<InsertBatchResult>;
 	/** Delete a node; its id returns to the freelist. Pairs with insert(). */
 	remove(id: number): void;
 
@@ -142,9 +181,11 @@ export declare class Plane {
 	 * Durability barrier: flush all data, then advance the watermark (omitted = leave the
 	 * stored watermark untouched), then flush the header alone — a crash between the two
 	 * flushes leaves an old watermark over durable data, never a new watermark over missing
-	 * data. Crash recovery is per-slot: a lock abandoned by a dead handle is detected via a
-	 * kernel-owned registration (immune to pid reuse) and taken over, with the slot marked
-	 * deleted until rewritten.
+	 * data. That promise assumes the watermark you pass already landed: `await` every
+	 * outstanding insertBatch() first, or a queued batch not yet applied is exactly a new
+	 * watermark over missing data. Crash recovery is per-slot: a lock abandoned by a dead
+	 * handle is detected via a kernel-owned registration (immune to pid reuse) and taken
+	 * over, with the slot marked deleted until rewritten.
 	 */
 	flush(watermark?: number): void;
 	/** flush() on the libuv thread pool — a whole-map msync can stall its calling thread. */
@@ -164,6 +205,34 @@ export declare class Plane {
 	invalidateFile(): InvalidationOutcome;
 	/** Whether the plane was invalidated, by any handle, since this one opened. */
 	invalidated(): boolean;
+}
+
+/** One record `insertBatch` skipped. */
+export interface BatchRejection {
+	/** Position in the batch. */
+	index: number;
+	/** Stable fault name: 'not-finite' | 'key-unstorable' | 'key-arena-full' | 'dimension-mismatch'. */
+	code: string;
+	/** The message `insert` would have thrown for this record. */
+	reason: string;
+}
+
+export interface InsertBatchResult {
+	/** Node id per record, in input order; 0xFFFFFFFF where `rejected` names the record. */
+	ids: Uint32Array;
+	/** Ascending by index. */
+	rejected: Array<BatchRejection>;
+}
+
+/** The rejection of an `insertBatch` a plane fault stopped. */
+export interface InsertBatchError extends Error {
+	/** 'full' | 'wedged'. */
+	code: string;
+	/** The lowest record that hit the fault; not a prefix boundary — read `ids`. */
+	index: number;
+	/** As in `InsertBatchResult`: the records that landed before the batch stopped. */
+	ids: Uint32Array;
+	rejected: Array<BatchRejection>;
 }
 
 export interface InvalidationOutcome {

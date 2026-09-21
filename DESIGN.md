@@ -183,6 +183,18 @@ a header field, so revising it is a rebuild, not a format change.
   holds: id allocation is one atomic fetch_add on the header, freelist pop is CAS, slot writes
   are seqlocked. Two inserts updating the same neighbor's edge list serialize on that slot's
   seqlock (a Rust-side per-slot spinlock on the odd state).
+- **Batch insert.** `insert_batch` (napi `insertBatch`) is the bulk driver for those writer
+  primitives: one crossing per chunk, one worker per scratch pulling records off a shared
+  counter, so a hub-heavy or cold region slows one worker rather than the chunk. Record faults
+  (non-finite component, unstorable key, wrong dims, an overflow key once the arena is full)
+  skip that record and are reported by index; a plane fault (full, wedged) stops the dispatch
+  and fails the batch once in-flight inserts finish, reporting the ids that landed — the call
+  never returns with an insert still running, which is what lets a host's barrier cover
+  exactly what it applied. The napi surface runs a plane's batches in order on one worker
+  thread, and each worker's visited set is 4 B per allocated id, so a batch's working memory
+  is `threads × 4 B × id_high_water`. Records land in thread order, so a batch-built graph is
+  one of many equally valid shapes for the same input (§10: concurrency only shuffles the
+  insertion permutation). Scaling in §11.
 - **Id reuse & ABA.** Delete pushes the id onto the freelist; a traversal holding the old id may
   read the reused slot and score the wrong vector — acceptable under the relaxed contract
   (rescore/record-load rejects it). The freelist head itself is tag-guarded against ABA.
@@ -557,6 +569,38 @@ recall.** The µs/visit rise from 100K (0.20) to 1M (0.32–0.35) is the working
 the memory-hierarchy term; it is the number that holds at 60–100M. An ef-1024 sweep on a
 reopened cap-64 plane without its hierarchy (pre-sidecar) still reached 0.985 at p50 2.47 ms —
 layer-0 beam is robust to a missing hierarchy, at ~3.4× the visits.
+
+### Parallel batch build (hnsw#6)
+
+`insert_batch` scaling on the same box, measured 2026-09-19 on NVMe (`/home`, not tmpfs):
+128-d int8 rows from a 16M float32 pool, layer-0 cap 128, efConstruction 200, 4,096-record
+chunks, 200 held-out queries. The box was shared with three other multi-GB benchmark sessions
+throughout (load average 10–31 on 20 hardware threads, IO pressure 20–40%), so absolute rates
+are conservative and the single-thread reference spent long stretches IO-stalled; the shape
+of the curve is the finding. recall@10 is against brute-force truth at ef 256.
+
+| N  | build threads | inserts/s | recall@10 |
+| -- | ------------- | --------- | --------- |
+| 4M | 1 (serial `insert_with_key`, 3.76 h) | 296 avg; 2,200 → 160 per 200k segment as IO pressure rose | 0.9995 |
+| 4M | 2  | 2,065 | 0.9995 |
+| 4M | 4  | 4,169 | 0.9995 |
+| 4M | 8  | 5,225 | 0.9995 |
+| 4M | 16 | 8,461 | 0.9995 |
+| 4M | 20 | 7,792 (box oversubscribed: load 24) | 0.9995 |
+| 8M | 1 (serial, stopped at 3.95M after 3.7 h) | 293 avg | — |
+| 8M | 4  | 2,625 | 1.0000 |
+| 8M | 8  | 4,182 | 1.0000 |
+| 8M | 16 | 9,105 | 1.0000 |
+| 8M | 20 | 8,555 (load 22) | 1.0000 |
+
+On a quiet box the serial path ran 3,114 inserts/s at 200k (SIFT1M rows) and 8 threads
+19,695/s — 6.3×. Two things the curve says: recall is unchanged by parallel insertion at
+every point (§10's "concurrency only shuffles the insertion permutation" holds at 4M and 8M),
+and under IO pressure the single writer collapses (hundreds of inserts/s, `D` state at
+~4,300 major faults/s) while 4–16 workers keep 2,000–8,500/s — the fault-overlap effect
+hnsw#6 predicted for out-of-cache builds is larger than the CPU term. The 8 → 16 → 20 step
+flattens where the box ran out of idle cores; the hub-contention ceiling on a quiet machine
+is still to be measured.
 
 Milestones: zero-copy seqlock reads + AVX2 kernels took per-visit cost from 0.440 µs (first
 scalar prototype) to ~0.1–0.35 µs, beating the 0.25–0.4 µs design budget. The
