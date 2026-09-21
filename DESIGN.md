@@ -251,8 +251,17 @@ search(sliceHandles, queryVector: Float32Array, k, ef, filter?): Promise<{ids, d
 
 - Asymmetric distance as today: float query × int8 stored, cached invMag, SIMD (AVX2/VNNI on
   x86, NEON on ARM; `std::arch` intrinsics with a scalar fallback).
-- Visited set: epoch-stamped u32 array (one per pool thread, reused across queries — no
-  allocation per query). Candidate heap: fixed-capacity binary heap of (dist, id) pairs.
+- Visited set: one bit per node id plus a journal of the words a sweep set, cleared per sweep
+  by walking the journal (one per pool thread, reused across queries — no allocation per
+  query). Per scratch: `8 × ceil(nodes / 64)` bytes of bitmap plus headroom of 1/8 of that or 8 KB,
+  whichever is larger (so a writer raising the high-water mark, or a visit just past the
+  snapshot, does not reallocate the scratch) plus at most 256 KB of journal — 200M nodes is
+  ~28 MB; worst
+  case per process is `(in-flight searches + 1 insert scratch) × that`, and the pool retains at
+  most 64 idle scratches. The u32 epoch stamp it replaced was
+  4 B/node materialized per scratch — 800 MB at 200M, 205 GB across a 256-thread libuv pool
+  (issue #8). A sweep that sets more than 65 536 distinct words overflows the journal and the
+  next clear walks the whole bitmap, amortized against the ≥ 65 536 visits that caused it. Candidate heap: fixed-capacity binary heap of (dist, id) pairs.
 - Auto-ef / auto-efC read the node count from the header high-water minus freelist length —
   same semantics as today, minus the #2182 inflation (freed ids return to the pool).
 
@@ -608,3 +617,35 @@ optimizeRouting-parity insert (including the recomputed neighbor↔neighbor dist
 recall from 0.49 (placeholder insert) to JS parity. Uniform-random 768-d corpora produce
 meaningless recall numbers (the JS benchmark's own calibration note: a corpus "no ANN can
 index") — all comparisons use the mixture corpus.
+
+### Visited set: bitmap + journal vs the u32 epoch array (2026-09-19, issue #8)
+
+Same box, base and candidate binaries alternated over one immutable plane per size (a fresh
+sparse copy per run for the concurrent pass, whose writer mutates the plane); the box was shared
+with two other benchmark runs, so single-thread numbers are the median of per-run p50 over
+pinned (`taskset`) runs and the spread is noted. Per-query dumps (visit count, ordered hit ids
+and distances) were byte-identical between the two builds at every ef — the set semantics are
+unchanged, so traversal order is unchanged.
+
+| N, dims, cap | ef | epoch p50 median (min) | bitmap p50 median (min) | epoch anon RSS / scratch | bitmap anon RSS / scratch |
+| ------------------ | ---- | ---------------- | ---------------- | ------- | ------- |
+| 1M, 768, 128 | 64 | 0.417 ms (0.348) | 0.398 ms (0.345) | 7.7 MB | 0.37 MB |
+| 1M, 768, 128 | 512 | 0.838 ms (0.729) | 0.720 ms (0.693) | | |
+| 1M, 768, 128 | 1448 | 4.151 ms (3.684) | 3.803 ms (3.371) | | |
+| 8M, 128, 32 | 64 | 0.220 ms (0.204) | 0.191 ms (0.190) | 57.7 MB | 2.0 MB |
+| 8M, 128, 32 | 512 | 0.443 ms (0.398) | 0.425 ms (0.375) | | |
+| 8M, 128, 32 | 1448 | 1.650 ms (1.630) | 1.660 ms (1.460) | | |
+
+1M: 6 rounds x 300 queries, the plane on disk. 8M: 4 rounds x 200 queries, the plane on tmpfs
+(a 9 GB cap-128 build could not stay page-cache-resident on the shared box; cap 32 keeps the
+plane at 2.6 GB, and the visited-set term under test does not depend on cap or dims). The
+concurrent pass (8 searchers + 1 writer) ran unpinned and its QPS moved 2-3x between rounds of
+the same binary, so only its RSS column is reported, plus one back-to-back round after the box quieted: 8M, epoch 2,539 QPS (writer 1,625 inserts/s) vs bitmap 3,251 QPS (writer 2,081 inserts/s), one run each.
+
+The bitmap wins or ties because 125 KB (1M) and 1 MB (8M) stay in L2 while the epoch array
+(4 MB, 32 MB) lives in L3 or beyond it; the per-sweep journal clear (one store per touched word,
+all cache-resident) is far below that difference. The epoch RSS figures are roughly double the
+array: under a concurrent writer every `begin()` sees a higher high-water mark and `Vec::resize`
+grows by amortized doubling, so the 4 MB array becomes 8 MB and the 32 MB one 64 MB — the bitmap
+reserves with 1/8 headroom instead. Both figures also include the heaps and neighbor buffer;
+the bitmap figures predate the headroom, so live scratches are ~12.5% larger than shown.

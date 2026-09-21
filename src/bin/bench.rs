@@ -15,6 +15,8 @@
 //! with that many workers per chunk, instead of the serial one-insert-at-a-time path.
 //! HNSW_BENCH_KERNELS=1 runs the kernel microbenchmark alone (no graph build).
 //! HNSW_BENCH_NO_RECALL=1 skips the brute-force recall truths (queries only; recall prints NaN).
+//! HNSW_BENCH_DUMP=<file> writes every single-thread query's visit count and (id:distance) hits,
+//! one line per query, so two binaries over the same plane can be diffed for exact equivalence.
 
 use hnsw_plane::distance::{quantize, Query};
 use hnsw_plane::format::Quant;
@@ -324,7 +326,8 @@ fn run(
         qs.iter().map(|_| Vec::new()).collect()
     } else {
         // brute-force truth is O(n x queries); spread it over the machine so an 8M plane does not
-        // spend longer on truth than on the build it measures
+        // spend longer on truth than on the build it measures. Bounded top-10 running insert per
+        // query (not collect-all-then-sort), so no query keeps an n-entry buffer resident.
         let truth_threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1).min(queries.max(1));
         std::thread::scope(|s| {
             let chunk = qs.len().div_ceil(truth_threads).max(1);
@@ -353,6 +356,9 @@ fn run(
             handles.into_iter().flat_map(|h| h.join().expect("truth thread")).collect()
         })
     };
+    let mut dump = std::env::var("HNSW_BENCH_DUMP").ok().map(|p| {
+        std::io::BufWriter::new(std::fs::File::create(&p).expect("create HNSW_BENCH_DUMP"))
+    });
     let mut ef = efs[0];
     for &ef_i in efs {
         ef = ef_i;
@@ -365,7 +371,7 @@ fn run(
             let _ = search(&graph, q, 10, ef, &mut scratch);
         }
         let majflt_before = major_faults();
-        for (q, truth) in qs.iter().zip(&truths) {
+        for (qi, (q, truth)) in qs.iter().zip(&truths).enumerate() {
             let start = Instant::now();
             let (results, stats) = search(&graph, q, 10, ef, &mut scratch);
             latencies.push(start.elapsed());
@@ -374,6 +380,14 @@ fn run(
             assert!(!results.is_empty());
             recall_total += truth.len();
             recall_hits += truth.iter().filter(|tid| results.iter().any(|(rid, _)| rid == *tid)).count();
+            if let Some(out) = dump.as_mut() {
+                use std::io::Write;
+                write!(out, "ef {ef} q {qi} visits {}", stats.visits).unwrap();
+                for (id, d) in &results {
+                    write!(out, " {id}:{d:e}").unwrap();
+                }
+                writeln!(out).unwrap();
+            }
         }
         latencies.sort();
         let p50 = latencies[queries / 2];
@@ -397,6 +411,8 @@ fn run(
         );
     }
 
+    drop(dump);
+
     if threads > 0 {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
@@ -404,24 +420,45 @@ fn run(
         let source = Arc::new(source);
         let stop = Arc::new(AtomicBool::new(false));
         let per_thread = queries.max(100);
+        let anon_before = rss_anon_kb();
+        let rendezvous = Arc::new(std::sync::Barrier::new(threads));
+        let writer_sized = Arc::new(AtomicBool::new(false));
         let start = Instant::now();
         let mut handles = Vec::new();
         for t in 0..threads {
             let graph = graph.clone();
             let corpus = source.clone();
+            let rendezvous = rendezvous.clone();
+            let writer_sized = writer_sized.clone();
             handles.push(std::thread::spawn(move || {
                 let mut scratch = SearchScratch::new();
                 let mut rng = Rng(0x9e37_79b9 ^ (t as u64 + 1) * 0x1234_5677);
                 let mut lat: Vec<std::time::Duration> = Vec::with_capacity(per_thread);
+                let mut empty = 0usize;
                 for i in 0..per_thread {
                     let q = Query::for_plane(&graph.file, corpus.query_row(i, &mut rng));
                     let s = Instant::now();
                     let (r, _) = search(&graph, &q, 10, ef, &mut scratch);
                     lat.push(s.elapsed());
-                    assert!(!r.is_empty());
+                    empty += r.is_empty() as usize;
                 }
                 lat.sort();
-                (lat[per_thread / 2], lat[(per_thread * 99 / 100).min(per_thread - 1)])
+                // a panic before the barrier would wedge the other searchers in wait()
+                let anon = if rendezvous.wait().is_leader() {
+                    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+                    while !writer_sized.load(Ordering::Relaxed) && Instant::now() < deadline {
+                        std::thread::yield_now();
+                    }
+                    if !writer_sized.load(Ordering::Relaxed) {
+                        eprintln!("warning: the writer never sized its scratch; RSS sample excludes it");
+                    }
+                    rss_anon_kb()
+                } else {
+                    0
+                };
+                rendezvous.wait();
+                assert_eq!(empty, 0, "searcher {t}: {empty} empty result sets");
+                (lat[per_thread / 2], lat[(per_thread * 99 / 100).min(per_thread - 1)], anon)
             }));
         }
         // background writer: sustained inserts while searchers run
@@ -429,6 +466,7 @@ fn run(
             let graph = graph.clone();
             let corpus = source.clone();
             let stop = stop.clone();
+            let writer_sized = writer_sized.clone();
             std::thread::spawn(move || {
                 let params = InsertParams::default();
                 let mut scratch = SearchScratch::new();
@@ -436,8 +474,14 @@ fn run(
                 let mut count = 0u64;
                 while !stop.load(Ordering::Relaxed) {
                     let v = corpus.base_row(count as usize % n as usize, &mut rng);
-                    if insert(&graph, &v, &params, &mut scratch).is_err() {
-                        break; // plane full
+                    let inserted = insert(&graph, &v, &params, &mut scratch);
+                    writer_sized.store(true, Ordering::Relaxed);
+                    if inserted.is_err() {
+                        // plane full: keep the scratch alive until stop so the RSS sample counts it
+                        while !stop.load(Ordering::Relaxed) {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        break;
                     }
                     count += 1;
                 }
@@ -446,10 +490,12 @@ fn run(
         };
         let mut p50s = Vec::new();
         let mut p99s = Vec::new();
+        let mut anon_peak = 0u64;
         for h in handles {
-            let (p50, p99) = h.join().unwrap();
+            let (p50, p99, anon) = h.join().unwrap();
             p50s.push(p50);
             p99s.push(p99);
+            anon_peak = anon_peak.max(anon);
         }
         let wall = start.elapsed();
         stop.store(true, Ordering::Relaxed);
@@ -466,7 +512,31 @@ fn run(
             p99s[threads - 1].as_secs_f64() * 1e3,
             inserted as f64 / wall.as_secs_f64()
         );
+        let growth_mb = (anon_peak as f64 - anon_before as f64) / 1024.0;
+        println!(
+            "anonymous RSS: {:.1} MB before the searchers, {:.1} MB peak with {} scratches live ({:+.1} MB, {:.2} MB per scratch)",
+            anon_before as f64 / 1024.0,
+            anon_peak as f64 / 1024.0,
+            threads + 1,
+            growth_mb,
+            growth_mb / (threads + 1) as f64
+        );
     }
+}
+
+/// Anonymous resident memory of this process in kB (Linux; 0 elsewhere). Anonymous rather than
+/// total RSS so the mmap'd plane's page-cache residency does not drown the scratch allocations
+/// this reports on.
+fn rss_anon_kb() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("RssAnon:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse().ok())
+        })
+        .unwrap_or(0)
 }
 
 /// Kernel microbenchmark: the measurement that chooses the int16 accumulator, and the

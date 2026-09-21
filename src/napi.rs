@@ -18,14 +18,20 @@ use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// Pooled per-query scratch (the visited array is O(nodes); never allocate per query).
+/// Pooled per-query scratch: never allocate per query. Retention is capped at 64 but a
+/// `take()` from an empty pool allocates, so live scratches equal in-flight searches. Each
+/// holds `ceil(nodes / 64) * 8` bytes of visited bitmap plus 1/8 headroom and a bounded journal (see
+/// `SearchScratch`): 200M nodes is ~28 MB per scratch, ~7 GB across 256 in flight.
 struct ScratchPool(Mutex<Vec<SearchScratch>>);
 
 impl ScratchPool {
     fn take(&self) -> SearchScratch {
         self.0.lock().unwrap().pop().unwrap_or_default()
     }
-    fn put(&self, s: SearchScratch) {
+    fn put(&self, mut s: SearchScratch) {
+        // outside the lock: a journal-overflow clear is a whole-bitmap fill, and every other
+        // search thread's take()/put() would queue behind it
+        s.finish();
         let mut pool = self.0.lock().unwrap();
         if pool.len() < 64 {
             pool.push(s);
@@ -713,8 +719,8 @@ impl Plane {
         let upper_levels: Vec<Vec<u32>> =
             upper.map(|ls| ls.iter().map(|l| l.to_vec()).collect()).unwrap_or_default();
         // reject out-of-range neighbor ids rather than letting them poison traversal
-        // (SearchScratch::visit would size its array from them; distance_to skips them, but
-        // a u32::MAX id costs a huge allocation before it is skipped)
+        // (SearchScratch::visit would size its bitmap from them; distance_to skips them, but
+        // a u32::MAX id costs a 512 MB allocation before it is skipped)
         let max = self.graph.file.max_nodes;
         for &n in neighbors.iter() {
             if (n as u64) >= max {
