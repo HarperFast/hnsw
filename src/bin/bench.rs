@@ -2,7 +2,7 @@
 //! per-visit cost — the number that decides whether the native plane hits its 0.25–0.4 µs
 //! budget (JS baseline: 4.34 µs/visit at 5M/ef 512).
 //!
-//! Usage: bench [n=100000] [dims=768] [queries=200] [ef=512] [path=/tmp/bench.hnsw] [cap=32] [threads=0] [precision=int8|int16|both] [buildThreads=1]
+//! Usage: bench [n=100000] [dims=768] [queries=200] [ef=512] [path=/tmp/bench.hnsw] [cap=64] [threads=0] [precision=int8|int16|both] [buildThreads=1]
 //! Env: HNSW_BENCH_FVECS=<dir> reads SIFT-style `sift_base.fvecs` / `sift_query.fvecs` from that
 //! directory (its dims must match the argument; n rows from base, queries from query) instead of the synthetic
 //! corpus, so a run matches the Harper-vs-pgvector benchmark's data. HNSW_BENCH_F32=<file> reads a
@@ -189,7 +189,7 @@ fn main() {
         .map(|a| a.split(',').map(|e| e.parse().expect("ef")).collect())
         .unwrap_or_else(|| vec![512]);
     let path: PathBuf = args.get(5).map(Into::into).unwrap_or_else(|| "/tmp/bench.hnsw".into());
-    let layer0_cap: usize = arg_or(&args, 6, "cap", 32);
+    let layer0_cap: usize = arg_or(&args, 6, "cap", 64);
     let threads: usize = arg_or(&args, 7, "threads", 0);
     let quants: Vec<Quant> = match args.get(8).map(String::as_str).unwrap_or("int8") {
         "int8" => vec![Quant::Int8],

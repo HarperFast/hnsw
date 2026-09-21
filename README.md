@@ -58,9 +58,10 @@ macOS and Windows are functional (no lock takeover — bounded degradation inste
 const { Plane } = require('@harperfast/hnsw');
 
 // keyCap 40 (min 8): each slot carries up to 40 bytes of the host's key inline (longer keys overflow)
-// layer-0 cap 32 (= 2M for M 16): the recommended value — smallest slot, recall within 0.5 pt of
-// cap 128 at ef ≥ 1024 and 1–2 pts below it at ef ≤ 512 (measured at 128-d; DESIGN.md §10)
-const plane = Plane.create('/data/vectors.hnsw', 768, 32, 10_000_000, 40);
+// layer-0 cap: 64 (= 4M for M 16) in general — for these 768-d vectors it stays within 0.35 pt of
+// cap 128's recall@10 with a 19% smaller slot; 32 for narrow vectors on a plane that outgrows RAM,
+// the smallest slot, but 1.3–2.2 pts below cap 128 under ef 1024 at 4M × 128-d (DESIGN.md §10)
+const plane = Plane.create('/data/vectors.hnsw', 768, 64, 10_000_000, 40);
 // ... or with the finer storage precision (see below):
 // const plane = Plane.create('/data/vectors.hnsw', 128, 32, 10_000_000, 40, undefined, 'int16');
 const id = plane.insert(myFloat32Vector, Buffer.from(myRecordKey));
@@ -110,7 +111,7 @@ Full API in [index.d.ts](index.d.ts).
 
 ## Benchmarks
 
-`cargo run --release --bin bench -- 1000000 768 100 512 /tmp/bench.hnsw 32 8` builds a 1M ×
+`cargo run --release --bin bench -- 1000000 768 100 512 /tmp/bench.hnsw 64 8` builds a 1M ×
 768-d graph on a calibrated Gaussian-mixture corpus, reports p50/p95/p99, per-visit cost,
 brute-force recall\@10, and a concurrent-throughput pass. A ninth argument selects the
 storage precision (`int8`, `int16`, or `both` to build and measure one plane of each), and

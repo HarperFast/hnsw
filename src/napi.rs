@@ -484,8 +484,9 @@ pub struct Plane {
 
 #[napi]
 impl Plane {
-    /// Create a new plane file. `layer0Cap` is the per-slot layer-0 neighbour capacity: 32 (2M for
-    /// M 16) is the measured size/recall trade (DESIGN.md §10). `maxNodes` bounds the sparse
+    /// Create a new plane file. `layer0Cap` is the per-slot layer-0 neighbour capacity: 64 (4M for
+    /// M 16) in general, 32 for narrow vectors on a plane that outgrows RAM (DESIGN.md §10 has the
+    /// measured trade). `maxNodes` bounds the sparse
     /// reservation (pages materialize on write). `keyCap` (default 0) is the inline key capacity
     /// per slot; longer keys spill to an overflow arena of `keyArenaBytesPerNode` bytes per node (default
     /// max(128, 4 x keyCap); sparse, so size it for the keys that will spill). `precision`
