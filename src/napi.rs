@@ -594,6 +594,10 @@ impl Plane {
     /// the promise. Working memory is `threads x 4 B x idHighWater` of visited-set scratch,
     /// retained in the plane's scratch pool afterwards; the count is per plane, so a host
     /// loading several planes at once divides its cores between them.
+    ///
+    /// A queued or in-flight batch is not covered by `flush`'s durability promise until its
+    /// promise settles: `await` every outstanding `insertBatch` before advancing the watermark,
+    /// or the watermark can land over records that have not been inserted yet.
     #[napi(ts_return_type = "Promise<InsertBatchResult>")]
     pub fn insert_batch(
         &self,

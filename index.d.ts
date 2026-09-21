@@ -94,6 +94,10 @@ export declare class Plane {
 	 * pool for later batches and searches. The thread count and that memory are per plane: a
 	 * host bulk-loading several planes at once should pass `threads` so the total fits its
 	 * cores and memory.
+	 *
+	 * A queued or in-flight batch is not covered by flush()'s durability promise until its
+	 * promise settles: `await` every outstanding insertBatch() before advancing the watermark,
+	 * or the watermark can land over records that have not been inserted yet.
 	 */
 	insertBatch(vectors: Float32Array, keys?: Buffer, keyEnds?: Uint32Array, threads?: number): Promise<InsertBatchResult>;
 	/** Delete a node; its id returns to the freelist. Pairs with insert(). */
