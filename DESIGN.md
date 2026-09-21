@@ -313,6 +313,115 @@ ever relaxed.
 3. TSFN lifecycle: shutdown-while-query-in-flight is a first-class test (see rocksdb-js #665's
    TSFN teardown SIGSEGV). napi-rs `ThreadsafeFunction` + explicit abort on env teardown.
 
+**Prefetch has two tiers, and the kernel tier is gated** (`unvisited_prefetched` in
+`search.rs`, `prefetch.rs`). Each expansion gathers its unvisited neighbour ids and hints their
+slots before the distance loop. The CPU hint (`_mm_prefetch`) overlaps cache misses on resident
+pages but is dropped on a non-resident page — no fault, no I/O — so once the plane exceeds page
+cache every neighbour became a synchronous, queue-depth-1 major fault (issue #9: p95 5.6 → 68.8 ms
+and p99 7.0 → 161 ms from 4M to 8M with p50 flat, ~18k faults/s on the builder). The kernel tier
+issues one `process_madvise(MADV_WILLNEED)` over the batch's slot pages (vector and adjacency
+only, never the key field), so the k reads start together: measured on NVMe, 32 random pages
+cost 2,540 µs as serial faults and 420 µs (submit + touch) batched.
+
+It cannot be always on. The vectored call costs ~0.5 µs per range when the pages are already
+resident (1.8 µs per `madvise` on the per-range fallback), against a 0.13 µs resident visit at
+128-d, so at ef 1448 (~1,400 expansions) it would add ~20 ms to a ~5 ms in-cache query. And a
+static switch cannot be right either: one query walks a hot region near the entry point and a
+cold tail. So the gate is per expansion, from an in-process signal: a cycle-counter read
+(`rdtsc` where the TSC is invariant, `cntvct_el0` on arm64, `Instant` otherwise; ~14 ns here,
+calibrated once at the backend probe) every 4th expansion while unarmed and every expansion while
+armed, and a window is fault-scale when it exceeds `kept × (1 µs + vector_bytes ns) + 16 µs` —
+~8–10× the resident visit at every supported width plus a term below one NVMe fault (~80 µs). A fault-scale expansion arms a hold of 16
+expansions; each fast one decrements it; the kernel prefetch is issued while the hold is armed.
+A prefetch-assisted expansion under pressure still waits one device round trip, so it stays
+fault-scale and the hold does not oscillate once the faults are parallel; page-cache-hit minor
+faults (~1 µs) do not trip it, correctly, since WILLNEED cannot help them. Cost accounting: a
+resident plane pays the clock read and no syscall (`SearchStats.willneed_batches` reads 0.0–0.1
+per query in the tables below, the pre-emption cases); a spurious arm costs ≤ 16 × k × 0.5 µs
+≈ 240 µs at k = 30, about one serial fault, which is also what the first, undetected expansion
+of a cold region costs.
+
+This does not conflict with `MADV_RANDOM` (§4, `format.rs`): that is about the readahead window
+around a random fault polluting co-tenants' page cache; the targeted advice fetches exactly the
+pages the next distance reads need.
+
+Backends are probed at first use, not by kernel version: Linux `process_madvise` (one syscall per
+batch; unprivileged self-advice needs Linux ≥ 6.13, so Ubuntu 24.04's 6.8 gets `EPERM`) → per-range
+`madvise(MADV_WILLNEED)` (older Linux, macOS; k syscalls, still asynchronous readahead) → off
+(Windows; `PrefetchVirtualMemory` is the vectored equivalent, not implemented). A backend that
+fails with a permanent error latches the next one down for the process. `HNSW_KERNEL_PREFETCH=0`
+forces off — a kill switch and A/B control, read once; there is no "on" value because the gate
+decides.
+
+Measured 2026-09-19 on a 4M × 128-d int8 plane (cap 32, 1.3 GB, `/home` NVMe), `bench` built
+from `main` vs this branch on the same file and queries, CPU-pinned, on a 20-thread Alder Lake
+host that other agents' benchmarks kept at load 20+ and the NVMe under ~70 MB/s of random reads
+throughout (a serial fault cost 80 µs on the idle device and ~250 µs during these runs).
+
+*Resident* (file warm, 200 queries, mean µs, 4 alternating rounds after a warm-up pair):
+
+| ef | base per round | branch per round | median Δ | `willneed_batches`/query |
+|---|---|---|---|---|
+| 128 | 248 · 248 · 317 · 257 | 251 · 288 · 277 · 250 | −0.9 % | 0.0 |
+| 512 | 447 · 418 · 465 · 419 | 426 · 520 · 478 · 440 | +4.0 % | 0.0 |
+| 1448 | 1726 · 1691 · 1965 · 1754 | 1742 · 1876 · 1951 · 1753 | +0.4 % | 0.1 |
+
+Run-to-run spread on this host was ±15 %, wider than the effect, so the resident cost was also
+measured as retired user instructions (`perf stat -e instructions:u`, exact under contention):
+gate on vs `HNSW_KERNEL_PREFETCH=0` in the same binary differs by 13.8 M instructions over the
+1,200 queries of a run (two "on" runs agree to 11 k), 11.5 k per query or 0.5 % of the query
+phase, and the `main` binary sits within 2 M of either (noise). With `rdtsc` at 14 ns on this
+CPU and one sample per 4 expansions, the gate's time is 0.4–0.8 % of a query at every ef. An earlier build that read `clock_gettime`
+(32 ns) on every expansion measured 3–8 % on the same runs, which is what set the window and the
+counter: a high-ef expansion scores only ~3–9 unvisited slots, so per-expansion overhead is paid
+~700 times in a 400 µs query.
+
+*Exceeds page cache* (same file under `systemd-run --scope -p MemoryMax=…` after
+`fadvise(DONTNEED)`; cgroup v2 charges the file pages, so the plane refaults from the device):
+
+`MemoryMax=256M` (≈ 20 % of the plane resident; base/branch back to back per ef, 100 queries,
+50 at ef 1448; ms):
+
+| ef | round | base p50 / p95 / p99 | branch p50 / p95 / p99 | speed-up | batches · major faults per query |
+|---|---|---|---|---|---|
+| 128 | 1 | 102 / 277 / 587 | 60 / 183 / 222 | 1.7× / 1.5× / 2.6× | 94 · 350 |
+| 128 | 2 | 103 / 168 / 453 | 56 / 74 / 146 | 1.8× / 2.3× / 3.1× | 94 · 352 |
+| 512 | 1 | 186 / 406 / 885 | 80 / 288 / 320 | 2.3× / 1.4× / 2.8× | 137 · 421 |
+| 512 | 2 | 152 / 306 / 542 | 74 / 272 / 370 | 2.0× / 1.1× / 1.5× | 137 · 420 |
+| 1448 | 1 | 2527 / 9064 / 10527 | 897 / 2615 / 4079 | 2.8× / 3.5× / 2.6× | 820 · 644 |
+| 1448 | 2 | 974 / 2273 / 3031 | 253 / 598 / 979 | 3.8× / 3.8× / 3.1× | 820 · 643 |
+
+The batch and fault counts are the mechanism: at ef 128 the branch takes ~350 major faults for
+~1,470 non-resident pages per query, the rest arriving through the ~94 kernel batches, and a
+probe on the same loaded device put a 12-page WILLNEED batch at 1.1 ms against 3.1 ms of serial
+faults (0.4 ms against 2.5 ms on the idle device), which is where the remaining cost sits. An
+earlier single-run round with all three efs in one process showed the branch 2× *worse* at
+ef 128/512 and 10× better at ef 1448; the per-ef back-to-back pairs above are what the
+minute-scale swings in the other tenant's I/O allow to be compared.
+
+`MemoryMax=768M` (≈ 60 % resident; after the warm-up pass most of a 100-query set's pages are
+in cache, so this is the issue's own regime — median on trend, tail from the few queries that
+walk into cold pages; ms):
+
+| ef | round | base p50 / p95 / p99 (mean) | branch p50 / p95 / p99 (mean) | batches · major faults per query |
+|---|---|---|---|---|
+| 128 | 1 | 0.32 / 0.39 / 0.45 | 0.34 / 0.42 / 0.47 | 0.0 · 0.0 |
+| 128 | 2 | 0.28 / 0.42 / 55.1 (1.87) | 0.25 / 0.30 / 0.35 (0.26) | 0.0 · 0.0 |
+| 512 | 1 | 0.71 / 1.23 / 884 (22.5) | 0.76 / 4.90 / 5.47 (1.62) | 2.1 · 0.0 |
+| 512 | 2 | 0.40 / 0.54 / 0.79 | 0.59 / 0.77 / 1.11 | 0.0 · 0.0 |
+| 1448 | 1 | 1475 / 5244 / 8327 | 667 / 1788 / 3268 | 818 · 373 |
+| 1448 | 2 | 559 / 881 / 1684 | 138 / 242 / 254 | 812 · 372 |
+
+The ef 512 round-1 pair is the issue's shape: base mean 22.5 ms from two or three queries near
+one second, branch mean 1.6 ms with those queries at ~5 ms. Which queries land on cold pages
+differs run to run (round 2's pairs came out warm on both sides), and pairs with zero batches on
+both sides differ only by CPU noise: right after this series, ef 512 fully resident and back to
+back at load 27 gave base 399 / 399 µs and branch 408 / 391 / 424 µs mean.
+
+A batch on the loaded device never lost to the serial faults it replaced, measured with the
+probe on mixed batches of cold and resident pages: 1 cold page 382 vs 372 µs, 2 cold 900 vs
+1518, 3 cold 405 vs 1017, 6 cold 747 vs 2670, 12 cold 2272 vs 9622.
+
 ## 8. Write path phasing
 
 - **Phase 1 — dual-write, search cutover.** Insert/update/delete logic stays in JS

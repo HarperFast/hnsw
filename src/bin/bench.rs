@@ -10,6 +10,7 @@
 //! background writer inserting throughout, reporting aggregate QPS and per-thread p50/p99.
 //! `precision=both` builds and measures an int8 and an int16 plane over the same corpus.
 //! HNSW_BENCH_KERNELS=1 runs the kernel microbenchmark alone (no graph build).
+//! HNSW_BENCH_NO_RECALL=1 skips the brute-force recall truths (queries only; recall prints NaN).
 
 use hnsw_plane::distance::{quantize, Query};
 use hnsw_plane::format::Quant;
@@ -34,6 +35,17 @@ impl Rng {
         let u2 = self.next_unit();
         (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
     }
+}
+
+fn major_faults() -> i64 {
+    #[cfg(unix)]
+    unsafe {
+        let mut ru: libc::rusage = std::mem::zeroed();
+        libc::getrusage(libc::RUSAGE_SELF, &mut ru);
+        ru.ru_majflt as i64
+    }
+    #[cfg(not(unix))]
+    0
 }
 
 /// Gaussian-mixture corpus matching benchmarks/hnsw-scale.js: unit centroids, per-dim noise
@@ -226,9 +238,14 @@ fn run(n: u64, dims: usize, queries: usize, efs: &[usize], path: &std::path::Pat
     // Query with held-out vectors; measure latency and set-recall@10 vs brute-force truth
     // (same asymmetric metric, so recall isolates graph quality, not quantization).
     let qs: Vec<Query> = (0..queries).map(|i| Query::for_plane(&graph.file, corpus.query_row(i, &mut rng))).collect();
+    // HNSW_BENCH_NO_RECALL=1 skips the brute-force truth pass: under a page-cache limit it is
+    // 200 full scans of the plane, hours of refaults before the first timed query
     let truths: Vec<Vec<u32>> = qs
         .iter()
         .map(|q| {
+            if std::env::var_os("HNSW_BENCH_NO_RECALL").is_some() {
+                return Vec::new();
+            }
             let mut truth: Vec<(u32, f32)> =
                 (0..n as u32).filter_map(|id| graph.distance_to(id, q).map(|d| (id, d))).collect();
             truth.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
@@ -241,16 +258,19 @@ fn run(n: u64, dims: usize, queries: usize, efs: &[usize], path: &std::path::Pat
         ef = ef_i;
         let mut latencies = Vec::with_capacity(queries);
         let mut total_visits = 0u64;
+        let mut willneed_batches = 0u64;
         let mut recall_hits = 0usize;
         let mut recall_total = 0usize;
         for q in &qs {
             let _ = search(&graph, q, 10, ef, &mut scratch);
         }
+        let majflt_before = major_faults();
         for (q, truth) in qs.iter().zip(&truths) {
             let start = Instant::now();
             let (results, stats) = search(&graph, q, 10, ef, &mut scratch);
             latencies.push(start.elapsed());
             total_visits += stats.visits;
+            willneed_batches += stats.willneed_batches;
             assert!(!results.is_empty());
             recall_total += truth.len();
             recall_hits += truth.iter().filter(|tid| results.iter().any(|(rid, _)| rid == *tid)).count();
@@ -263,7 +283,7 @@ fn run(n: u64, dims: usize, queries: usize, efs: &[usize], path: &std::path::Pat
         let mean_us = latencies.iter().map(|d| d.as_secs_f64()).sum::<f64>() / queries as f64 * 1e6;
         let us_per_visit = mean_us / mean_visits;
         println!(
-            "search (ef {:>4}): p50 {:.3} ms  p95 {:.3} ms  p99 {:.3} ms  mean {:.1} us  visits/query {:.0}  ->  {:.3} us/visit  recall@10 {:.4}",
+            "search (ef {:>4}): p50 {:.3} ms  p95 {:.3} ms  p99 {:.3} ms  mean {:.1} us  visits/query {:.0}  ->  {:.3} us/visit  recall@10 {:.4}  willneed batches/query {:.1}  major faults/query {:.1}",
             ef,
             p50.as_secs_f64() * 1e3,
             p95.as_secs_f64() * 1e3,
@@ -271,7 +291,9 @@ fn run(n: u64, dims: usize, queries: usize, efs: &[usize], path: &std::path::Pat
             mean_us,
             mean_visits,
             us_per_visit,
-            recall_hits as f64 / recall_total as f64
+            recall_hits as f64 / recall_total as f64,
+            willneed_batches as f64 / queries as f64,
+            (major_faults() - majflt_before) as f64 / queries as f64
         );
     }
 

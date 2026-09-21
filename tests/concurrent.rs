@@ -250,7 +250,7 @@ fn search_at_descent_width(
     let Some(entry_dist) = graph.distance_to(entry_id, query) else {
         return Vec::new();
     };
-    let mut stats = SearchStats { visits: 0 };
+    let mut stats = SearchStats::default();
     let (ep, ep_dist) =
         beam_descend(graph, query, entry_id, entry_dist, entry_level, 0, descent_ef, scratch, &mut stats);
     scratch.begin_public(graph.file.id_high_water());

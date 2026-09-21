@@ -10,6 +10,7 @@ use crate::format::{
     S_DEGREE, S_FLAGS, S_INV_MAG, S_LEVEL, S_SCALE, S_UPPER_IDX, S_VECTOR, UPPER_CAP, UPPER_LEVEL_STRIDE, UL_DEGREE,
     UL_IDS, U_LEVELS, U_LISTS,
 };
+use crate::prefetch::PageRange;
 use crate::seqlock;
 use crate::seqlock::Wedged;
 
@@ -108,6 +109,8 @@ pub struct NodeRead {
 
 impl Graph {
     pub fn new(file: PlaneFile) -> Self {
+        // probe the kernel-prefetch backend (and calibrate its clock) here, not on a search
+        crate::prefetch::mode();
         Graph {
             file,
             probe_rotation: std::sync::atomic::AtomicU32::new(0),
@@ -289,6 +292,14 @@ impl Graph {
             prefetch_line(unsafe { p.add(off) });
             off += 64;
         }
+    }
+
+    /// The pages holding what search reads from slot `id`: seqlock through adjacency, never the
+    /// key field (up to 64 KiB that no distance read touches).
+    #[inline]
+    pub fn slot_read_span(&self, id: u32) -> PageRange {
+        let start = self.file.slot_ptr(id) as usize;
+        PageRange::covering(start, start + self.file.key_offset())
     }
 
     /// Zero-copy distance from `query` to the stored vector of `id`. None for absent/deleted.

@@ -5,6 +5,7 @@
 use crate::distance::Query;
 use crate::format::{MAX_UPPER_LEVELS, NO_ID};
 use crate::graph::Graph;
+use crate::prefetch::{self, clock, PageRange};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::BinaryHeap;
 
@@ -53,6 +54,17 @@ pub struct SearchScratch {
     results: BinaryHeap<Result_>,
     descent_out: Vec<(u32, f32)>,
     batch_keys: BatchKeys,
+    /// `id_high_water` at `begin()`: ids past it are rejected by `distance_to`, so they are
+    /// never handed to the kernel either (a corrupt neighbor id must not read reserved slots).
+    capacity: u64,
+    /// Expansions left in the kernel-prefetch hold; per layer sweep, so one cold query never
+    /// arms the next query that draws this scratch from the pool.
+    willneed_hold: u8,
+    /// Gate window: opening tick (0 = none), slots scored, expansions elapsed.
+    window_tick: u64,
+    window_kept: u32,
+    window_len: u8,
+    ranges: Vec<PageRange>,
 }
 
 impl SearchScratch {
@@ -65,6 +77,12 @@ impl SearchScratch {
             results: BinaryHeap::new(),
             descent_out: Vec::new(),
             batch_keys: BatchKeys::default(),
+            capacity: 0,
+            willneed_hold: 0,
+            window_tick: 0,
+            window_kept: 0,
+            window_len: 0,
+            ranges: Vec::new(),
         }
     }
 
@@ -76,6 +94,10 @@ impl SearchScratch {
         if self.visited.len() < capacity as usize {
             self.visited.resize(capacity as usize, 0);
         }
+        self.capacity = capacity;
+        self.window_tick = 0;
+        self.window_len = 0;
+        self.willneed_hold = 0;
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 {
             self.visited.fill(0);
@@ -106,8 +128,11 @@ impl Default for SearchScratch {
     }
 }
 
+#[derive(Default)]
 pub struct SearchStats {
     pub visits: u64,
+    /// Expansions whose slots were handed to the kernel prefetch: 0 on a resident plane.
+    pub willneed_batches: u64,
 }
 
 #[inline]
@@ -122,11 +147,58 @@ fn bit_allowed(filter: Option<&[u8]>, id: u32) -> bool {
 }
 
 
+/// Expansions the kernel prefetch stays armed for after one fault-scale expansion: sixteen
+/// resident expansions under the hold cost about one serial fault, the price of the first,
+/// undetected expansion of a cold region.
+const WILLNEED_HOLD: u8 = 16;
+
+/// Expansions per clock sample while unarmed; armed, every expansion so the hold decays per
+/// expansion.
+const GATE_WINDOW: u8 = 4;
+
+/// The hold after a window that scored `kept` slots in `elapsed_ns`. The allowance is ~8–10×
+/// a resident visit at every supported width plus a term below one NVMe fault, so one fault
+/// trips it while a resident window of wide vectors does not; a prefetch-assisted expansion
+/// under pressure still waits one device round trip, so the hold does not oscillate.
+/// Thresholds and their measurements: DESIGN.md §7, "Prefetch has two tiers".
+#[inline]
+pub fn willneed_hold_after(hold: u8, elapsed_ns: u64, kept: u32, vector_bytes: usize) -> u8 {
+    let allowance = kept as u64 * (1_000 + vector_bytes as u64) + 16_000;
+    if elapsed_ns > allowance {
+        WILLNEED_HOLD
+    } else {
+        hold.saturating_sub(1)
+    }
+}
+
 /// Compact `nbuf` to its unvisited, in-range ids (marking them visited) and prefetch their
 /// slots, so the distance reads that follow find the lines in flight instead of missing one
 /// at a time. Returns the compacted length.
+///
+/// The kernel page prefetch (`prefetch.rs`) is added while the hold is armed, for batches of
+/// at least two pages (one page faults the same either way). The gate's window runs from the
+/// end of the previous armed call's advice, not its start, so the advice syscalls' own time
+/// never counts as fault latency.
 #[inline]
-fn unvisited_prefetched(graph: &Graph, scratch: &mut SearchScratch, nbuf: &mut [u32]) -> usize {
+fn unvisited_prefetched(graph: &Graph, scratch: &mut SearchScratch, stats: &mut SearchStats, nbuf: &mut [u32]) -> usize {
+    let enabled = prefetch::mode() != prefetch::Mode::Off;
+    let armed = enabled && scratch.willneed_hold > 0;
+    scratch.window_len = if armed { 0 } else { (scratch.window_len + 1) % GATE_WINDOW };
+    if enabled && scratch.window_len == 0 {
+        let now = clock::ticks();
+        if scratch.window_tick != 0 {
+            let elapsed = clock::ns(now.wrapping_sub(scratch.window_tick));
+            scratch.willneed_hold =
+                willneed_hold_after(scratch.willneed_hold, elapsed, scratch.window_kept, graph.file.vector_bytes());
+        }
+        scratch.window_tick = now;
+        scratch.window_kept = 0;
+    }
+    let kernel = enabled && scratch.willneed_hold > 0;
+    let mut range_bytes = 0;
+    if kernel {
+        scratch.ranges.clear();
+    }
     let mut kept = 0;
     for i in 0..nbuf.len() {
         let nid = nbuf[i];
@@ -136,10 +208,30 @@ fn unvisited_prefetched(graph: &Graph, scratch: &mut SearchScratch, nbuf: &mut [
         if !scratch.visit(nid) {
             continue;
         }
+        if kernel && (nid as u64) < scratch.capacity {
+            let span = graph.slot_read_span(nid);
+            match scratch.ranges.last_mut() {
+                Some(last) if last.base == span.base => {
+                    range_bytes += span.len.saturating_sub(last.len);
+                    last.len = last.len.max(span.len);
+                }
+                _ => {
+                    range_bytes += span.len;
+                    scratch.ranges.push(span);
+                }
+            }
+        }
         graph.prefetch_slot(nid);
         nbuf[kept] = nid;
         kept += 1;
     }
+    if kernel {
+        if range_bytes >= 2 * prefetch::page_size() && prefetch::willneed(&scratch.ranges) {
+            stats.willneed_batches += 1;
+        }
+        scratch.window_tick = clock::ticks();
+    }
+    scratch.window_kept += kept as u32;
     kept
 }
 
@@ -195,7 +287,7 @@ pub fn search_layer(
         } else {
             graph.upper_neighbors_into(c.id, level, &mut nbuf);
         }
-        let kept = unvisited_prefetched(graph, scratch, &mut nbuf);
+        let kept = unvisited_prefetched(graph, scratch, stats, &mut nbuf);
         for i in 0..kept {
             let nid = nbuf[i];
             if let Some(d) = graph.distance_to(nid, query) {
@@ -306,7 +398,7 @@ pub fn search(
     ef: usize,
     scratch: &mut SearchScratch,
 ) -> (Vec<(u32, f32)>, SearchStats) {
-    let mut stats = SearchStats { visits: 0 };
+    let mut stats = SearchStats::default();
     let Some((entry_id, entry_level, entry_dist)) = resolve_entry(graph, query, &mut stats) else {
         return (Vec::new(), stats);
     };
@@ -330,7 +422,7 @@ pub fn search_filtered(
     filter_expansion: usize,
     scratch: &mut SearchScratch,
 ) -> (Vec<(u32, f32)>, SearchStats) {
-    let mut stats = SearchStats { visits: 0 };
+    let mut stats = SearchStats::default();
     let Some((entry_id, entry_level, entry_dist)) = resolve_entry(graph, query, &mut stats) else {
         return (Vec::new(), stats);
     };
@@ -461,7 +553,7 @@ pub fn search_predicated(
     visit_budget: u64,
     scratch: &mut SearchScratch,
 ) -> (PredicatedHits, SearchStats) {
-    let mut stats = SearchStats { visits: 0 };
+    let mut stats = SearchStats::default();
     let empty = || PredicatedHits { hits: Vec::new(), keys: Vec::new(), key_ends: Vec::new() };
     let Some((entry_id, entry_level, entry_dist)) = resolve_entry(graph, query, &mut stats) else {
         return (empty(), stats);
@@ -535,7 +627,7 @@ pub fn search_predicated(
         if graph.neighbors_into(c.id, &mut nbuf).is_none() {
             continue;
         }
-        let kept = unvisited_prefetched(graph, scratch, &mut nbuf);
+        let kept = unvisited_prefetched(graph, scratch, &mut stats, &mut nbuf);
         for i in 0..kept {
             let nid = nbuf[i];
             if let Some(d) = graph.distance_to(nid, query) {
@@ -616,7 +708,7 @@ mod descent_tests {
         assert_eq!(entry_dist, 1.0, "precondition: a zero query ties every stored vector at 1.0");
 
         let ef = 2usize; // one level, so the bound under test is per-level rather than a sum
-        let mut stats = SearchStats { visits: 0 };
+        let mut stats = SearchStats::default();
         beam_descend(&graph, &query, entry_id, entry_dist, 1, 0, ef, &mut scratch, &mut stats);
 
         let ceiling = (ef * UPPER_CAP) as u64;
@@ -652,7 +744,7 @@ level 1 holds roughly {} nodes, and a beam that pushed tied candidates would wal
         let query = graph.query((0..dims).map(|d| ((97.0f32 * 0.31 + d as f32) * 0.7).sin()).collect());
         let (entry_id, entry_level) = graph.file.entry_point();
         let entry_dist = graph.distance_to(entry_id, &query).expect("the entry point is live");
-        let mut descent = SearchStats { visits: 0 };
+        let mut descent = SearchStats::default();
         beam_descend(&graph, &query, entry_id, entry_dist, entry_level, 0, DESCENT_EF, &mut scratch, &mut descent);
 
         // a budget deliberately far below what the descent spends
@@ -720,7 +812,7 @@ level 1 holds roughly {} nodes, and a beam that pushed tied candidates would wal
         let query = graph.query((0..dims).map(|d| ((97.0f32 * 0.31 + d as f32) * 0.7).sin()).collect());
         let (entry_id, entry_level) = graph.file.entry_point();
         let entry_dist = graph.distance_to(entry_id, &query).expect("the entry point is live");
-        let mut descent = SearchStats { visits: 0 };
+        let mut descent = SearchStats::default();
         beam_descend(&graph, &query, entry_id, entry_dist, entry_level, 0, DESCENT_EF, &mut scratch, &mut descent);
 
         let budget = 64u64;
