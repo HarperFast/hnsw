@@ -21,9 +21,6 @@
 		"README.md",
 		"DESIGN.md"
 	],
-	"engines": {
-		"node": ">=18"
-	},
 	"scripts": {
 		"build": "node build.mjs",
 		"install": "node build.mjs --if-needed",
